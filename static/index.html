@@ -49,7 +49,7 @@ const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",
 let D=null,U=null,TOK=null,view="dash",pid=null,tab="glob",q="",err="";
 try{TOK=localStorage.getItem("apm_tok");U=localStorage.getItem("apm_user")}catch(e){}
 async function api(m,u,b){const r=await fetch(u,{method:m,headers:Object.assign({"Content-Type":"application/json"},TOK?{Authorization:"Bearer "+TOK}:{}),body:b?JSON.stringify(b):undefined});const j=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(j.error||r.statusText);e.status=r.status;e.data=j;throw e}return j}
-async function loadState(){const d=await api("GET","/api/state");if(!d||!d.projects)return fresh();d.projects.forEach(p=>{p.tasks.forEach(t=>{t.running=false});p.agents.forEach(a=>{a.state="actif"})});return d}
+async function loadState(){const d=await api("GET","/api/state");if(!d||!d.projects)return fresh();d.projects.forEach(ensure);return d}
 const uid=()=>Math.random().toString(36).slice(2,9);
 let st=null;function save(){clearTimeout(st);st=setTimeout(()=>{if(D&&TOK)api("PUT","/api/state",D).catch(e=>{if(e.status==401)logout()})},300)}
 
@@ -57,16 +57,19 @@ const NAMES=["Camille","Louis","Inès","Hugo","Jade","Noah","Léna","Adam","Zoé
 const ROLES=[["Chef de projet","Planifie, priorise, coordonne l’équipe et rend compte de l’avancement."],["Architecte","Définit l’architecture technique et les standards de code."],["Développeur back-end","Implémente la logique métier, les API et la base de données."],["Développeur front-end","Réalise l’interface et l’expérience utilisateur."],["Testeur QA","Rédige et exécute les tests, qualifie et remonte les bugs."],["DevOps","Gère l’intégration continue, le déploiement et l’infrastructure."],["Rédacteur technique","Rédige la documentation et les notes de version."]];
 const SERV=[["Claude","https://api.anthropic.com/v1","Raisonnement, code long, respect des consignes","Quota de tokens à surveiller","anthropic","claude-sonnet-4-6"],["Mistral","https://api.mistral.ai/v1","Rapide, bon en français, coût maîtrisé","Moins solide sur les très gros contextes","openai","mistral-large-latest"],["ChatGPT","https://api.openai.com/v1","Polyvalent, large écosystème d’outils","Verbosité, coût variable","openai","gpt-4o"],["Gemini","https://generativelanguage.googleapis.com/v1beta/openai","Très grand contexte, multimodal","Régularité variable sur le code","openai","gemini-2.0-flash"],["DeepSeek","https://api.deepseek.com","Excellent rapport qualité/prix en code","Disponibilité parfois limitée","openai","deepseek-chat"]];
 function fresh(){return{services:SERV.map(s=>({id:uid(),name:s[0],url:s[1],account:"",pros:s[2],cons:s[3],kind:s[4],model:s[5],apiKey:""})),projects:[]}}
-function newProject(name){return{id:uid(),name,open:true,desc:"",repo:{url:"",branch:"main",dir:""},roles:ROLES.map(r=>({id:uid(),name:r[0],desc:r[1]})),agents:[],tasks:[],bugs:[],commits:[],releases:[],mrs:[]}}
+function newProject(name){return{id:uid(),name,open:true,desc:"",rules:"",spec:"",mainId:"",repo:{url:"",branch:"main",token:""},roles:ROLES.map(r=>({id:uid(),name:r[0],desc:r[1]})),agents:[],tasks:[],bugs:[],modules:[],log:[],commits:[],releases:[],mrs:[]}}
+function ensure(p){p.repo=Object.assign({url:"",branch:"main",token:""},p.repo||{});["agents","tasks","bugs","modules","log","commits","releases","mrs","roles"].forEach(k=>{p[k]=p[k]||[]});p.rules=p.rules||"";p.spec=p.spec||"";
+  p.agents.forEach(a=>{if(a.token&&!p.repo.token)p.repo.token=a.token;if(a.repo&&!p.repo.url)p.repo.url=a.repo;delete a.token;delete a.repo;delete a.dir;a.state="actif";a.history=a.history||[];a.notes=a.notes||"";a.talk=a.talk||[];a.branch=a.branch||"agent/"+a.name.toLowerCase()});
+  if(!p.mainId&&p.agents[0])p.mainId=p.agents[0].id;p.tasks.forEach(t=>{t.running=false;t.modules=t.modules||[]});p.bugs.forEach(b=>{b.modules=b.modules||[]})}
 const P=()=>D.projects.find(p=>p.id===pid);
 const ag=(p,id)=>p.agents.find(a=>a.id===id);
 function prog(p){const t=p.tasks.length;return t?Math.round(100*p.tasks.filter(x=>x.status==="terminée").length/t):0}
 function modal(title,fields,cb,okLabel){
-  const h=fields.map(f=>`<label>${esc(f.l)}</label>`+(f.opts?`<select data-k="${f.k}">${f.opts.map(o=>`<option value="${esc(o[0])}"${o[0]==f.v?" selected":""}>${esc(o[1])}</option>`).join("")}</select>`:f.area?`<textarea data-k="${f.k}" rows="3">${esc(f.v||"")}</textarea>`:`<input data-k="${f.k}" type="${f.type||"text"}" value="${esc(f.v||"")}">`)).join("");
+  const h=fields.map(f=>`<label>${esc(f.l)}</label>`+(f.opts?`<select data-k="${f.k}"${f.multi?" multiple size=4":""}>${f.opts.map(o=>`<option value="${esc(o[0])}"${(f.multi?(f.v||[]).includes(o[0]):o[0]==f.v)?" selected":""}>${esc(o[1])}</option>`).join("")}</select>`:f.area?`<textarea data-k="${f.k}" rows="${f.rows||3}">${esc(f.v||"")}</textarea>`:`<input data-k="${f.k}" type="${f.type||"text"}" value="${esc(f.v||"")}">`)).join("");
   $("#mb").innerHTML=`<h3 style="margin-top:0">${esc(title)}</h3>${h}<div class="row" style="margin:16px 0 0;justify-content:flex-end"><button class="g" id="mc">Annuler</button><button class="b" id="mo">${okLabel||"Valider"}</button></div>`;
   $("#mod").style.display="flex";
   $("#mc").onclick=()=>$("#mod").style.display="none";
-  $("#mo").onclick=()=>{const o={};document.querySelectorAll("#mb [data-k]").forEach(e=>o[e.dataset.k]=e.value);$("#mod").style.display="none";cb(o);save();render()};
+  $("#mo").onclick=()=>{const o={};document.querySelectorAll("#mb [data-k]").forEach(e=>o[e.dataset.k]=e.multiple?[...e.selectedOptions].map(x=>x.value):e.value);$("#mod").style.display="none";cb(o);save();render()};
 }
 function login(){
   $("#root").innerHTML=`<div id="login"><div class="card"><h2 style="margin:0">Atelier d’agents IA</h2><span class="mu">Connectez-vous ou créez un compte (les données restent sur cet appareil).</span><input id="u" placeholder="Identifiant" autocomplete="username"><input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password"><div style="color:var(--er)">${esc(err)}</div><button class="b" id="in">Connexion</button><button class="g" id="cr">Créer le compte</button></div></div>`;
@@ -80,7 +83,9 @@ function render(){
   const open=D.projects.filter(p=>p.open);
   let nav=`<nav><h1>Atelier d’agents IA</h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
   let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():projView();
+  const keep={};["ci","gi"].forEach(i=>{const e=$("#"+i);if(e)keep[i]=e.value});
   $("#root").innerHTML=`<div id="app">${nav}<main>${body}</main></div>`;
+  Object.keys(keep).forEach(i=>{const e=$("#"+i);if(e)e.value=keep[i]});
   document.querySelectorAll("nav [data-v]").forEach(b=>b.onclick=()=>{view=b.dataset.v;render()});
   document.querySelectorAll("nav [data-p]").forEach(b=>b.onclick=()=>{pid=b.dataset.p;view="p";tab="glob";render()});
   $("#lo").onclick=logout;bind();
@@ -88,7 +93,7 @@ function render(){
 function bind(){document.querySelectorAll("main [data-a]").forEach(b=>b.onclick=()=>act(b.dataset.a,b.dataset.i,b.dataset.j));
   document.querySelectorAll("main [data-t]").forEach(b=>b.onclick=()=>{tab=b.dataset.t;render()});
   document.querySelectorAll("main select[data-s]").forEach(s=>s.onchange=()=>{const p=P();const t=p.tasks.find(x=>x.id==s.dataset.i)||p.bugs.find(x=>x.id==s.dataset.i);t[s.dataset.s]=s.value;save();render()});
-  const s=$("#sq");if(s)s.oninput=()=>{q=s.value;render();const n=$("#sq");n.focus();n.setSelectionRange(q.length,q.length)}}
+  ["ci","gi"].forEach(i=>{const e=$("#"+i);if(e)e.onkeydown=ev=>{if(ev.key=="Enter"){const b=document.querySelector(`[data-j="${i}"]`);if(b)b.click()}}});const s=$("#sq");if(s)s.oninput=()=>{q=s.value;render();const n=$("#sq");n.focus();n.setSelectionRange(q.length,q.length)}}
 function dash(){
   const open=D.projects.filter(p=>p.open);
   const ags=open.reduce((n,p)=>n+p.agents.length,0),bugs=open.reduce((n,p)=>n+p.bugs.filter(b=>b.status!="résolu").length,0),susp=open.reduce((n,p)=>n+p.agents.filter(a=>a.state=="suspendu").length,0);
@@ -101,49 +106,150 @@ function projects(){
 function services(){
   return `<h2>Services IA</h2><div class="row"><button class="b" data-a="news">Ajouter un service</button></div><div class="grid">`+D.services.map(s=>`<div class="card"><b>${esc(s.name)}</b><div class="mu">${esc(s.url)}</div><div class="mu">Compte : ${esc(s.account||"—")} · modèle ${esc(s.model||"—")} · clé ${s.apiKey?"définie":"manquante"}</div><p><span class="tag ok">Forts</span> ${esc(s.pros)}</p><p><span class="tag er">Faibles</span> ${esc(s.cons)}</p><button class="g" data-a="edits" data-i="${s.id}">Modifier</button> <button class="g d" data-a="dels" data-i="${s.id}">Révoquer</button></div>`).join("")+`</div>`;
 }
+let busy=null,chatAg=null,hf="all",rk="f";
+const now=()=>new Date().toLocaleString("fr-FR");
+const NA=["Vous","Système","Application"];
+const isMain=(p,a)=>p.mainId==a.id,mainAgent=p=>p.agents.find(a=>a.id==p.mainId);
+const role=(p,a)=>p.roles.find(r=>r.id==a.role)||{name:"—",desc:""};
+const modNames=(p,ids)=>(ids||[]).map(i=>(p.modules.find(m=>m.id==i)||{}).name).filter(Boolean);
+const modIds=(p,v)=>(v||[]).map(x=>(p.modules.find(m=>m.id==x||m.name.toLowerCase()==String(x).toLowerCase())||{}).id).filter(Boolean);
+const mtags=(p,ids)=>modNames(p,ids).map(n=>`<span class="tag">${esc(n)}</span>`).join(" ");
+function log(p,from,to,text){p.log.push({d:now(),from,to,text})}
+function chatBox(p,a,n){const L=p.log.filter(m=>(m.from=="Vous"&&m.to==a.name)||(m.to=="Vous"&&m.from==a.name)||(m.from=="Système"&&m.to==a.name)).slice(-n);
+  return `<div class="card" style="max-height:340px;overflow:auto">${L.map(m=>`<div style="margin-bottom:8px"><b>${esc(m.from)}</b> <span class="mu">${esc(m.d)}</span><div style="white-space:pre-wrap">${esc(m.text)}</div></div>`).join("")||`<span class="mu">Aucun message.</span>`}${busy==a.name?`<div class="mu">⏳ ${esc(a.name)} réfléchit…</div>`:""}</div>`}
+const chatInput=(id,aid)=>`<div class="row" style="margin-top:8px"><input id="${id}" placeholder="Votre message…"><button class="b" data-a="say" data-i="${aid}" data-j="${id}"${busy?" disabled":""}>Envoyer</button></div>`;
+function recap(p,k){const L=[],pct=ts=>ts.length?Math.round(100*ts.filter(t=>t.status=="terminée").length/ts.length):0,ob=p.bugs.filter(b=>b.status!="résolu");
+  if(k=="f"){L.push("# "+p.name+" — récapitulatif fonctionnel","",p.desc||"","","## Spécifications",p.spec||"(non renseignées : l’agent principal les tient à jour)","","## Modules");
+    p.modules.concat([{id:"",name:"Transverse (sans module)"}]).forEach(m=>{const own=x=>m.id?(x.modules||[]).includes(m.id):!(x.modules||[]).length,ts=p.tasks.filter(own);L.push("- "+m.name+(m.desc?" : "+m.desc:"")+" — "+pct(ts)+" % ("+ts.filter(t=>t.status=="terminée").length+"/"+ts.length+" tâches), "+ob.filter(own).length+" bug(s) ouvert(s)")})}
+  else{const br=[...new Set(p.agents.map(a=>a.branch))];
+    L.push("# "+p.name+" — récapitulatif technique","","Dépôt : "+(p.repo.url||"non configuré")+" · branche de base : "+p.repo.branch,"Branches d’agents : "+(br.join(", ")||"—"),"","## Agents");
+    p.agents.forEach(a=>L.push("- "+a.name+(isMain(p,a)?" (principal)":"")+" — "+role(p,a).name+", "+svc(a.service)+", branche "+a.branch+", "+p.tasks.filter(t=>t.who==a.id&&t.status!="terminée").length+" tâche(s) en cours/à faire"));
+    L.push("","## Bugs ouverts : "+ob.length);ob.forEach(b=>L.push("- ["+b.sev+"] "+b.t+(modNames(p,b.modules).length?" ("+modNames(p,b.modules).join(", ")+")":"")));
+    L.push("","## Derniers commits");p.commits.slice(-10).reverse().forEach(c=>L.push("- "+c.d+" "+c.by+" : "+c.m+(c.sha?" ("+c.sha+")":"")));
+    L.push("","## Merge requests");p.mrs.slice(-10).reverse().forEach(m=>L.push("- "+m.t+" : "+m.from+" → "+m.to));
+    L.push("","## Releases");p.releases.forEach(r=>L.push("- "+r.v+" ("+r.d+")"))}
+  return L.join("\n")}
 function projView(){
   const p=P();if(!p)return "";
-  const T=[["glob","Vue globale"],["tasks","Tâches"],["team","Équipe"],["roles","Rôles"],["git","Git & releases"],["bugs","Bugs"]];
-  let c="";
+  const T=[["glob","Vue globale"],["tasks","Tâches"],["modules","Modules"],["team","Équipe"],["dlg","Dialogue"],["histo","Historique"],["recap","Récapitulatif"],["git","Git & releases"],["bugs","Bugs"],["roles","Rôles"]];
+  const m=mainAgent(p),ob=p.bugs.filter(b=>b.status!="résolu").length;let c="";
   if(tab=="glob"){const done=p.tasks.filter(t=>t.status=="terminée").length,doing=p.tasks.filter(t=>t.status=="en cours").length;
-    c=`<div class="grid"><div class="card"><div class="big">${prog(p)} %</div><div class="bar"><i style="width:${prog(p)}%"></i></div><div class="mu">${done}/${p.tasks.length} tâches terminées · ${doing} en cours</div></div><div class="card"><div class="big">${p.agents.length}</div><div class="mu">agents · ${p.agents.filter(a=>a.state=="suspendu").length} suspendus (tokens)</div></div><div class="card"><div class="big">${p.bugs.filter(b=>b.status!="résolu").length}</div><div class="mu">bugs ouverts sur ${p.bugs.length}</div></div><div class="card"><div class="big">${p.releases.length?esc(p.releases[p.releases.length-1].v):"—"}</div><div class="mu">dernière release · ${p.commits.length} commits · ${p.mrs.length} MR</div></div></div><h3>Description</h3><div class="card">${esc(p.desc||"Aucune description.")}</div>`}
-  if(tab=="tasks"){c=`<div class="row"><button class="b" data-a="newt" data-i="">Nouvelle tâche</button></div>`+(tree(p,"")||`<div class="mu">Aucune tâche.</div>`)}
-  if(tab=="team"){c=`<div class="row"><button class="b" data-a="newa">Recruter un agent</button></div><table><tr><th>Agent</th><th>Service / rôle</th><th>Droits</th><th>Contexte & tokens</th><th></th></tr>`+p.agents.map(a=>`<tr><td><b>${esc(a.name)}</b><div class="mu">parle à : ${a.talk.map(i=>ag(p,i)).filter(Boolean).map(x=>esc(x.name)).join(", ")||"personne"}</div></td><td>${esc(svc(a.service))}<br><span class="tag">${esc(rname(p,a.role))}</span></td><td class="mu">dépôt ${esc(a.repo||"—")} · branche ${esc(a.branch||"—")}<br>dossier ${esc(a.dir||"—")}<br>token ${a.token?"••••"+esc(a.token.slice(-3)):"—"}</td><td><span class="tag ${a.state=="suspendu"?"wa":"ok"}">${a.state=="suspendu"?"suspendu — reprise auto":"actif"}</span><div class="mu">contexte conservé côté service IA</div></td><td><button class="g" data-a="edita" data-i="${a.id}">Modifier</button> <button class="g" data-a="tok" data-i="${a.id}">Simuler fin de tokens</button> <button class="g d" data-a="dela" data-i="${a.id}">Révoquer</button></td></tr>`).join("")+`</table>`}
-  if(tab=="roles"){c=`<div class="row"><button class="b" data-a="newr">Nouveau rôle</button></div><table><tr><th>Rôle</th><th>Description</th><th></th></tr>`+p.roles.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.desc)}</td><td><button class="g" data-a="editr" data-i="${r.id}">Modifier</button> <button class="g d" data-a="delr" data-i="${r.id}">Supprimer</button></td></tr>`).join("")+`</table>`}
-  if(tab=="git"){c=`<div class="card"><b>Dépôt associé</b><div class="mu">${esc(p.repo.url||"non configuré")} · branche ${esc(p.repo.branch)} · dossier ${esc(p.repo.dir||"—")}</div><div style="margin-top:8px"><button class="g" data-a="repo">Configurer</button> <button class="g" data-a="newc">Nouveau commit</button> <button class="g" data-a="newrel">Générer une release</button> <button class="g" data-a="newmr">Merge request</button></div></div><h3>Commits</h3><table><tr><th>Date</th><th>Message</th><th>Auteur</th></tr>`+p.commits.slice().reverse().map(m=>`<tr><td class="mu">${esc(m.d)}</td><td>${esc(m.m)}</td><td>${esc(m.by)}</td></tr>`).join("")+`</table><h3>Releases</h3>`+p.releases.map(r=>`<div class="tr" style="margin-bottom:6px"><span class="tag ok">${esc(r.v)}</span><span class="t">${esc(r.n)}</span><span class="mu">${esc(r.d)}</span></div>`).join("")+`<h3>Merge requests</h3>`+p.mrs.map(r=>`<div class="tr" style="margin-bottom:6px"><span class="tag">${esc(r.from)} → ${esc(r.to)}</span><span class="t">${esc(r.t)}</span><span class="mu">${esc(r.d)}</span></div>`).join("")}
-  if(tab=="bugs"){c=`<div class="row"><button class="b" data-a="newb">Déclarer un bug</button></div><table><tr><th>Bug</th><th>Gravité</th><th>Assigné</th><th>Statut</th><th></th></tr>`+p.bugs.map(b=>`<tr><td><b>${esc(b.t)}</b><div class="mu">${esc(b.d)}</div></td><td><span class="tag ${b.sev=="critique"?"er":b.sev=="majeur"?"wa":""}">${esc(b.sev)}</span></td><td>${esc((ag(p,b.who)||{}).name||"—")}</td><td><select data-s="status" data-i="${b.id}" id="bs${b.id}">${["ouvert","en cours","résolu"].map(s=>`<option${s==b.status?" selected":""}>${s}</option>`).join("")}</select></td><td><button class="g d" data-a="delb" data-i="${b.id}">Supprimer</button></td></tr>`).join("")+`</table>`}
+    c=`<div class="grid"><div class="card"><div class="big">${prog(p)} %</div><div class="bar"><i style="width:${prog(p)}%"></i></div><div class="mu">${done}/${p.tasks.length} tâches terminées · ${doing} en cours</div></div><div class="card"><div class="big">${p.agents.length}</div><div class="mu">agents · principal : ${esc(m?m.name:"aucun")}</div></div><div class="card"><div class="big">${ob}</div><div class="mu">bugs ouverts sur ${p.bugs.length}</div></div><div class="card"><div class="big">${p.releases.length?esc(p.releases[p.releases.length-1].v):"—"}</div><div class="mu">dernière release · ${p.modules.length} modules</div></div></div><h3>Dialogue avec l’agent principal</h3>`+(m?chatBox(p,m,8)+chatInput("gi",m.id):`<div class="card">Aucun agent principal : recrutez un agent dans l’onglet Équipe.</div>`)+`<h3>Règles du projet <button class="g" data-a="rules">Modifier</button></h3><div class="card" style="white-space:pre-wrap">${esc(p.rules||"Aucune règle spécifique.")}</div><h3>Description</h3><div class="card">${esc(p.desc||"Aucune description.")}</div>`}
+  if(tab=="tasks")c=`<div class="row"><button class="b" data-a="newt" data-i="">Nouvelle tâche</button></div>`+(tree(p,"")||`<div class="mu">Aucune tâche.</div>`);
+  if(tab=="modules")c=`<div class="row"><button class="b" data-a="newm">Nouveau module</button></div><table><tr><th>Module</th><th>Avancement</th><th>Bugs ouverts</th><th></th></tr>`+p.modules.map(x=>{const ts=p.tasks.filter(t=>(t.modules||[]).includes(x.id)),d=ts.filter(t=>t.status=="terminée").length;return `<tr><td><b>${esc(x.name)}</b><div class="mu">${esc(x.desc||"")}</div></td><td>${ts.length?Math.round(100*d/ts.length):0} % (${d}/${ts.length})</td><td>${p.bugs.filter(b=>(b.modules||[]).includes(x.id)&&b.status!="résolu").length}</td><td><button class="g" data-a="editm" data-i="${x.id}">Modifier</button> <button class="g d" data-a="delm" data-i="${x.id}">Supprimer</button></td></tr>`}).join("")+`</table>`;
+  if(tab=="team")c=`<div class="row"><button class="b" data-a="newa">Recruter un agent</button><button class="g" data-a="sync">Synchroniser règles et branches</button></div><table><tr><th>Agent</th><th>Service / rôle</th><th>Git & droits</th><th></th></tr>`+p.agents.map(a=>`<tr><td><b>${esc(a.name)}</b> ${isMain(p,a)?`<span class="tag ok">principal</span>`:""}<div class="mu">joint : ${isMain(p,a)?"tous":esc((a.talk||[]).map(i=>(ag(p,i)||{}).name).filter(Boolean).join(", ")||"personne")}</div></td><td>${esc(svc(a.service))}<br><span class="tag">${esc(rname(p,a.role))}</span></td><td class="mu">branche ${esc(a.branch)}<br>bugs : ${a.canBug||isMain(p,a)?"oui":"non"}</td><td><button class="g" data-a="talkto" data-i="${a.id}">Dialoguer</button> <button class="g" data-a="edita" data-i="${a.id}">Modifier</button>${isMain(p,a)?"":` <button class="g" data-a="main" data-i="${a.id}">Principal</button>`} <button class="g d" data-a="dela" data-i="${a.id}">Révoquer</button></td></tr>`).join("")+`</table>`;
+  if(tab=="dlg"){const cur=ag(p,chatAg)||m||p.agents[0];
+    c=cur?`<div class="row">`+p.agents.map(a=>`<button class="g" data-a="pick" data-i="${a.id}"${cur.id==a.id?` style="background:var(--ac2)"`:""}>${esc(a.name)}${isMain(p,a)?" ★":""}</button>`).join("")+`</div>`+chatBox(p,cur,60)+chatInput("ci",cur.id):`<div class="card">Aucun agent.</div>`}
+  if(tab=="histo"){const L=p.log.filter(x=>hf=="all"||(!NA.includes(x.from)&&!NA.includes(x.to))).slice(-200);
+    c=`<div class="row"><button class="g" data-a="hf" data-i="all">Tout</button><button class="g" data-a="hf" data-i="ag">Entre agents seulement</button><span class="mu">${L.length} message(s)</span></div><table><tr><th>Date</th><th>De → À</th><th>Message</th></tr>`+L.map(x=>`<tr><td class="mu">${esc(x.d)}</td><td>${esc(x.from)} → ${esc(x.to)}</td><td style="white-space:pre-wrap">${esc(x.text)}</td></tr>`).join("")+`</table>`}
+  if(tab=="recap")c=`<div class="row"><button class="g" data-a="rk" data-i="f">Fonctionnel</button><button class="g" data-a="rk" data-i="t">Technique</button></div><div class="card" style="white-space:pre-wrap">${esc(recap(p,rk))}</div>`;
+  if(tab=="git")c=`<div class="card"><b>Dépôt du projet</b><div class="mu">${esc(p.repo.url||"non configuré")} · branche de base ${esc(p.repo.branch)} · token ${p.repo.token?"défini":"manquant"}</div><div style="margin-top:8px"><button class="g" data-a="repo">Configurer</button> <button class="g" data-a="newrel"${busy=="release"?" disabled":""}>${busy=="release"?"⏳ release en cours…":"Créer une release"}</button></div><div class="mu" style="margin-top:6px">Une release fait réaliser par l’agent principal la fusion (merge request) de chaque branche d’agent dans la branche de base, puis la création du tag.</div></div><h3>Commits poussés</h3><table><tr><th>Date</th><th>Message</th><th>Auteur</th><th>SHA</th></tr>`+p.commits.slice(-30).reverse().map(x=>`<tr><td class="mu">${esc(x.d)}</td><td>${esc(x.m)}</td><td>${esc(x.by)}</td><td class="mu">${esc(x.sha||"")}</td></tr>`).join("")+`</table><h3>Releases</h3>`+p.releases.map(r=>`<div class="tr" style="margin-bottom:6px"><span class="tag ok">${esc(r.v)}</span><span class="t">${esc(r.n)}</span><span class="mu">${esc(r.d)}</span></div>`).join("")+`<h3>Merge requests</h3>`+p.mrs.map(r=>`<div class="tr" style="margin-bottom:6px"><span class="tag">${esc(r.from)} → ${esc(r.to)}</span><span class="t">${esc(r.t)}</span><span class="mu">${esc(r.d)}</span></div>`).join("");
+  if(tab=="bugs")c=`<div class="row"><button class="b" data-a="newb">Déclarer un bug</button></div><table><tr><th>Bug</th><th>Gravité</th><th>Statut</th><th></th></tr>`+p.bugs.map(b=>`<tr><td><b>${esc(b.t)}</b> ${mtags(p,b.modules)}<div class="mu">${esc(b.d)}${b.by?" — déclaré par "+esc(b.by):""}</div></td><td><span class="tag ${b.sev=="critique"?"er":b.sev=="majeur"?"wa":""}">${esc(b.sev)}</span></td><td><select data-s="status" data-i="${b.id}">${["ouvert","en cours","résolu"].map(s=>`<option${s==b.status?" selected":""}>${s}</option>`).join("")}</select></td><td><button class="g" data-a="mods" data-i="${b.id}" data-j="b">Modules</button> <button class="g d" data-a="delb" data-i="${b.id}">Supprimer</button></td></tr>`).join("")+`</table>`;
+  if(tab=="roles")c=`<div class="row"><button class="b" data-a="newr">Nouveau rôle</button></div><table><tr><th>Rôle</th><th>Description</th><th></th></tr>`+p.roles.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.desc)}</td><td><button class="g" data-a="editr" data-i="${r.id}">Modifier</button> <button class="g d" data-a="delr" data-i="${r.id}">Supprimer</button></td></tr>`).join("")+`</table>`;
   return `<div class="top"><h2>${esc(p.name)}</h2><span class="mu">${esc(p.repo.url||"")}</span></div><div class="tabs">`+T.map(t=>`<button data-t="${t[0]}" class="${tab==t[0]?"on":""}">${t[1]}</button>`).join("")+`</div>`+c;
 }
 const svc=id=>(D.services.find(s=>s.id==id)||{name:"service révoqué"}).name;
 const rname=(p,id)=>(p.roles.find(r=>r.id==id)||{name:"—"}).name;
 function tree(p,par){
-  return p.tasks.filter(t=>(t.parent||"")==par).map(t=>`<div class="task"><div class="tr"><span class="t"><b>${esc(t.title)}</b> <span class="mu">${esc(t.desc||"")}</span></span><select data-s="who" data-i="${t.id}"><option value="">non affectée</option>${p.agents.map(a=>`<option value="${a.id}"${a.id==t.who?" selected":""}>${esc(a.name)}</option>`).join("")}</select><select data-s="status" data-i="${t.id}">${["à faire","en cours","terminée"].map(s=>`<option${s==t.status?" selected":""}>${s}</option>`).join("")}</select>${t.who?`<button class="g" data-a="run" data-i="${t.id}"${t.running?" disabled":""}>${t.running?"⏳ en cours…":"▶ Exécuter"}</button>`:""}<button class="g" data-a="newt" data-i="${t.id}">+ sous-tâche</button><button class="g d" data-a="delt" data-i="${t.id}">×</button></div>${t.result?`<details><summary class="mu">Résultat de l’agent</summary><div style="white-space:pre-wrap">${esc(t.result)}</div></details>`:""}${tree(p,t.id)}</div>`).join("");
+  return p.tasks.filter(t=>(t.parent||"")==par).map(t=>`<div class="task"><div class="tr"><span class="t"><b>${esc(t.title)}</b> ${mtags(p,t.modules)} <span class="mu">${esc(t.desc||"")}</span></span><select data-s="who" data-i="${t.id}"><option value="">non affectée</option>${p.agents.map(a=>`<option value="${a.id}"${a.id==t.who?" selected":""}>${esc(a.name)}</option>`).join("")}</select><select data-s="status" data-i="${t.id}">${["à faire","en cours","terminée"].map(s=>`<option${s==t.status?" selected":""}>${s}</option>`).join("")}</select>${t.who?`<button class="g" data-a="run" data-i="${t.id}"${t.running?" disabled":""}>${t.running?"⏳ en cours…":"▶ Exécuter"}</button>`:""}<button class="g" data-a="mods" data-i="${t.id}" data-j="t">Modules</button><button class="g" data-a="newt" data-i="${t.id}">+ sous-tâche</button><button class="g d" data-a="delt" data-i="${t.id}">×</button></div>${t.result?`<details><summary class="mu">Résultat de l’agent</summary><div style="white-space:pre-wrap">${esc(t.result)}</div></details>`:""}${tree(p,t.id)}</div>`).join("");
+}
+const F="`".repeat(3);
+const RULES=[
+"Tu es un agent IA membre d’une équipe de développement pilotée depuis une application web. Tu réponds en français, de façon concise et factuelle.",
+"Tu travailles uniquement sur ta branche git, jamais directement sur la branche de base. Les merge requests et le tag sont réalisés par l’agent principal lors des releases.",
+"Ton fichier de contexte (.agents/<ton prénom>.md sur ta branche) fait foi : respecte-le rigoureusement et mets-le à jour avec l’action « context » dès qu’une décision ou une convention durable apparaît.",
+"Tu ne contactes que les agents autorisés. Seul l’agent principal crée des tâches et tient les spécifications. Tu ne déclares un bug que si ce droit t’est accordé.",
+"Pour agir sur l’application, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Sans bloc, ta réponse reste du simple texte."];
+const ACTIONS="Actions (un objet JSON par bloc "+F+"action ... "+F+") :\n"+[
+'{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable',
+'{"do":"context","text":"..."} : réécrire tes notes personnelles (fichier de contexte)',
+'{"do":"task_status","id":"<id>","status":"à faire|en cours|terminée"} : statut d’une de tes tâches',
+'{"do":"bug","title":"...","desc":"...","sev":"mineur|majeur|critique","modules":["<module>"]} : déclarer un bug (si autorisé)',
+'{"do":"task","title":"...","desc":"...","assignee":"<prénom>","parent":"<id ou vide>","modules":["<module>"]} : créer une tâche (agent principal)',
+'{"do":"spec","text":"<spécifications complètes en markdown>"} : remplacer les spécifications (agent principal)'].join("\n");
+function ctxText(p,a){const r=role(p,a),mn=isMain(p,a);
+  return ["# Contexte de l’agent "+a.name+" — projet "+p.name,"","> Ce fichier fait foi : respecte-le rigoureusement et mets-le à jour (action « context »).","","## Règles de l’équipe",RULES.map(x=>"- "+x).join("\n"),p.rules?"\n## Règles du projet\n"+p.rules:"","\n## Mon rôle\n"+r.name+" — "+r.desc,"\n## Ma branche\n"+a.branch+(mn?"\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release.":""),"\n## Droits\n- Déclarer des bugs : "+(a.canBug||mn?"oui":"non")+"\n- Agents joignables : "+(mn?"tous":((a.talk||[]).map(i=>(ag(p,i)||{}).name).filter(Boolean).join(", ")||"aucun")),"\n## "+ACTIONS,"\n## Notes de l’agent (à tenir à jour)\n"+(a.notes||"(vides)")].join("\n")}
+function sysPrompt(p,a){const mn=isMain(p,a),others=p.agents.filter(x=>x.id!=a.id),r=role(p,a),can=x=>mn||(a.talk||[]).includes(x.id);
+  const ts=p.tasks.filter(t=>mn||t.who==a.id).slice(0,60).map(t=>t.id+" | "+t.title+" | "+t.status+" | "+((ag(p,t.who)||{}).name||"—")+(modNames(p,t.modules).length?" | "+modNames(p,t.modules).join(","):"")).join("\n");
+  return ["# Règles de l’équipe\n"+RULES.join("\n"),p.rules?"# Règles du projet\n"+p.rules:"",
+  "# Toi\nPrénom : "+a.name+"\nRôle : "+r.name+" — "+r.desc+"\nBranche git : "+a.branch+"\n"+(mn?"Tu es l’AGENT PRINCIPAL : tu peux écrire à tous les agents, créer des tâches, déclarer des bugs et tenir les spécifications à jour.":"Droit de déclarer des bugs : "+(a.canBug?"oui":"non")),
+  "# Équipe\n"+(others.map(x=>"- "+x.name+" ("+role(p,x).name+(isMain(p,x)?", agent principal":"")+", branche "+x.branch+")"+(can(x)?"":" [non joignable]")).join("\n")||"(seul)"),
+  "# Projet "+p.name+"\n"+(p.desc||""),"# Modules\n"+(p.modules.map(m=>"- "+m.name+" : "+(m.desc||"")).join("\n")||"(aucun)"),
+  "# Tâches (id | titre | statut | agent | modules)\n"+(ts||"(aucune)"),mn?"# Spécifications actuelles\n"+(p.spec||"(vides)").slice(0,6000):"",
+  "# Notes personnelles (ton fichier de contexte)\n"+(a.notes||"(vides)"),ACTIONS].filter(Boolean).join("\n\n")}
+function parseActs(t){const acts=[],re=/```action\s*([\s\S]*?)```/g;let m;while((m=re.exec(t))){try{acts.push(JSON.parse(m[1]))}catch(e){}}return{clean:t.replace(re,"").trim(),acts}}
+const hasGit=p=>p.repo.url&&p.repo.token;
+async function flush(){clearTimeout(st);if(D&&TOK)await api("PUT","/api/state",D)}
+async function git(p,op,o){await flush();return api("POST","/api/git",Object.assign({projectId:p.id,op},o||{}))}
+async function pushFile(p,a,path,content,msg){if(!hasGit(p))return;const r=await git(p,"put_file",{branch:a.branch||p.repo.branch,path,content,message:msg});p.commits.push({m:msg,by:a.name,d:now(),sha:(r.sha||"").slice(0,7)})}
+async function provision(p,a){
+  if(!hasGit(p))return "Dépôt GitHub/token non configuré au niveau du projet : branche et fichier de contexte non créés.";
+  try{const r=await git(p,"ensure_branch",{branch:a.branch});await pushFile(p,a,".agents/"+a.name+".md",ctxText(p,a),"chore("+a.name+") : contexte agent");return "Branche "+a.branch+(r.created?" créée":" déjà existante")+", fichier .agents/"+a.name+".md poussé."}
+  catch(e){return "Provisionnement échoué : "+e.message}}
+async function onboard(p,a){const r=await provision(p,a);log(p,"Système",a.name,"Onboarding de "+a.name+" : règles de l’équipe et du projet transmises (prompt système + fichier de contexte). "+r);save();render()}
+async function syncAll(p){for(const a of p.agents){const r=await provision(p,a);log(p,"Système",a.name,"Synchronisation : "+r)}save();render()}
+async function ask(p,a,text,from,depth){
+  const s=D.services.find(x=>x.id==a.service);
+  if(!s)throw new Error("Service IA révoqué pour "+a.name);
+  const content="["+from+"] "+text;
+  log(p,from,a.name,text);save();render();
+  const h=(a.history||[]).slice(-30);while(h.length&&h[0].role!="user")h.shift();
+  await flush();
+  const o=await api("POST","/api/agent/run",{serviceId:s.id,system:sysPrompt(p,a),messages:h.concat([{role:"user",content}])});
+  const {clean,acts}=parseActs(o.text);
+  a.history=h.concat([{role:"user",content},{role:"assistant",content:o.text}]);
+  log(p,a.name,from,clean||"(action sans texte)");
+  for(const x of acts){const r=await doAct(p,a,x,depth);if(r)log(p,"Système",a.name,r)}
+  save();render();return clean;
+}
+async function doAct(p,a,x,depth){
+  const mn=isMain(p,a),byName=n=>p.agents.find(g=>g.name.toLowerCase()==String(n||"").toLowerCase());
+  try{
+    if(x.do=="message"){const t=byName(x.to);if(!t||t.id==a.id)return "Message refusé : agent « "+x.to+" » inconnu.";
+      if(!mn&&!(a.talk||[]).includes(t.id))return "Message refusé : "+a.name+" ne peut pas écrire à "+t.name+".";
+      if(depth>=3)return "Message non délivré (profondeur maximale d’échanges atteinte).";
+      const r=await ask(p,t,x.text,a.name,depth+1);a.history.push({role:"user",content:"[Réponse de "+t.name+"] "+r});return ""}
+    if(x.do=="context"){a.notes=String(x.text||"");await pushFile(p,a,".agents/"+a.name+".md",ctxText(p,a),"chore("+a.name+") : mise à jour du contexte");return "Contexte mis à jour"+(hasGit(p)?" et poussé sur "+a.branch:"")+"."}
+    if(x.do=="task_status"){const t=p.tasks.find(k=>k.id==x.id);if(!t||(!mn&&t.who!=a.id))return "Changement de statut refusé.";t.status=x.status;return "Tâche « "+t.title+" » : "+x.status+"."}
+    if(x.do=="bug"){if(!mn&&!a.canBug)return "Déclaration de bug refusée : droit non accordé à "+a.name+".";p.bugs.push({id:uid(),t:x.title,d:x.desc||"",sev:["mineur","majeur","critique"].includes(x.sev)?x.sev:"mineur",status:"ouvert",by:a.name,modules:modIds(p,x.modules)});return "Bug déclaré : "+x.title}
+    if(x.do=="task"){if(!mn)return "Création de tâche refusée : réservée à l’agent principal.";const as=byName(x.assignee);p.tasks.push({id:uid(),parent:p.tasks.some(k=>k.id==x.parent)?x.parent:"",title:x.title,desc:x.desc||"",who:as?as.id:"",status:"à faire",modules:modIds(p,x.modules)});return "Tâche créée : "+x.title+(as?" → "+as.name:"")}
+    if(x.do=="spec"){if(!mn)return "Mise à jour des spécifications refusée : réservée à l’agent principal.";p.spec=String(x.text||"");await pushFile(p,a,"SPEC.md",p.spec,"docs : mise à jour des spécifications");return "Spécifications mises à jour."}
+  }catch(e){return "Action « "+x.do+" » en échec : "+e.message}
+  return "Action inconnue : "+x.do;
+}
+async function userSay(p,a,text){
+  if(busy||!text.trim())return;busy=a.name;
+  try{await ask(p,a,text,"Vous",0)}catch(e){log(p,"Système",a.name,e.status==429?"Quota du service atteint : réessayez dans "+((e.data||{}).retry_after||60)+" s.":"Erreur : "+e.message)}
+  busy=null;save();render();
 }
 async function runTask(p,tid){
   const t=p.tasks.find(x=>x.id==tid),a=t&&ag(p,t.who);
   if(!a)return alert("Affectez d’abord la tâche à un agent.");
-  const s=D.services.find(x=>x.id==a.service),r=p.roles.find(x=>x.id==a.role)||{};
-  if(!s)return alert("Le service IA de cet agent a été révoqué.");
   if(t.running)return;
-  t.running=true;t.status="en cours";a.state="actif";a.history=a.history||[];save();render();
-  const msg="Projet : "+p.name+(p.desc?" — "+p.desc:"")+"\nTâche : "+t.title+(t.desc?"\n"+t.desc:"")+"\nRéponds avec ton livrable (code, texte ou analyse) pour cette tâche.";
-  const system="Tu es "+a.name+", "+(r.name||"membre de l’équipe")+" sur ce projet. "+(r.desc||"")+" Tu collabores avec : "+((a.talk||[]).map(i=>(ag(p,i)||{}).name).filter(Boolean).join(", ")||"personne")+".";
-  try{
-    const o=await api("POST","/api/agent/run",{serviceId:s.id,system,messages:a.history.concat([{role:"user",content:msg}])});
-    t.result=o.text;t.status="terminée";t.running=false;
-    a.history=a.history.concat([{role:"user",content:msg},{role:"assistant",content:o.text}]).slice(-20);
-  }catch(e){
-    t.running=false;
+  t.running=true;t.status="en cours";a.state="actif";save();render();
+  const msg="Exécute cette tâche (id "+t.id+") : "+t.title+(t.desc?"\n"+t.desc:"")+(modNames(p,t.modules).length?"\nModules : "+modNames(p,t.modules).join(", "):"")+"\nRéponds avec ton livrable, puis mets à jour le statut avec l’action task_status.";
+  try{const r=await ask(p,a,msg,"Application",0);t.result=r;if(t.status=="en cours")t.status="terminée"}
+  catch(e){
     if(e.status==429){const w=Math.max(5,Math.min(+((e.data||{}).retry_after)||60,3600));a.state="suspendu";t.status="à faire";t.result="Suspendu (quota atteint) — reprise automatique dans "+w+" s.";setTimeout(()=>{if(a.state=="suspendu"){a.state="actif";runTask(p,tid)}},w*1000)}
     else{t.status="à faire";t.result="Erreur : "+e.message}
   }
-  save();render();
+  t.running=false;save();render();
+}
+async function doRelease(p,v,n){
+  const mg=mainAgent(p),who=mg?mg.name:"Système",base=p.repo.branch;
+  if(!hasGit(p)){p.releases.push({v,n,d:now()});log(p,"Système",who,"Release "+v+" enregistrée localement : dépôt/token non configuré, ni fusion ni tag.");save();return render()}
+  busy="release";render();const out=[];
+  for(const b of [...new Set(p.agents.map(a=>a.branch).filter(b=>b&&b!=base))]){
+    try{const r=await git(p,"pr_merge",{head:b,title:"Release "+v+" : fusion de "+b,body:n});
+      if(r.skipped)out.push(b+" : rien à fusionner");else{p.mrs.push({from:b,to:base,t:"#"+r.number+" "+b,d:now()});out.push(b+" : merge request #"+r.number+" fusionnée")}}
+    catch(e){out.push(b+" : ÉCHEC — "+e.message)}}
+  try{const r=await git(p,"release",{tag:v,name:"Release "+v,body:n});p.releases.push({v,n,d:now(),url:r.url});out.push("Tag "+v+" créé sur "+base)}
+  catch(e){out.push("Tag : ÉCHEC — "+e.message)}
+  log(p,who,"Vous","Release "+v+" :\n"+out.join("\n"));busy=null;save();render();
 }
 function act(a,i,j){
   const p=P();
-  const now=()=>new Date().toLocaleString("fr-FR");
   if(a=="go"){pid=i;view="p";tab="glob";return render()}
-  if(a=="run")return runTask(p,i);
   if(a=="newp")return modal("Nouveau projet",[{k:"name",l:"Nom"},{k:"desc",l:"Description",area:1}],o=>{if(o.name){const n=newProject(o.name);n.desc=o.desc;D.projects.push(n);pid=n.id;view="p";tab="glob"}});
   if(a=="tog"){const x=D.projects.find(p=>p.id==i);x.open=!x.open;save();return render()}
   if(a=="delp"){if(confirm("Supprimer ce projet définitivement ?")){D.projects=D.projects.filter(p=>p.id!=i);save();render()}return}
@@ -151,24 +257,33 @@ function act(a,i,j){
   if(a=="news")return modal("Ajouter un service IA",sf({}),o=>{if(o.name)D.services.push(Object.assign({id:uid()},o))});
   if(a=="edits"){const s=D.services.find(x=>x.id==i);return modal("Modifier le service",sf(s),o=>Object.assign(s,o))}
   if(a=="dels"){if(confirm("Révoquer ce service ?")){D.services=D.services.filter(s=>s.id!=i);save();render()}return}
-  if(a=="newt")return modal(i?"Nouvelle sous-tâche":"Nouvelle tâche",[{k:"title",l:"Titre"},{k:"desc",l:"Description"}],o=>{if(o.title)p.tasks.push({id:uid(),parent:i||"",title:o.title,desc:o.desc,who:"",status:"à faire"})});
+  if(a=="run")return runTask(p,i);
+  const mf=(v)=>p.modules.length?[{k:"modules",l:"Modules (Ctrl+clic pour plusieurs)",opts:p.modules.map(m=>[m.id,m.name]),multi:1,v:v||[]}]:[];
+  if(a=="newt")return modal(i?"Nouvelle sous-tâche":"Nouvelle tâche",[{k:"title",l:"Titre"},{k:"desc",l:"Description"}].concat(mf()),o=>{if(o.title)p.tasks.push({id:uid(),parent:i||"",title:o.title,desc:o.desc,who:"",status:"à faire",modules:o.modules||[]})});
   if(a=="delt"){const kill=new Set([i]);let ch=true;while(ch){ch=false;p.tasks.forEach(t=>{if(kill.has(t.parent)&&!kill.has(t.id)){kill.add(t.id);ch=true}})}p.tasks=p.tasks.filter(t=>!kill.has(t.id));save();return render()}
-  const af=(x)=>[{k:"name",l:"Prénom",v:x.name},{k:"service",l:"Service IA",v:x.service,opts:D.services.map(s=>[s.id,s.name])},{k:"role",l:"Rôle",v:x.role,opts:p.roles.map(r=>[r.id,r.name])},{k:"token",l:"Token GitHub",v:x.token,type:"password"},{k:"repo",l:"Dépôt",v:x.repo||p.repo.url},{k:"branch",l:"Branche",v:x.branch||"main"},{k:"dir",l:"Répertoire local",v:x.dir}].concat(p.agents.filter(o=>o.id!=x.id).length?[{k:"talk",l:"Peut communiquer avec (noms séparés par des virgules)",v:(x.talk||[]).map(i=>(ag(p,i)||{}).name).filter(Boolean).join(", ")}]:[]);
+  if(a=="mods"){if(!p.modules.length)return alert("Créez d’abord un module (onglet Modules).");const x=(j=="t"?p.tasks:p.bugs).find(k=>k.id==i);return modal("Modules",mf(x.modules),o=>{x.modules=o.modules||[]})}
+  if(a=="newm"||a=="editm"){const x=a=="editm"?p.modules.find(m=>m.id==i):{};return modal("Module",[{k:"name",l:"Nom",v:x.name},{k:"desc",l:"Description",v:x.desc,area:1}],o=>{if(!o.name)return;if(x.id)Object.assign(x,o);else p.modules.push({id:uid(),name:o.name,desc:o.desc})})}
+  if(a=="delm"){if(confirm("Supprimer ce module ?")){p.modules=p.modules.filter(m=>m.id!=i);p.tasks.concat(p.bugs).forEach(x=>{x.modules=(x.modules||[]).filter(k=>k!=i)});save();render()}return}
+  const af=(x)=>[{k:"name",l:"Prénom",v:x.name},{k:"service",l:"Service IA",v:x.service,opts:D.services.map(s=>[s.id,s.name])},{k:"role",l:"Rôle",v:x.role,opts:p.roles.map(r=>[r.id,r.name])},{k:"branch",l:"Branche git (créée si absente ; peut être partagée avec d’autres agents)",v:x.branch},{k:"canBug",l:"Peut déclarer des bugs",v:x.canBug?"1":"0",opts:[["1","oui"],["0","non"]]},{k:"talk",l:"Agents joignables (prénoms séparés par des virgules ; l’agent principal joint tout le monde)",v:(x.talk||[]).map(i=>(ag(p,i)||{}).name).filter(Boolean).join(", ")}];
   const talk=(s)=>(s||"").split(",").map(n=>n.trim().toLowerCase()).filter(Boolean).map(n=>(p.agents.find(a=>a.name.toLowerCase()==n)||{}).id).filter(Boolean);
-  if(a=="newa"){if(!D.services.length||!p.roles.length)return alert("Il faut au moins un service IA et un rôle.");const used=p.agents.map(a=>a.name),free=NAMES.filter(n=>!used.includes(n)),nm=(free.length?free:NAMES)[Math.floor(Math.random()*(free.length||NAMES.length))];return modal("Recruter un agent",af({name:nm}),o=>{o.talk=talk(o.talk);o.id=uid();o.state="actif";p.agents.push(o)},"Recruter")}
-  if(a=="edita"){const x=ag(p,i);return modal("Modifier l’agent",af(x),o=>{o.talk=talk(o.talk);Object.assign(x,o)})}
-  if(a=="dela"){if(confirm("Révoquer cet agent ?")){p.agents=p.agents.filter(a=>a.id!=i);p.tasks.forEach(t=>{if(t.who==i)t.who=""});save();render()}return}
-  if(a=="tok"){const x=ag(p,i);x.state="suspendu";save();render();setTimeout(()=>{x.state="actif";save();if(view=="p"&&pid==p.id)render()},6000);return}
+  if(a=="newa"){if(!D.services.length||!p.roles.length)return alert("Il faut au moins un service IA et un rôle.");const used=p.agents.map(a=>a.name),free=NAMES.filter(n=>!used.includes(n)),nm=(free.length?free:NAMES)[Math.floor(Math.random()*(free.length||NAMES.length))];
+    return modal("Recruter un agent",af({name:nm,branch:"agent/"+nm.toLowerCase()}),o=>{o.talk=talk(o.talk);o.canBug=o.canBug=="1";o.id=uid();o.state="actif";o.history=[];o.notes="";o.branch=o.branch||"agent/"+o.name.toLowerCase();p.agents.push(o);if(!p.mainId)p.mainId=o.id;onboard(p,o)},"Recruter")}
+  if(a=="edita"){const x=ag(p,i);return modal("Modifier l’agent",af(x),o=>{o.talk=talk(o.talk);o.canBug=o.canBug=="1";Object.assign(x,o);onboard(p,x)})}
+  if(a=="dela"){if(confirm("Révoquer cet agent ?")){p.agents=p.agents.filter(a=>a.id!=i);p.tasks.forEach(t=>{if(t.who==i)t.who=""});if(p.mainId==i)p.mainId=p.agents[0]?p.agents[0].id:"";save();render()}return}
+  if(a=="main"){p.mainId=i;save();render();return onboard(p,ag(p,i))}
+  if(a=="sync")return syncAll(p);
+  if(a=="talkto"){chatAg=i;tab="dlg";return render()}
+  if(a=="pick"){chatAg=i;return render()}
+  if(a=="say"){const e=$("#"+j),t=e?e.value:"";if(e)e.value="";return userSay(p,ag(p,i),t)}
+  if(a=="hf"){hf=i;return render()}
+  if(a=="rk"){rk=i;return render()}
+  if(a=="rules")return modal("Règles du projet (transmises à tous les agents)",[{k:"rules",l:"Règles",v:p.rules,area:1,rows:9}],o=>{p.rules=o.rules;syncAll(p)});
   if(a=="newr"||a=="editr"){const r=a=="editr"?p.roles.find(x=>x.id==i):{};return modal("Rôle",[{k:"name",l:"Nom",v:r.name},{k:"desc",l:"Description",v:r.desc,area:1}],o=>{if(!o.name)return;if(r.id)Object.assign(r,o);else p.roles.push(Object.assign({id:uid()},o))})}
   if(a=="delr"){if(p.agents.some(x=>x.role==i))return alert("Ce rôle est utilisé par un agent.");p.roles=p.roles.filter(r=>r.id!=i);save();return render()}
-  const who=[["","—"]].concat(p.agents.map(a=>[a.name,a.name]));
-  if(a=="repo")return modal("Dépôt git",[{k:"url",l:"URL du dépôt",v:p.repo.url},{k:"branch",l:"Branche principale",v:p.repo.branch},{k:"dir",l:"Répertoire local",v:p.repo.dir}],o=>Object.assign(p.repo,o));
-  if(a=="newc")return modal("Nouveau commit",[{k:"m",l:"Message"},{k:"by",l:"Auteur",opts:who}],o=>{if(o.m)p.commits.push({m:o.m,by:o.by||"—",d:now()})});
-  if(a=="newrel")return modal("Générer une release",[{k:"v",l:"Version",v:"v"+(p.releases.length+1)+".0.0"},{k:"n",l:"Notes de version",v:p.commits.slice(-5).map(c=>c.m).join(" ; "),area:1}],o=>{if(o.v)p.releases.push({v:o.v,n:o.n,d:now()})});
-  if(a=="newmr")return modal("Merge request",[{k:"from",l:"Branche source",v:"feature/"},{k:"to",l:"Branche cible",v:p.repo.branch},{k:"t",l:"Titre"}],o=>{if(o.t)p.mrs.push({from:o.from,to:o.to,t:o.t,d:now()})});
-  if(a=="newb")return modal("Déclarer un bug",[{k:"t",l:"Titre"},{k:"d",l:"Description",area:1},{k:"sev",l:"Gravité",opts:[["mineur","mineur"],["majeur","majeur"],["critique","critique"]]},{k:"who",l:"Assigné à",opts:[["","—"]].concat(p.agents.map(a=>[a.id,a.name]))}],o=>{if(o.t)p.bugs.push({id:uid(),t:o.t,d:o.d,sev:o.sev||"mineur",who:o.who,status:"ouvert"})});
+  if(a=="repo")return modal("Dépôt GitHub du projet",[{k:"url",l:"URL du dépôt (https://github.com/propriétaire/dépôt)",v:p.repo.url},{k:"branch",l:"Branche de base",v:p.repo.branch},{k:"token",l:"Token GitHub (contenu + pull requests en écriture)",v:p.repo.token,type:"password"}],o=>Object.assign(p.repo,o));
+  if(a=="newrel")return modal("Créer une release",[{k:"v",l:"Version (tag)",v:"v"+(p.releases.length+1)+".0.0"},{k:"n",l:"Notes de version",area:1}],o=>{if(o.v)doRelease(p,o.v,o.n)},"Lancer la release");
+  if(a=="newb")return modal("Déclarer un bug",[{k:"t",l:"Titre"},{k:"d",l:"Description",area:1},{k:"sev",l:"Gravité",opts:[["mineur","mineur"],["majeur","majeur"],["critique","critique"]]}].concat(mf()),o=>{if(o.t)p.bugs.push({id:uid(),t:o.t,d:o.d,sev:o.sev||"mineur",status:"ouvert",by:"Vous",modules:o.modules||[]})});
   if(a=="delb"){p.bugs=p.bugs.filter(b=>b.id!=i);save();render()}
 }
-
 (async()=>{if(TOK){try{D=await loadState()}catch(e){TOK=null;U=null;D=null}}else U=null;render()})();
 </script></body></html>

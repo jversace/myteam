@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MyTeam - serveur local. Bibliothèque standard uniquement, aucune dépendance."""
-import hashlib, hmac, json, mimetypes, os, re, secrets, threading
-import urllib.error, urllib.request
+import base64, hashlib, hmac, json, mimetypes, os, re, secrets, threading
+import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -53,7 +53,7 @@ def call_ai(s, system, messages):
     if anth:
         u = url + "/messages"
         hd = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-        body = {"model": model, "max_tokens": 4096, "system": system, "messages": messages}
+        body = {"model": model, "max_tokens": 8192, "system": system, "messages": messages}
     else:
         u = url + "/chat/completions"
         hd = {"Authorization": "Bearer " + key}
@@ -77,6 +77,87 @@ def call_ai(s, system, messages):
     if anth:
         return "".join(b.get("text", "") for b in res.get("content", []))
     return res["choices"][0]["message"]["content"]
+
+
+def gh(token, method, path, body=None, ok404=False):
+    """Appel de l'API REST GitHub (aucun git local requis)."""
+    req = urllib.request.Request(
+        "https://api.github.com" + path,
+        json.dumps(body).encode() if body is not None else None,
+        {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+         "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "myteam/1.0",
+         "Content-Type": "application/json"}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and ok404:
+            return None
+        txt = e.read().decode(errors="replace")[:300]
+        if e.code == 403 and "not accessible" in txt:
+            txt = "permission manquante sur le token GitHub (%s %s) : vérifiez Contents et Pull requests en « Read and write »" % (method, path.split("?")[0])
+        raise Err(e.code if e.code in (404, 405, 409, 422) else 502, "GitHub %s : %s" % (e.code, txt))
+    except urllib.error.URLError as e:
+        raise Err(502, "GitHub injoignable : %s" % e.reason)
+
+
+def git_op(u, d):
+    """Opérations git d'un projet : ensure_branch, put_file, pr_merge, release."""
+    st = rj(state_path(u), {})
+    p = next((x for x in st.get("projects", []) if x.get("id") == d.get("projectId")), None)
+    if not p:
+        raise Err(404, "Projet introuvable")
+    repo = p.get("repo") or {}
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", repo.get("url", ""))
+    tok = repo.get("token", "")
+    if not m or not tok:
+        raise Err(400, "Dépôt GitHub ou token non configuré pour ce projet")
+    base = d.get("base") or repo.get("branch") or "main"
+    R = "/repos/%s/%s" % m.groups()
+    q = urllib.parse.quote
+    op = d.get("op")
+    if op == "ensure_branch":
+        b = d["branch"]
+        if gh(tok, "GET", R + "/git/ref/heads/" + q(b), ok404=True):
+            return {"created": False}
+        ref = gh(tok, "GET", R + "/git/ref/heads/" + q(base), ok404=True)
+        if not ref:
+            raise Err(404, "Branche de base « %s » introuvable (dépôt vide ?)" % base)
+        gh(tok, "POST", R + "/git/refs", {"ref": "refs/heads/" + b, "sha": ref["object"]["sha"]})
+        return {"created": True}
+    if op == "put_file":
+        path, b = d["path"], d["branch"]
+        cur = gh(tok, "GET", R + "/contents/" + q(path) + "?ref=" + q(b), ok404=True)
+        body = {"message": d.get("message", "update " + path), "branch": b,
+                "content": base64.b64encode(str(d.get("content", "")).encode()).decode()}
+        if isinstance(cur, dict) and "sha" in cur:
+            body["sha"] = cur["sha"]
+        r = gh(tok, "PUT", R + "/contents/" + q(path), body)
+        return {"sha": r["commit"]["sha"]}
+    if op == "pr_merge":
+        head, pr = d["head"], None
+        try:
+            pr = gh(tok, "POST", R + "/pulls", {"title": d.get("title", head), "head": head,
+                                                 "base": base, "body": d.get("body", "")})
+        except Err as e:
+            if e.code != 422:
+                raise
+            if "No commits between" in e.msg:
+                return {"skipped": True}
+            if "already exists" not in e.msg:
+                raise
+            lst = gh(tok, "GET", R + "/pulls?state=open&base=%s&head=%s" % (q(base), q(m.group(1) + ":" + head)))
+            if not lst:
+                raise
+            pr = lst[0]
+        gh(tok, "PUT", R + "/pulls/%d/merge" % pr["number"], {"merge_method": "merge"})
+        return {"number": pr["number"]}
+    if op == "release":
+        r = gh(tok, "POST", R + "/releases", {"tag_name": d["tag"], "target_commitish": base,
+                                              "name": d.get("name", d["tag"]), "body": d.get("body", "")})
+        return {"url": r.get("html_url")}
+    raise Err(400, "Opération git inconnue")
 
 
 def state_path(user):
@@ -194,6 +275,8 @@ class H(BaseHTTPRequestHandler):
             msgs = [{"role": m["role"], "content": str(m["content"])}
                     for m in d.get("messages", []) if m.get("role") in ("user", "assistant")]
             return self.out(200, {"text": call_ai(s, str(d.get("system", "")), msgs)})
+        if p == "/api/git":
+            return self.out(200, git_op(u, d))
         raise Err(404, "Route inconnue")
 
 

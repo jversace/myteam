@@ -23,9 +23,14 @@ Application web (SPA) + backend Python **sans aucune dépendance** (bibliothèqu
 
 ## Premier usage
 1. **Services IA** : modifiez le service voulu et renseignez la **clé API** et le **modèle**.
-2. **Projets** : créez un projet.
-3. **Équipe** : recrutez un agent (service IA, rôle).
-4. **Tâches** : créez une tâche, affectez-la à l'agent, cliquez sur **▶ Exécuter**. La réponse s'affiche sous la tâche.
+2. **Projets** : créez un projet, puis dans *Git & releases* > *Configurer* : URL du dépôt GitHub, branche de base, **token** (le dépôt et le token sont propres au projet).
+3. **Équipe** : recrutez des agents (service IA, rôle, branche, droits). Le premier est l'**agent principal** (modifiable). À l'onboarding, chaque agent reçoit les règles, sa branche est créée si besoin et son fichier `.agents/<Prénom>.md` est poussé.
+4. **Dialogue** avec n'importe quel agent, ou prompt global vers l'agent principal dans la *Vue globale* : il peut écrire aux autres agents, créer des tâches, tenir les spécifications à jour.
+5. **Modules, tâches, bugs** : une tâche ou un bug peut appartenir à plusieurs modules. **▶ Exécuter** lance une tâche affectée à un agent.
+6. **Release** (*Git & releases*) : l'agent principal fusionne les branches des agents dans la branche de base et crée le tag.
+7. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
+
+Token GitHub : permissions *Contents* et *Pull requests* en lecture/écriture sur le dépôt concerné.
 
 Chaque agent garde son historique (20 derniers messages) et le renvoie au service IA à chaque tâche. Si le service répond « quota atteint » (HTTP 429), l'agent passe en **suspendu** puis relance la tâche automatiquement après le délai indiqué.
 
@@ -50,4 +55,4 @@ Même commande : `APM_HOST=127.0.0.1 python3 server.py`, derrière un reverse pr
 - *Pare-feu Windows* : inutile tant que l'accès reste local.
 
 ## Limites actuelles
-Pas de base de données, pas d'intégration git/GitHub réelle (commits, releases et merge requests sont enregistrés dans l'application mais non exécutés sur le dépôt), la reprise automatique des agents ne survit pas à un redémarrage de la page.
+Pas de base de données, les agents ne lisent ni n'exécutent le code du dépôt, la reprise automatique des agents ne survit pas à un redémarrage de la page.
