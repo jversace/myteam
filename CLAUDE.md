@@ -1,62 +1,67 @@
 # CLAUDE.md — contexte du projet « myteam »
 
 > Lire ce fichier en premier : il évite de ré-analyser tout le code à chaque demande.
-> **Le mettre à jour à chaque modification structurante** (nouvelle route, nouveau champ d'état, nouvelle action d'agent, décision d'architecture).
+> **Le mettre à jour à chaque modification structurante** (route, champ d'état, action d'agent, décision d'architecture).
 
 ## But
 Application de gestion de projets de développement par une **équipe d'agents IA** (Claude, Mistral, ChatGPT, Gemini, DeepSeek…). Tourne en local sur Windows 11 (usage actuel) ou sur un serveur Linux (plus tard). Langue de l'interface, des prompts et des commentaires : **français**.
 
 ## Stack et contraintes
-- Backend : `server.py`, **Python 3.10+, bibliothèque standard uniquement** (aucun `pip install`, ne pas en introduire sans décision explicite).
-- Front : `static/index.html`, SPA **fichier unique** (HTML + CSS + JS, sans framework ni build). Servie par le backend.
+- Backend : **Python 3.10+, bibliothèque standard uniquement** (aucun `pip install` ; ne pas en introduire sans décision explicite).
+- Front : `static/index.html`, SPA **fichier unique** (HTML + CSS + JS, sans framework ni build), servie par le backend.
 - Persistance : fichiers JSON dans `data/` (ignoré par git) : `users.json` (hash PBKDF2), `sessions.json`, `users/<user>.json` (**état complet** d'un utilisateur). Pas de base de données pour l'instant.
-- Git/GitHub : **API REST GitHub** via `urllib` (pas de git local requis). Token au niveau projet.
-- Windows : `start.bat` ; variables `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`.
+- Git/GitHub : **API REST GitHub** via `urllib` (pas de git local). Dépôt + token au niveau projet.
+- Variables : `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`, `APM_GITHUB_API` (tests). Windows : `start.bat`.
 
 ## Fichiers
 | Fichier | Rôle |
 |---|---|
-| `server.py` | HTTP (ThreadingHTTPServer), comptes/sessions, état, `call_ai`, `git_op` |
-| `static/index.html` | Toute l'IHM et le **moteur d'agents côté client** |
-| `README.md` | Installation Windows 11 et usage |
-| `CLAUDE.md` | Ce fichier |
+| `server.py` | HTTP uniquement : routes, comptes/sessions, service du front |
+| `store.py` | lecture/écriture de l'état, `mutate()` atomique, révisions, **fusion à trois voies** `merge3` |
+| `engine.py` | **moteur d'agents serveur** : dialogues, actions, tâches, onboarding, releases, reprise après quota |
+| `github.py` | classe `Repo` : branches, lecture/écriture/suppression de fichiers, PR+fusion, release |
+| `ai.py` | `call_ai` : API Anthropic ou compatible OpenAI |
+| `static/index.html` | toute l'IHM (aucune logique d'agent : elle envoie des travaux au serveur) |
+| `tests/test_engine.py` | tests (faux GitHub local + IA scriptée) : `python -m unittest discover -s tests` |
 
-## API backend (JSON, `Authorization: Bearer <token>`)
+## API (JSON, `Authorization: Bearer <token>`)
 - `POST /api/register|login` → `{token}` ; `POST /api/logout`
-- `GET|PUT /api/state` : état complet de l'utilisateur (le front sauvegarde 300 ms après chaque modification, `flush()` avant les appels agents/git)
-- `POST /api/agent/run` `{serviceId, system, messages}` → `{text}`. Format Anthropic (`kind:"anthropic"`) ou compatible OpenAI. HTTP 429/529 → erreur 429 + `retry_after` (l'agent se suspend et reprend seul pour les tâches).
-- `POST /api/git` `{projectId, op, ...}` ; le serveur relit dépôt+token dans l'état du projet. Ops : `ensure_branch{branch}`, `put_file{branch,path,content,message}`, `pr_merge{head,title,body,base?}` (crée la PR puis la fusionne ; `skipped` si aucun commit), `release{tag,name,body}` (crée le tag + la release GitHub sur la branche de base).
-- Les clés API des services sont stockées **en clair** dans l'état (serveur local uniquement).
+- `GET /api/state` → `{rev, ser, state}` ; `GET /api/state?ser=N` → `{same:true}` si rien n'a changé (sondage du front, toutes les 2 s)
+- `PUT /api/state` `{rev, state}` → `{rev, ser, state}` : le serveur **fusionne** l'état du navigateur avec l'état courant (voir ci-dessous) et renvoie le résultat.
+- `POST /api/job` `{type, projectId, ...}` : lance un travail en arrière-plan (un thread). Types : `say{agentId,text}`, `run_task{taskId}`, `onboard{agentId}`, `sync`, `release{version,notes}`. Le front fait `flush()` (PUT) avant chaque travail.
+
+## Concurrence navigateur / serveur (important)
+Le navigateur et le moteur modifient le même état. `store.put` fait une fusion **à trois voies** : base = dernier instantané reçu par le navigateur (`rev`, 8 gardés + celui servant de base), theirs = état disque, mine = état envoyé. Les listes d'objets avec `id` sont fusionnées par id (suppressions locales respectées, créations serveur conservées) ; en cas de vrai conflit sur une valeur, **le navigateur gagne**. Conséquences :
+- Tout nouvel élément de liste doit avoir un `id`. Les listes sans `id` (`log`, `commits`, `history`…) sont écrites **uniquement par le serveur**.
+- Champs écrits par le serveur : `log, commits, mrs, releases, spec, releasing`, `agent.{history,notes,work,state}`, `task.{running,result,retry_at}`, tâches/bugs créés par les agents. Le navigateur ne doit pas les modifier (`ensure()` ne doit que **compléter** les champs manquants).
+- Le front adopte l'état serveur (sondage ou réponse du PUT) sauf s'il a des modifications en attente ou une fenêtre modale ouverte.
 
 ## Modèle de données (état utilisateur)
 `{services:[{id,name,url,kind,model,apiKey,account,pros,cons}], projects:[...]}`
-Projet : `{id,name,open,desc,rules,spec,mainId, repo:{url,branch,token}, roles[], agents[], tasks[], bugs[], modules[], log[], commits[], releases[], mrs[]}`
-- Agent : `{id,name,service,role,branch,canBug,talk[ids],notes,history[],state}`. **Le dépôt et le token sont au niveau projet** ; seule la **branche** varie par agent (plusieurs agents peuvent partager une branche).
-- Tâche : `{id,parent,title,desc,who,status("à faire|en cours|terminée"),modules[],result,running}` (arborescence via `parent`).
-- Bug : `{id,t,d,sev,status("ouvert|en cours|résolu"),modules[],by}`. Module : `{id,name,desc}`.
+Projet : `{id,name,open,desc,rules,spec,mainId, repo:{url,branch,token}, roles[], agents[], tasks[], bugs[], modules[], log[], commits[], releases[], mrs[], releasing}`
+- Agent : `{id,name,service,role,branch,canBug,talk[ids],notes,history[],state,work}` — **dépôt et token au niveau projet**, seule la **branche** varie par agent (peut être partagée).
+- Tâche : `{id,parent,title,desc,who,status("à faire|en cours|terminée"),modules[],result,running,retry_at}`. Bug : `{id,t,d,sev,status,modules[],by}`. Module : `{id,name,desc}`.
 - `log[]` : `{d,from,to,text}` = historique de **toutes** les discussions (Vous, agents, « Système », « Application »).
-- `ensure(p)` (front) migre/complète les anciens états à chaque chargement : **y ajouter tout nouveau champ**.
+- `ensure(p)` (front) complète les anciens états : **y ajouter tout nouveau champ**.
 
-## Moteur d'agents (dans `static/index.html`)
-- `ask(p,a,text,from,depth)` : prompt système (`sysPrompt`) + historique de l'agent (30 derniers messages) → `/api/agent/run` → extraction des blocs ```` ```action {json} ``` ```` (`parseActs`) → exécution (`doAct`).
-- Actions : `message` (agents joignables ; l'agent principal joint tous ; profondeur max 3), `context` (réécrit les notes de l'agent + repousse son fichier), `task_status`, `bug` (si `canBug` ou principal), `task` (principal seul), `spec` (principal seul, pousse `SPEC.md`).
-- **Agent principal** (`p.mainId`, le premier recruté par défaut) : dialogue via le prompt de la Vue globale, écrit aux autres agents, crée les tâches, tient les spécifications, **réalise les merge requests + le tag à la release** (`doRelease`).
-- **Onboarding** (`onboard`/`provision`) : crée la branche de l'agent si absente (`ensure_branch`, depuis la branche de base) et pousse `.agents/<Prénom>.md` (`ctxText` : règles équipe + règles projet + rôle + droits + actions + notes). Les mêmes règles sont injectées dans le prompt système à chaque appel. « Synchroniser » ou la modification des règles du projet re-pousse tout.
-- Règles génériques : constante `RULES` ; protocole d'actions : constante `ACTIONS`. **Toute nouvelle règle ou action se déclare là** pour que les agents la reçoivent.
-- Release : pour chaque branche d'agent ≠ base → `pr_merge`, puis `release` (tag). Les échecs sont consignés dans l'historique, sans bloquer la suite.
-- Récapitulatifs fonctionnel/technique : générés localement (`recap`) à partir de l'état et de `p.spec`.
-
-## Onglets d'un projet
-Vue globale (indicateurs, prompt vers l'agent principal, règles), Tâches, Modules, Équipe, Dialogue (avec n'importe quel agent), Historique (tout / entre agents), Récapitulatif, Git & releases, Bugs, Rôles.
+## Moteur d'agents (`engine.py`)
+- `ask(u,pid,aid,text,frm,depth)` : boucle d'au plus `MAX_STEPS`=6 tours : prompt système (`sys_prompt`, reconstruit à chaque tour depuis l'état frais) + historique (30 derniers messages) → `call_ai` → blocs ```` ```action {json} ``` ```` (`parse_acts`) → `do_act`. Les **retours** (lecture de fichier, liste, réponse d'un autre agent, refus/erreurs) sont renvoyés à l'agent au tour suivant ; les écritures réussies sont seulement journalisées.
+- Actions : `list_files`, `read_file`, `write_file`, `delete_file` (sur **la branche de l'agent** ; jamais sur la branche de base ; chemins validés par `safe_path`, `.github/`, `.git/` et `.agents/` interdits en écriture ; lecture tronquée à 12 000 car., écriture ≤ 200 000 car.), `message` (agents joignables ; le principal joint tous ; profondeur max 3 ; la réponse revient à l'expéditeur), `context`, `task_status`, `bug` (si `canBug` ou principal), `task` et `spec` (principal seul ; `spec` pousse `SPEC.md`).
+- **Toute nouvelle règle ou action se déclare dans `RULES` / `ACTIONS`** (elles alimentent le prompt système ET le fichier `.agents/<Prénom>.md`).
+- Onboarding/synchronisation (`provision`) : crée la branche de l'agent si absente et pousse `.agents/<Prénom>.md` (règles équipe + projet, rôle, droits, actions, notes).
+- Tâches (`run_task`) : quota 429/529 → agent `suspendu`, `retry_at`, reprise automatique par `threading.Timer` ; `recover()` au démarrage remet les compteurs à zéro, marque les tâches interrompues et replanifie les reprises.
+- Release (`release`) : pour chaque branche d'agent ≠ base → PR + fusion, puis tag + release GitHub ; échecs consignés sans bloquer la suite.
+- Agent principal (`mainId`) : dialogue via le prompt de la Vue globale ; écrit à tous, crée les tâches, tient les spécifications, réalise MR + tag.
 
 ## Conventions de travail
 - Modifier `static/index.html` par remplacements ciblés ; vérifier la syntaxe JS (extraire le `<script>` et `node --check`).
-- Tester le backend avec un faux service OpenAI local (aucune clé réelle nécessaire) ; ne jamais lancer de tests git sur des branches réelles sans les supprimer ensuite.
-- Ne jamais committer `data/`, de token ni de clé API. Un token a été collé dans une conversation : il doit être révoqué.
-- Token GitHub requis : *Contents* et *Pull requests* en lecture/écriture (sinon la fusion échoue en 403 avec un message explicite).
+- Lancer `python -m unittest discover -s tests` avant tout commit. Les tests n'utilisent ni réseau ni clé (faux GitHub, IA scriptée).
+- Ne jamais committer `data/`, de token ni de clé API. Ne jamais tester sur le vrai dépôt sans supprimer ensuite les branches créées.
+- Token GitHub requis : *Contents* et *Pull requests* en lecture/écriture (sinon fusion en 403 avec message explicite).
 
 ## Limites connues / suite prévue
-- Pas de base de données ; sessions sans expiration ; mots de passe/clés non chiffrés au repos côté clés API.
-- Les agents n'exécutent pas de code ni ne lisent le dépôt : ils produisent du texte et des actions (fichier de contexte, spécifications). Prévu : lecture/écriture de fichiers du dépôt par les agents.
-- La reprise automatique après quota ne survit pas à un rechargement de la page ; l'orchestration est côté navigateur (à déplacer côté serveur).
-- Non testé : exécution réelle sous Windows 11, fusion de PR et release avec un token disposant des bons droits.
+- Pas de base de données ; sessions sans expiration ; clés API stockées en clair dans `data/`.
+- Un serveur redémarré perd les travaux en cours (tâches marquées « Interrompu ») ; pas de file d'attente persistante.
+- Les agents ne peuvent pas exécuter de code ni lancer de tests ; ils lisent/écrivent des fichiers du dépôt.
+- Fusion à trois voies : si le navigateur reste très longtemps sans adopter l'état serveur (plus de 8 instantanés), le repli est « le navigateur gagne » (perte possible de données serveur récentes).
+- Non testé : exécution sous Windows 11, fusion de PR et release sur le vrai GitHub avec un token disposant des droits.

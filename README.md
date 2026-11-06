@@ -1,6 +1,7 @@
 # myteam — gestion de projets par une équipe d'agents IA
 
 Application web (SPA) + backend Python **sans aucune dépendance** (bibliothèque standard uniquement).
+Les agents travaillent **côté serveur** : un travail lancé continue même si vous fermez le navigateur.
 - Les données sont persistées dans des fichiers JSON, dans le dossier `data/` (une base de données viendra plus tard).
 - Le backend appelle les API des services IA (Claude via l'API Anthropic ; ChatGPT, Mistral, DeepSeek, Gemini via le format compatible OpenAI).
 
@@ -27,12 +28,19 @@ Application web (SPA) + backend Python **sans aucune dépendance** (bibliothèqu
 3. **Équipe** : recrutez des agents (service IA, rôle, branche, droits). Le premier est l'**agent principal** (modifiable). À l'onboarding, chaque agent reçoit les règles, sa branche est créée si besoin et son fichier `.agents/<Prénom>.md` est poussé.
 4. **Dialogue** avec n'importe quel agent, ou prompt global vers l'agent principal dans la *Vue globale* : il peut écrire aux autres agents, créer des tâches, tenir les spécifications à jour.
 5. **Modules, tâches, bugs** : une tâche ou un bug peut appartenir à plusieurs modules. **▶ Exécuter** lance une tâche affectée à un agent.
-6. **Release** (*Git & releases*) : l'agent principal fusionne les branches des agents dans la branche de base et crée le tag.
-7. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
+6. **Fichiers du dépôt** : les agents peuvent lister, lire, écrire et supprimer des fichiers **sur leur branche** (jamais sur la branche de base), et vous voyez leurs commits dans *Git & releases*.
+7. **Release** (*Git & releases*) : l'agent principal fusionne les branches des agents dans la branche de base et crée le tag.
+8. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
 
 Token GitHub : permissions *Contents* et *Pull requests* en lecture/écriture sur le dépôt concerné.
 
 Chaque agent garde son historique (20 derniers messages) et le renvoie au service IA à chaque tâche. Si le service répond « quota atteint » (HTTP 429), l'agent passe en **suspendu** puis relance la tâche automatiquement après le délai indiqué.
+
+## Tests
+```
+python -m unittest discover -s tests
+```
+Aucun réseau ni clé nécessaires (faux GitHub local, IA simulée).
 
 ## Données et sécurité
 - Tout est dans `data/` (ignoré par git) : comptes (mots de passe hachés PBKDF2), état de chaque utilisateur, **clés API en clair**. Ne partagez jamais ce dossier. Pour sauvegarder, copiez-le.
@@ -55,4 +63,4 @@ Même commande : `APM_HOST=127.0.0.1 python3 server.py`, derrière un reverse pr
 - *Pare-feu Windows* : inutile tant que l'accès reste local.
 
 ## Limites actuelles
-Pas de base de données, les agents ne lisent ni n'exécutent le code du dépôt, la reprise automatique des agents ne survit pas à un redémarrage de la page.
+Pas de base de données ; les agents lisent/écrivent des fichiers mais n'exécutent pas de code ; un redémarrage du serveur interrompt les travaux en cours (les reprises après quota sont, elles, replanifiées).

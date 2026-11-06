@@ -1,0 +1,40 @@
+"""Appel des API des services IA : format Anthropic ou compatible OpenAI."""
+import json
+import urllib.error
+import urllib.request
+
+from store import Err
+
+
+def call_ai(s, system, messages):
+    key, url, model = s.get("apiKey", ""), s.get("url", "").rstrip("/"), s.get("model", "")
+    if not key:
+        raise Err(400, "Clé API manquante pour le service « %s »" % s.get("name", "?"))
+    anth = s.get("kind") == "anthropic"
+    if anth:
+        u = url + "/messages"
+        hd = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        body = {"model": model, "max_tokens": 8192, "system": system, "messages": messages}
+    else:
+        u = url + "/chat/completions"
+        hd = {"Authorization": "Bearer " + key}
+        body = {"model": model, "messages": [{"role": "system", "content": system}] + messages}
+    hd.update({"Content-Type": "application/json", "User-Agent": "myteam/1.0"})
+    req = urllib.request.Request(u, json.dumps(body).encode(), hd, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            res = json.load(r)
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode(errors="replace")[:400]
+        if e.code in (429, 529):  # quota / surcharge : l'agent se suspend puis reprend
+            try:
+                wait = int(e.headers.get("retry-after", "60"))
+            except ValueError:
+                wait = 60
+            raise Err(429, "Quota atteint : " + txt, wait)
+        raise Err(502, "Erreur du service IA (%s) : %s" % (e.code, txt))
+    except urllib.error.URLError as e:
+        raise Err(502, "Service IA injoignable : %s" % e.reason)
+    if anth:
+        return "".join(b.get("text", "") for b in res.get("content", []))
+    return res["choices"][0]["message"]["content"]
