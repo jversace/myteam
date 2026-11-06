@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Atelier d’agents IA</title>
+<style>
+:root{color-scheme:light;--bg:#f6f7f9;--sf:#fff;--tx:#1b1f24;--mu:#667085;--bd:#d9dde3;--ac:#3b5bdb;--ac2:#e7ecff;--ok:#2b8a3e;--wa:#e8590c;--er:#c92a2a;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#14171c;--sf:#1d2128;--tx:#e8eaed;--mu:#9aa3b0;--bd:#323944;--ac:#7c93ff;--ac2:#273055;--ok:#69db7c;--wa:#ffa94d;--er:#ff8787}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#14171c;--sf:#1d2128;--tx:#e8eaed;--mu:#9aa3b0;--bd:#323944;--ac:#7c93ff;--ac2:#273055;--ok:#69db7c;--wa:#ffa94d;--er:#ff8787}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+#app{display:flex;min-height:100vh}
+nav{width:210px;background:var(--sf);border-right:1px solid var(--bd);padding:14px 10px;display:flex;flex-direction:column;gap:4px;flex-shrink:0}
+nav h1{font-size:15px;margin:0 6px 10px}nav .sec{font-size:11px;color:var(--mu);text-transform:uppercase;margin:12px 8px 2px}
+nav button{text-align:left;border:0;background:none;color:var(--tx);padding:8px 10px;border-radius:6px;cursor:pointer;font:inherit}
+nav button:hover{background:var(--bg)}nav button.on{background:var(--ac2);color:var(--ac);font-weight:600}
+main{flex:1;padding:20px;min-width:0;overflow-x:auto}
+h2{margin:0 0 14px;font-size:20px}h3{margin:18px 0 8px;font-size:15px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--bd);margin-bottom:16px;flex-wrap:wrap}
+.tabs button{border:0;background:none;color:var(--mu);padding:8px 12px;cursor:pointer;font:inherit;border-bottom:2px solid transparent}
+.tabs button.on{color:var(--ac);border-color:var(--ac);font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:14px}
+.big{font-size:26px;font-weight:700}.mu{color:var(--mu);font-size:12px}
+.bar{height:7px;background:var(--bd);border-radius:4px;overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;background:var(--ok)}
+button.b,.b{background:var(--ac);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
+button.g{background:none;color:var(--ac);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}
+button.d{color:var(--er)}
+input,select,textarea{font:inherit;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;width:100%}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.row input{width:auto;flex:1;min-width:140px}
+table{width:100%;border-collapse:collapse;background:var(--sf);border:1px solid var(--bd);border-radius:10px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--bd);text-align:left;vertical-align:top}th{font-size:12px;color:var(--mu)}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:var(--ac2);color:var(--ac)}
+.tag.ok{color:var(--ok)}.tag.wa{color:var(--wa)}.tag.er{color:var(--er)}
+.task{margin-left:0;border-left:2px solid var(--bd);padding-left:10px;margin-top:6px}
+.tr{display:flex;gap:8px;align-items:center;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:6px 10px;flex-wrap:wrap}.tr .t{flex:1;min-width:140px}.tr select{width:auto}
+#mod{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;z-index:9;padding:16px}
+#mod>div{background:var(--sf);border-radius:12px;padding:18px;width:100%;max-width:440px;max-height:90vh;overflow:auto}
+#mod label{display:block;font-size:12px;color:var(--mu);margin:10px 0 3px}
+#login{max-width:340px;margin:12vh auto;padding:0 16px}#login .card{display:flex;flex-direction:column;gap:10px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+@media(max-width:700px){#app{flex-direction:column}nav{width:auto;flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--bd)}nav .sec{display:none}}
+</style></head><body>
+<div id="root"></div><div id="mod"><div id="mb"></div></div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let store={users:{},data:{},session:null};
+try{const r=localStorage.getItem("apm");if(r)store=Object.assign(store,JSON.parse(r))}catch(e){}
+let D=null,U=null,view="dash",pid=null,tab="glob",q="",err="";
+const uid=()=>Math.random().toString(36).slice(2,9);
+function save(){if(U)store.data[U]=D;try{localStorage.setItem("apm",JSON.stringify(store))}catch(e){}}
+async function hash(s){try{const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode("apm"+s));return[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("")}catch(e){return btoa(unescape(encodeURIComponent(s)))}}
+const NAMES=["Camille","Louis","Inès","Hugo","Jade","Noah","Léna","Adam","Zoé","Théo","Maëlle","Axel","Éva","Malo","Lucie","Nils"];
+const ROLES=[["Chef de projet","Planifie, priorise, coordonne l’équipe et rend compte de l’avancement."],["Architecte","Définit l’architecture technique et les standards de code."],["Développeur back-end","Implémente la logique métier, les API et la base de données."],["Développeur front-end","Réalise l’interface et l’expérience utilisateur."],["Testeur QA","Rédige et exécute les tests, qualifie et remonte les bugs."],["DevOps","Gère l’intégration continue, le déploiement et l’infrastructure."],["Rédacteur technique","Rédige la documentation et les notes de version."]];
+const SERV=[["Claude","https://api.anthropic.com/v1","Raisonnement, code long, respect des consignes","Quota de tokens à surveiller"],["Mistral","https://api.mistral.ai/v1","Rapide, bon en français, coût maîtrisé","Moins solide sur les très gros contextes"],["ChatGPT","https://api.openai.com/v1","Polyvalent, large écosystème d’outils","Verbosité, coût variable"],["Gemini","https://generativelanguage.googleapis.com","Très grand contexte, multimodal","Régularité variable sur le code"],["DeepSeek","https://api.deepseek.com","Excellent rapport qualité/prix en code","Disponibilité parfois limitée"]];
+function fresh(){return{services:SERV.map(s=>({id:uid(),name:s[0],url:s[1],account:"",pros:s[2],cons:s[3]})),projects:[]}}
+function newProject(name){return{id:uid(),name,open:true,desc:"",repo:{url:"",branch:"main",dir:""},roles:ROLES.map(r=>({id:uid(),name:r[0],desc:r[1]})),agents:[],tasks:[],bugs:[],commits:[],releases:[],mrs:[]}}
+const P=()=>D.projects.find(p=>p.id===pid);
+const ag=(p,id)=>p.agents.find(a=>a.id===id);
+function prog(p){const t=p.tasks.length;return t?Math.round(100*p.tasks.filter(x=>x.status==="terminée").length/t):0}
+function modal(title,fields,cb,okLabel){
+  const h=fields.map(f=>`<label>${esc(f.l)}</label>`+(f.opts?`<select data-k="${f.k}">${f.opts.map(o=>`<option value="${esc(o[0])}"${o[0]==f.v?" selected":""}>${esc(o[1])}</option>`).join("")}</select>`:f.area?`<textarea data-k="${f.k}" rows="3">${esc(f.v||"")}</textarea>`:`<input data-k="${f.k}" type="${f.type||"text"}" value="${esc(f.v||"")}">`)).join("");
+  $("#mb").innerHTML=`<h3 style="margin-top:0">${esc(title)}</h3>${h}<div class="row" style="margin:16px 0 0;justify-content:flex-end"><button class="g" id="mc">Annuler</button><button class="b" id="mo">${okLabel||"Valider"}</button></div>`;
+  $("#mod").style.display="flex";
+  $("#mc").onclick=()=>$("#mod").style.display="none";
+  $("#mo").onclick=()=>{const o={};document.querySelectorAll("#mb [data-k]").forEach(e=>o[e.dataset.k]=e.value);$("#mod").style.display="none";cb(o);save();render()};
+}
+function login(){
+  $("#root").innerHTML=`<div id="login"><div class="card"><h2 style="margin:0">Atelier d’agents IA</h2><span class="mu">Connectez-vous ou créez un compte (les données restent sur cet appareil).</span><input id="u" placeholder="Identifiant" autocomplete="username"><input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password"><div style="color:var(--er)">${esc(err)}</div><button class="b" id="in">Connexion</button><button class="g" id="cr">Créer le compte</button></div></div>`;
+  const go=async mk=>{const u=$("#u").value.trim(),p=$("#p").value;if(!u||!p){err="Identifiant et mot de passe requis.";return login()}const h=await hash(p);
+    if(mk){if(store.users[u]){err="Ce compte existe déjà.";return login()}store.users[u]=h;store.data[u]=fresh()}
+    else if(store.users[u]!==h){err="Identifiants incorrects.";return login()}
+    err="";U=u;D=store.data[u]||(store.data[u]=fresh());store.session=u;save();render()};
+  $("#in").onclick=()=>go(false);$("#cr").onclick=()=>go(true);
+}
+function logout(){save();store.session=null;U=D=null;pid=null;view="dash";try{localStorage.setItem("apm",JSON.stringify(store))}catch(e){}login()}
+function render(){
+  if(!U)return login();
+  const open=D.projects.filter(p=>p.open);
+  let nav=`<nav><h1>Atelier d’agents IA</h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
+  let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():projView();
+  $("#root").innerHTML=`<div id="app">${nav}<main>${body}</main></div>`;
+  document.querySelectorAll("nav [data-v]").forEach(b=>b.onclick=()=>{view=b.dataset.v;render()});
+  document.querySelectorAll("nav [data-p]").forEach(b=>b.onclick=()=>{pid=b.dataset.p;view="p";tab="glob";render()});
+  $("#lo").onclick=logout;bind();
+}
+function bind(){document.querySelectorAll("main [data-a]").forEach(b=>b.onclick=()=>act(b.dataset.a,b.dataset.i,b.dataset.j));
+  document.querySelectorAll("main [data-t]").forEach(b=>b.onclick=()=>{tab=b.dataset.t;render()});
+  document.querySelectorAll("main select[data-s]").forEach(s=>s.onchange=()=>{const p=P();const t=p.tasks.find(x=>x.id==s.dataset.i)||p.bugs.find(x=>x.id==s.dataset.i);t[s.dataset.s]=s.value;save();render()});
+  const s=$("#sq");if(s)s.oninput=()=>{q=s.value;render();const n=$("#sq");n.focus();n.setSelectionRange(q.length,q.length)}}
+function dash(){
+  const open=D.projects.filter(p=>p.open);
+  const ags=open.reduce((n,p)=>n+p.agents.length,0),bugs=open.reduce((n,p)=>n+p.bugs.filter(b=>b.status!="résolu").length,0),susp=open.reduce((n,p)=>n+p.agents.filter(a=>a.state=="suspendu").length,0);
+  return `<h2>Tableau de bord</h2><div class="grid" style="margin-bottom:18px"><div class="card"><div class="big">${open.length}</div><div class="mu">projets ouverts</div></div><div class="card"><div class="big">${ags}</div><div class="mu">agents actifs (dont ${susp} suspendus)</div></div><div class="card"><div class="big">${bugs}</div><div class="mu">bugs non résolus</div></div><div class="card"><div class="big">${D.services.length}</div><div class="mu">services IA</div></div></div>`+(open.length?`<div class="grid">`+open.map(p=>`<div class="card"><b>${esc(p.name)}</b><div class="bar"><i style="width:${prog(p)}%"></i></div><div class="mu">${prog(p)} % · ${p.tasks.length} tâches · ${p.agents.length} agents · ${p.bugs.filter(b=>b.status!="résolu").length} bugs · ${p.releases.length} releases</div><div style="margin-top:8px"><button class="g" data-a="go" data-i="${p.id}">Ouvrir</button></div></div>`).join("")+`</div>`:`<div class="card">Aucun projet ouvert. Créez-en un dans l’onglet Projets.</div>`);
+}
+function projects(){
+  const l=D.projects.filter(p=>p.name.toLowerCase().includes(q.toLowerCase()));
+  return `<h2>Projets</h2><div class="row"><input id="sq" placeholder="Rechercher un projet…" value="${esc(q)}"><button class="b" data-a="newp">Nouveau projet</button></div><table><tr><th>Nom</th><th>État</th><th>Avancement</th><th></th></tr>`+l.map(p=>`<tr><td><b>${esc(p.name)}</b><div class="mu">${esc(p.desc)}</div></td><td><span class="tag ${p.open?"ok":""}">${p.open?"ouvert":"fermé"}</span></td><td>${prog(p)} %</td><td><button class="g" data-a="go" data-i="${p.id}">Ouvrir</button> <button class="g" data-a="tog" data-i="${p.id}">${p.open?"Fermer":"Rouvrir"}</button> <button class="g d" data-a="delp" data-i="${p.id}">Supprimer</button></td></tr>`).join("")+(l.length?"":`<tr><td colspan="4" class="mu">Aucun résultat.</td></tr>`)+`</table>`;
+}
+function services(){
+  return `<h2>Services IA</h2><div class="row"><button class="b" data-a="news">Ajouter un service</button></div><div class="grid">`+D.services.map(s=>`<div class="card"><b>${esc(s.name)}</b><div class="mu">${esc(s.url)}</div><div class="mu">Compte : ${esc(s.account||"—")}</div><p><span class="tag ok">Forts</span> ${esc(s.pros)}</p><p><span class="tag er">Faibles</span> ${esc(s.cons)}</p><button class="g" data-a="edits" data-i="${s.id}">Modifier</button> <button class="g d" data-a="dels" data-i="${s.id}">Révoquer</button></div>`).join("")+`</div>`;
+}
+function projView(){
+  const p=P();if(!p)return "";
+  const T=[["glob","Vue globale"],["tasks","Tâches"],["team","Équipe"],["roles","Rôles"],["git","Git & releases"],["bugs","Bugs"]];
+  let c="";
+  if(tab=="glob"){const done=p.tasks.filter(t=>t.status=="terminée").length,doing=p.tasks.filter(t=>t.status=="en cours").length;
+    c=`<div class="grid"><div class="card"><div class="big">${prog(p)} %</div><div class="bar"><i style="width:${prog(p)}%"></i></div><div class="mu">${done}/${p.tasks.length} tâches terminées · ${doing} en cours</div></div><div class="card"><div class="big">${p.agents.length}</div><div class="mu">agents · ${p.agents.filter(a=>a.state=="suspendu").length} suspendus (tokens)</div></div><div class="card"><div class="big">${p.bugs.filter(b=>b.status!="résolu").length}</div><div class="mu">bugs ouverts sur ${p.bugs.length}</div></div><div class="card"><div class="big">${p.releases.length?esc(p.releases[p.releases.length-1].v):"—"}</div><div class="mu">dernière release · ${p.commits.length} commits · ${p.mrs.length} MR</div></div></div><h3>Description</h3><div class="card">${esc(p.desc||"Aucune description.")}</div>`}
+  if(tab=="tasks"){c=`<div class="row"><button class="b" data-a="newt" data-i="">Nouvelle tâche</button></div>`+(tree(p,"")||`<div class="mu">Aucune tâche.</div>`)}
+  if(tab=="team"){c=`<div class="row"><button class="b" data-a="newa">Recruter un agent</button></div><table><tr><th>Agent</th><th>Service / rôle</th><th>Droits</th><th>Contexte & tokens</th><th></th></tr>`+p.agents.map(a=>`<tr><td><b>${esc(a.name)}</b><div class="mu">parle à : ${a.talk.map(i=>ag(p,i)).filter(Boolean).map(x=>esc(x.name)).join(", ")||"personne"}</div></td><td>${esc(svc(a.service))}<br><span class="tag">${esc(rname(p,a.role))}</span></td><td class="mu">dépôt ${esc(a.repo||"—")} · branche ${esc(a.branch||"—")}<br>dossier ${esc(a.dir||"—")}<br>token ${a.token?"••••"+esc(a.token.slice(-3)):"—"}</td><td><span class="tag ${a.state=="suspendu"?"wa":"ok"}">${a.state=="suspendu"?"suspendu — reprise auto":"actif"}</span><div class="mu">contexte conservé côté service IA</div></td><td><button class="g" data-a="edita" data-i="${a.id}">Modifier</button> <button class="g" data-a="tok" data-i="${a.id}">Simuler fin de tokens</button> <button class="g d" data-a="dela" data-i="${a.id}">Révoquer</button></td></tr>`).join("")+`</table>`}
+  if(tab=="roles"){c=`<div class="row"><button class="b" data-a="newr">Nouveau rôle</button></div><table><tr><th>Rôle</th><th>Description</th><th></th></tr>`+p.roles.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.desc)}</td><td><button class="g" data-a="editr" data-i="${r.id}">Modifier</button> <button class="g d" data-a="delr" data-i="${r.id}">Supprimer</button></td></tr>`).join("")+`</table>`}
+  if(tab=="git"){c=`<div class="card"><b>Dépôt associé</b><div class="mu">${esc(p.repo.url||"non configuré")} · branche ${esc(p.repo.branch)} · dossier ${esc(p.repo.dir||"—")}</div><div style="margin-top:8px"><button class="g" data-a="repo">Configurer</button> <button class="g" data-a="newc">Nouveau commit</button> <button class="g" data-a="newrel">Générer une release</button> <button class="g" data-a="newmr">Merge request</button></div></div><h3>Commits</h3><table><tr><th>Date</th><th>Message</th><th>Auteur</th></tr>`+p.commits.slice().reverse().map(m=>`<tr><td class="mu">${esc(m.d)}</td><td>${esc(m.m)}</td><td>${esc(m.by)}</td></tr>`).join("")+`</table><h3>Releases</h3>`+p.releases.map(r=>`<div class="tr" style="margin-bottom:6px"><span class="tag ok">${esc(r.v)}</span><span class="t">${esc(r.n)}</span><span class="mu">${esc(r.d)}</span></div>`).join("")+`<h3>Merge requests</h3>`+p.mrs.map(r=>`<div class="tr" style="margin-bottom:6px"><span class="tag">${esc(r.from)} → ${esc(r.to)}</span><span class="t">${esc(r.t)}</span><span class="mu">${esc(r.d)}</span></div>`).join("")}
+  if(tab=="bugs"){c=`<div class="row"><button class="b" data-a="newb">Déclarer un bug</button></div><table><tr><th>Bug</th><th>Gravité</th><th>Assigné</th><th>Statut</th><th></th></tr>`+p.bugs.map(b=>`<tr><td><b>${esc(b.t)}</b><div class="mu">${esc(b.d)}</div></td><td><span class="tag ${b.sev=="critique"?"er":b.sev=="majeur"?"wa":""}">${esc(b.sev)}</span></td><td>${esc((ag(p,b.who)||{}).name||"—")}</td><td><select data-s="status" data-i="${b.id}" id="bs${b.id}">${["ouvert","en cours","résolu"].map(s=>`<option${s==b.status?" selected":""}>${s}</option>`).join("")}</select></td><td><button class="g d" data-a="delb" data-i="${b.id}">Supprimer</button></td></tr>`).join("")+`</table>`}
+  return `<div class="top"><h2>${esc(p.name)}</h2><span class="mu">${esc(p.repo.url||"")}</span></div><div class="tabs">`+T.map(t=>`<button data-t="${t[0]}" class="${tab==t[0]?"on":""}">${t[1]}</button>`).join("")+`</div>`+c;
+}
+const svc=id=>(D.services.find(s=>s.id==id)||{name:"service révoqué"}).name;
+const rname=(p,id)=>(p.roles.find(r=>r.id==id)||{name:"—"}).name;
+function tree(p,par){
+  return p.tasks.filter(t=>(t.parent||"")==par).map(t=>`<div class="task"><div class="tr"><span class="t"><b>${esc(t.title)}</b> <span class="mu">${esc(t.desc||"")}</span></span><select data-s="who" data-i="${t.id}"><option value="">non affectée</option>${p.agents.map(a=>`<option value="${a.id}"${a.id==t.who?" selected":""}>${esc(a.name)}</option>`).join("")}</select><select data-s="status" data-i="${t.id}">${["à faire","en cours","terminée"].map(s=>`<option${s==t.status?" selected":""}>${s}</option>`).join("")}</select><button class="g" data-a="newt" data-i="${t.id}">+ sous-tâche</button><button class="g d" data-a="delt" data-i="${t.id}">×</button></div>${tree(p,t.id)}</div>`).join("");
+}
+function act(a,i,j){
+  const p=P();
+  const now=()=>new Date().toLocaleString("fr-FR");
+  if(a=="go"){pid=i;view="p";tab="glob";return render()}
+  if(a=="newp")return modal("Nouveau projet",[{k:"name",l:"Nom"},{k:"desc",l:"Description",area:1}],o=>{if(o.name){const n=newProject(o.name);n.desc=o.desc;D.projects.push(n);pid=n.id;view="p";tab="glob"}});
+  if(a=="tog"){const x=D.projects.find(p=>p.id==i);x.open=!x.open;save();return render()}
+  if(a=="delp"){if(confirm("Supprimer ce projet définitivement ?")){D.projects=D.projects.filter(p=>p.id!=i);save();render()}return}
+  const sf=(s)=>[{k:"name",l:"Nom",v:s.name},{k:"url",l:"URL de l’API",v:s.url},{k:"account",l:"Compte utilisé",v:s.account},{k:"pros",l:"Points forts",v:s.pros,area:1},{k:"cons",l:"Points faibles",v:s.cons,area:1}];
+  if(a=="news")return modal("Ajouter un service IA",sf({}),o=>{if(o.name)D.services.push(Object.assign({id:uid()},o))});
+  if(a=="edits"){const s=D.services.find(x=>x.id==i);return modal("Modifier le service",sf(s),o=>Object.assign(s,o))}
+  if(a=="dels"){if(confirm("Révoquer ce service ?")){D.services=D.services.filter(s=>s.id!=i);save();render()}return}
+  if(a=="newt")return modal(i?"Nouvelle sous-tâche":"Nouvelle tâche",[{k:"title",l:"Titre"},{k:"desc",l:"Description"}],o=>{if(o.title)p.tasks.push({id:uid(),parent:i||"",title:o.title,desc:o.desc,who:"",status:"à faire"})});
+  if(a=="delt"){const kill=new Set([i]);let ch=true;while(ch){ch=false;p.tasks.forEach(t=>{if(kill.has(t.parent)&&!kill.has(t.id)){kill.add(t.id);ch=true}})}p.tasks=p.tasks.filter(t=>!kill.has(t.id));save();return render()}
+  const af=(x)=>[{k:"name",l:"Prénom",v:x.name},{k:"service",l:"Service IA",v:x.service,opts:D.services.map(s=>[s.id,s.name])},{k:"role",l:"Rôle",v:x.role,opts:p.roles.map(r=>[r.id,r.name])},{k:"token",l:"Token GitHub",v:x.token,type:"password"},{k:"repo",l:"Dépôt",v:x.repo||p.repo.url},{k:"branch",l:"Branche",v:x.branch||"main"},{k:"dir",l:"Répertoire local",v:x.dir}].concat(p.agents.filter(o=>o.id!=x.id).length?[{k:"talk",l:"Peut communiquer avec (noms séparés par des virgules)",v:(x.talk||[]).map(i=>(ag(p,i)||{}).name).filter(Boolean).join(", ")}]:[]);
+  const talk=(s)=>(s||"").split(",").map(n=>n.trim().toLowerCase()).filter(Boolean).map(n=>(p.agents.find(a=>a.name.toLowerCase()==n)||{}).id).filter(Boolean);
+  if(a=="newa"){if(!D.services.length||!p.roles.length)return alert("Il faut au moins un service IA et un rôle.");const used=p.agents.map(a=>a.name),free=NAMES.filter(n=>!used.includes(n)),nm=(free.length?free:NAMES)[Math.floor(Math.random()*(free.length||NAMES.length))];return modal("Recruter un agent",af({name:nm}),o=>{o.talk=talk(o.talk);o.id=uid();o.state="actif";p.agents.push(o)},"Recruter")}
+  if(a=="edita"){const x=ag(p,i);return modal("Modifier l’agent",af(x),o=>{o.talk=talk(o.talk);Object.assign(x,o)})}
+  if(a=="dela"){if(confirm("Révoquer cet agent ?")){p.agents=p.agents.filter(a=>a.id!=i);p.tasks.forEach(t=>{if(t.who==i)t.who=""});save();render()}return}
+  if(a=="tok"){const x=ag(p,i);x.state="suspendu";save();render();setTimeout(()=>{x.state="actif";save();if(view=="p"&&pid==p.id)render()},6000);return}
+  if(a=="newr"||a=="editr"){const r=a=="editr"?p.roles.find(x=>x.id==i):{};return modal("Rôle",[{k:"name",l:"Nom",v:r.name},{k:"desc",l:"Description",v:r.desc,area:1}],o=>{if(!o.name)return;if(r.id)Object.assign(r,o);else p.roles.push(Object.assign({id:uid()},o))})}
+  if(a=="delr"){if(p.agents.some(x=>x.role==i))return alert("Ce rôle est utilisé par un agent.");p.roles=p.roles.filter(r=>r.id!=i);save();return render()}
+  const who=[["","—"]].concat(p.agents.map(a=>[a.name,a.name]));
+  if(a=="repo")return modal("Dépôt git",[{k:"url",l:"URL du dépôt",v:p.repo.url},{k:"branch",l:"Branche principale",v:p.repo.branch},{k:"dir",l:"Répertoire local",v:p.repo.dir}],o=>Object.assign(p.repo,o));
+  if(a=="newc")return modal("Nouveau commit",[{k:"m",l:"Message"},{k:"by",l:"Auteur",opts:who}],o=>{if(o.m)p.commits.push({m:o.m,by:o.by||"—",d:now()})});
+  if(a=="newrel")return modal("Générer une release",[{k:"v",l:"Version",v:"v"+(p.releases.length+1)+".0.0"},{k:"n",l:"Notes de version",v:p.commits.slice(-5).map(c=>c.m).join(" ; "),area:1}],o=>{if(o.v)p.releases.push({v:o.v,n:o.n,d:now()})});
+  if(a=="newmr")return modal("Merge request",[{k:"from",l:"Branche source",v:"feature/"},{k:"to",l:"Branche cible",v:p.repo.branch},{k:"t",l:"Titre"}],o=>{if(o.t)p.mrs.push({from:o.from,to:o.to,t:o.t,d:now()})});
+  if(a=="newb")return modal("Déclarer un bug",[{k:"t",l:"Titre"},{k:"d",l:"Description",area:1},{k:"sev",l:"Gravité",opts:[["mineur","mineur"],["majeur","majeur"],["critique","critique"]]},{k:"who",l:"Assigné à",opts:[["","—"]].concat(p.agents.map(a=>[a.id,a.name]))}],o=>{if(o.t)p.bugs.push({id:uid(),t:o.t,d:o.d,sev:o.sev||"mineur",who:o.who,status:"ouvert"})});
+  if(a=="delb"){p.bugs=p.bugs.filter(b=>b.id!=i);save();render()}
+}
+if(store.session&&store.users[store.session]){U=store.session;D=store.data[U]||(store.data[U]=fresh())}
+render();
+</script></body></html>
