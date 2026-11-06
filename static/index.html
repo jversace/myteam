@@ -44,16 +44,19 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--bd);text-align:left;vertica
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let store={users:{},data:{},session:null};
-try{const r=localStorage.getItem("apm");if(r)store=Object.assign(store,JSON.parse(r))}catch(e){}
-let D=null,U=null,view="dash",pid=null,tab="glob",q="",err="";
+
+
+let D=null,U=null,TOK=null,view="dash",pid=null,tab="glob",q="",err="";
+try{TOK=localStorage.getItem("apm_tok");U=localStorage.getItem("apm_user")}catch(e){}
+async function api(m,u,b){const r=await fetch(u,{method:m,headers:Object.assign({"Content-Type":"application/json"},TOK?{Authorization:"Bearer "+TOK}:{}),body:b?JSON.stringify(b):undefined});const j=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(j.error||r.statusText);e.status=r.status;e.data=j;throw e}return j}
+async function loadState(){const d=await api("GET","/api/state");if(!d||!d.projects)return fresh();d.projects.forEach(p=>{p.tasks.forEach(t=>{t.running=false});p.agents.forEach(a=>{a.state="actif"})});return d}
 const uid=()=>Math.random().toString(36).slice(2,9);
-function save(){if(U)store.data[U]=D;try{localStorage.setItem("apm",JSON.stringify(store))}catch(e){}}
-async function hash(s){try{const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode("apm"+s));return[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("")}catch(e){return btoa(unescape(encodeURIComponent(s)))}}
+let st=null;function save(){clearTimeout(st);st=setTimeout(()=>{if(D&&TOK)api("PUT","/api/state",D).catch(e=>{if(e.status==401)logout()})},300)}
+
 const NAMES=["Camille","Louis","Inès","Hugo","Jade","Noah","Léna","Adam","Zoé","Théo","Maëlle","Axel","Éva","Malo","Lucie","Nils"];
 const ROLES=[["Chef de projet","Planifie, priorise, coordonne l’équipe et rend compte de l’avancement."],["Architecte","Définit l’architecture technique et les standards de code."],["Développeur back-end","Implémente la logique métier, les API et la base de données."],["Développeur front-end","Réalise l’interface et l’expérience utilisateur."],["Testeur QA","Rédige et exécute les tests, qualifie et remonte les bugs."],["DevOps","Gère l’intégration continue, le déploiement et l’infrastructure."],["Rédacteur technique","Rédige la documentation et les notes de version."]];
-const SERV=[["Claude","https://api.anthropic.com/v1","Raisonnement, code long, respect des consignes","Quota de tokens à surveiller"],["Mistral","https://api.mistral.ai/v1","Rapide, bon en français, coût maîtrisé","Moins solide sur les très gros contextes"],["ChatGPT","https://api.openai.com/v1","Polyvalent, large écosystème d’outils","Verbosité, coût variable"],["Gemini","https://generativelanguage.googleapis.com","Très grand contexte, multimodal","Régularité variable sur le code"],["DeepSeek","https://api.deepseek.com","Excellent rapport qualité/prix en code","Disponibilité parfois limitée"]];
-function fresh(){return{services:SERV.map(s=>({id:uid(),name:s[0],url:s[1],account:"",pros:s[2],cons:s[3]})),projects:[]}}
+const SERV=[["Claude","https://api.anthropic.com/v1","Raisonnement, code long, respect des consignes","Quota de tokens à surveiller","anthropic","claude-sonnet-4-6"],["Mistral","https://api.mistral.ai/v1","Rapide, bon en français, coût maîtrisé","Moins solide sur les très gros contextes","openai","mistral-large-latest"],["ChatGPT","https://api.openai.com/v1","Polyvalent, large écosystème d’outils","Verbosité, coût variable","openai","gpt-4o"],["Gemini","https://generativelanguage.googleapis.com/v1beta/openai","Très grand contexte, multimodal","Régularité variable sur le code","openai","gemini-2.0-flash"],["DeepSeek","https://api.deepseek.com","Excellent rapport qualité/prix en code","Disponibilité parfois limitée","openai","deepseek-chat"]];
+function fresh(){return{services:SERV.map(s=>({id:uid(),name:s[0],url:s[1],account:"",pros:s[2],cons:s[3],kind:s[4],model:s[5],apiKey:""})),projects:[]}}
 function newProject(name){return{id:uid(),name,open:true,desc:"",repo:{url:"",branch:"main",dir:""},roles:ROLES.map(r=>({id:uid(),name:r[0],desc:r[1]})),agents:[],tasks:[],bugs:[],commits:[],releases:[],mrs:[]}}
 const P=()=>D.projects.find(p=>p.id===pid);
 const ag=(p,id)=>p.agents.find(a=>a.id===id);
@@ -67,13 +70,11 @@ function modal(title,fields,cb,okLabel){
 }
 function login(){
   $("#root").innerHTML=`<div id="login"><div class="card"><h2 style="margin:0">Atelier d’agents IA</h2><span class="mu">Connectez-vous ou créez un compte (les données restent sur cet appareil).</span><input id="u" placeholder="Identifiant" autocomplete="username"><input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password"><div style="color:var(--er)">${esc(err)}</div><button class="b" id="in">Connexion</button><button class="g" id="cr">Créer le compte</button></div></div>`;
-  const go=async mk=>{const u=$("#u").value.trim(),p=$("#p").value;if(!u||!p){err="Identifiant et mot de passe requis.";return login()}const h=await hash(p);
-    if(mk){if(store.users[u]){err="Ce compte existe déjà.";return login()}store.users[u]=h;store.data[u]=fresh()}
-    else if(store.users[u]!==h){err="Identifiants incorrects.";return login()}
-    err="";U=u;D=store.data[u]||(store.data[u]=fresh());store.session=u;save();render()};
+  const go=async mk=>{const u=$("#u").value.trim(),p=$("#p").value;if(!u||!p){err="Identifiant et mot de passe requis.";return login()}
+    try{const r=await api("POST",mk?"/api/register":"/api/login",{user:u,password:p});TOK=r.token;U=u;try{localStorage.setItem("apm_tok",TOK);localStorage.setItem("apm_user",U)}catch(e){}D=await loadState();if(mk)save();err="";render()}catch(e){err=e.message;login()}};
   $("#in").onclick=()=>go(false);$("#cr").onclick=()=>go(true);
 }
-function logout(){save();store.session=null;U=D=null;pid=null;view="dash";try{localStorage.setItem("apm",JSON.stringify(store))}catch(e){}login()}
+function logout(){clearTimeout(st);api("POST","/api/logout").catch(()=>{});TOK=U=D=null;pid=null;view="dash";try{localStorage.removeItem("apm_tok");localStorage.removeItem("apm_user")}catch(e){}login()}
 function render(){
   if(!U)return login();
   const open=D.projects.filter(p=>p.open);
@@ -98,7 +99,7 @@ function projects(){
   return `<h2>Projets</h2><div class="row"><input id="sq" placeholder="Rechercher un projet…" value="${esc(q)}"><button class="b" data-a="newp">Nouveau projet</button></div><table><tr><th>Nom</th><th>État</th><th>Avancement</th><th></th></tr>`+l.map(p=>`<tr><td><b>${esc(p.name)}</b><div class="mu">${esc(p.desc)}</div></td><td><span class="tag ${p.open?"ok":""}">${p.open?"ouvert":"fermé"}</span></td><td>${prog(p)} %</td><td><button class="g" data-a="go" data-i="${p.id}">Ouvrir</button> <button class="g" data-a="tog" data-i="${p.id}">${p.open?"Fermer":"Rouvrir"}</button> <button class="g d" data-a="delp" data-i="${p.id}">Supprimer</button></td></tr>`).join("")+(l.length?"":`<tr><td colspan="4" class="mu">Aucun résultat.</td></tr>`)+`</table>`;
 }
 function services(){
-  return `<h2>Services IA</h2><div class="row"><button class="b" data-a="news">Ajouter un service</button></div><div class="grid">`+D.services.map(s=>`<div class="card"><b>${esc(s.name)}</b><div class="mu">${esc(s.url)}</div><div class="mu">Compte : ${esc(s.account||"—")}</div><p><span class="tag ok">Forts</span> ${esc(s.pros)}</p><p><span class="tag er">Faibles</span> ${esc(s.cons)}</p><button class="g" data-a="edits" data-i="${s.id}">Modifier</button> <button class="g d" data-a="dels" data-i="${s.id}">Révoquer</button></div>`).join("")+`</div>`;
+  return `<h2>Services IA</h2><div class="row"><button class="b" data-a="news">Ajouter un service</button></div><div class="grid">`+D.services.map(s=>`<div class="card"><b>${esc(s.name)}</b><div class="mu">${esc(s.url)}</div><div class="mu">Compte : ${esc(s.account||"—")} · modèle ${esc(s.model||"—")} · clé ${s.apiKey?"définie":"manquante"}</div><p><span class="tag ok">Forts</span> ${esc(s.pros)}</p><p><span class="tag er">Faibles</span> ${esc(s.cons)}</p><button class="g" data-a="edits" data-i="${s.id}">Modifier</button> <button class="g d" data-a="dels" data-i="${s.id}">Révoquer</button></div>`).join("")+`</div>`;
 }
 function projView(){
   const p=P();if(!p)return "";
@@ -116,16 +117,37 @@ function projView(){
 const svc=id=>(D.services.find(s=>s.id==id)||{name:"service révoqué"}).name;
 const rname=(p,id)=>(p.roles.find(r=>r.id==id)||{name:"—"}).name;
 function tree(p,par){
-  return p.tasks.filter(t=>(t.parent||"")==par).map(t=>`<div class="task"><div class="tr"><span class="t"><b>${esc(t.title)}</b> <span class="mu">${esc(t.desc||"")}</span></span><select data-s="who" data-i="${t.id}"><option value="">non affectée</option>${p.agents.map(a=>`<option value="${a.id}"${a.id==t.who?" selected":""}>${esc(a.name)}</option>`).join("")}</select><select data-s="status" data-i="${t.id}">${["à faire","en cours","terminée"].map(s=>`<option${s==t.status?" selected":""}>${s}</option>`).join("")}</select><button class="g" data-a="newt" data-i="${t.id}">+ sous-tâche</button><button class="g d" data-a="delt" data-i="${t.id}">×</button></div>${tree(p,t.id)}</div>`).join("");
+  return p.tasks.filter(t=>(t.parent||"")==par).map(t=>`<div class="task"><div class="tr"><span class="t"><b>${esc(t.title)}</b> <span class="mu">${esc(t.desc||"")}</span></span><select data-s="who" data-i="${t.id}"><option value="">non affectée</option>${p.agents.map(a=>`<option value="${a.id}"${a.id==t.who?" selected":""}>${esc(a.name)}</option>`).join("")}</select><select data-s="status" data-i="${t.id}">${["à faire","en cours","terminée"].map(s=>`<option${s==t.status?" selected":""}>${s}</option>`).join("")}</select>${t.who?`<button class="g" data-a="run" data-i="${t.id}"${t.running?" disabled":""}>${t.running?"⏳ en cours…":"▶ Exécuter"}</button>`:""}<button class="g" data-a="newt" data-i="${t.id}">+ sous-tâche</button><button class="g d" data-a="delt" data-i="${t.id}">×</button></div>${t.result?`<details><summary class="mu">Résultat de l’agent</summary><div style="white-space:pre-wrap">${esc(t.result)}</div></details>`:""}${tree(p,t.id)}</div>`).join("");
+}
+async function runTask(p,tid){
+  const t=p.tasks.find(x=>x.id==tid),a=t&&ag(p,t.who);
+  if(!a)return alert("Affectez d’abord la tâche à un agent.");
+  const s=D.services.find(x=>x.id==a.service),r=p.roles.find(x=>x.id==a.role)||{};
+  if(!s)return alert("Le service IA de cet agent a été révoqué.");
+  if(t.running)return;
+  t.running=true;t.status="en cours";a.state="actif";a.history=a.history||[];save();render();
+  const msg="Projet : "+p.name+(p.desc?" — "+p.desc:"")+"\nTâche : "+t.title+(t.desc?"\n"+t.desc:"")+"\nRéponds avec ton livrable (code, texte ou analyse) pour cette tâche.";
+  const system="Tu es "+a.name+", "+(r.name||"membre de l’équipe")+" sur ce projet. "+(r.desc||"")+" Tu collabores avec : "+((a.talk||[]).map(i=>(ag(p,i)||{}).name).filter(Boolean).join(", ")||"personne")+".";
+  try{
+    const o=await api("POST","/api/agent/run",{serviceId:s.id,system,messages:a.history.concat([{role:"user",content:msg}])});
+    t.result=o.text;t.status="terminée";t.running=false;
+    a.history=a.history.concat([{role:"user",content:msg},{role:"assistant",content:o.text}]).slice(-20);
+  }catch(e){
+    t.running=false;
+    if(e.status==429){const w=Math.max(5,Math.min(+((e.data||{}).retry_after)||60,3600));a.state="suspendu";t.status="à faire";t.result="Suspendu (quota atteint) — reprise automatique dans "+w+" s.";setTimeout(()=>{if(a.state=="suspendu"){a.state="actif";runTask(p,tid)}},w*1000)}
+    else{t.status="à faire";t.result="Erreur : "+e.message}
+  }
+  save();render();
 }
 function act(a,i,j){
   const p=P();
   const now=()=>new Date().toLocaleString("fr-FR");
   if(a=="go"){pid=i;view="p";tab="glob";return render()}
+  if(a=="run")return runTask(p,i);
   if(a=="newp")return modal("Nouveau projet",[{k:"name",l:"Nom"},{k:"desc",l:"Description",area:1}],o=>{if(o.name){const n=newProject(o.name);n.desc=o.desc;D.projects.push(n);pid=n.id;view="p";tab="glob"}});
   if(a=="tog"){const x=D.projects.find(p=>p.id==i);x.open=!x.open;save();return render()}
   if(a=="delp"){if(confirm("Supprimer ce projet définitivement ?")){D.projects=D.projects.filter(p=>p.id!=i);save();render()}return}
-  const sf=(s)=>[{k:"name",l:"Nom",v:s.name},{k:"url",l:"URL de l’API",v:s.url},{k:"account",l:"Compte utilisé",v:s.account},{k:"pros",l:"Points forts",v:s.pros,area:1},{k:"cons",l:"Points faibles",v:s.cons,area:1}];
+  const sf=(s)=>[{k:"name",l:"Nom",v:s.name},{k:"url",l:"URL de base de l’API",v:s.url},{k:"kind",l:"Type d’API",v:s.kind||"openai",opts:[["openai","Compatible OpenAI (ChatGPT, Mistral, DeepSeek, Gemini)"],["anthropic","Anthropic (Claude)"]]},{k:"model",l:"Modèle",v:s.model},{k:"apiKey",l:"Clé API (stockée sur le serveur)",v:s.apiKey,type:"password"},{k:"account",l:"Compte utilisé",v:s.account},{k:"pros",l:"Points forts",v:s.pros,area:1},{k:"cons",l:"Points faibles",v:s.cons,area:1}];
   if(a=="news")return modal("Ajouter un service IA",sf({}),o=>{if(o.name)D.services.push(Object.assign({id:uid()},o))});
   if(a=="edits"){const s=D.services.find(x=>x.id==i);return modal("Modifier le service",sf(s),o=>Object.assign(s,o))}
   if(a=="dels"){if(confirm("Révoquer ce service ?")){D.services=D.services.filter(s=>s.id!=i);save();render()}return}
@@ -147,6 +169,6 @@ function act(a,i,j){
   if(a=="newb")return modal("Déclarer un bug",[{k:"t",l:"Titre"},{k:"d",l:"Description",area:1},{k:"sev",l:"Gravité",opts:[["mineur","mineur"],["majeur","majeur"],["critique","critique"]]},{k:"who",l:"Assigné à",opts:[["","—"]].concat(p.agents.map(a=>[a.id,a.name]))}],o=>{if(o.t)p.bugs.push({id:uid(),t:o.t,d:o.d,sev:o.sev||"mineur",who:o.who,status:"ouvert"})});
   if(a=="delb"){p.bugs=p.bugs.filter(b=>b.id!=i);save();render()}
 }
-if(store.session&&store.users[store.session]){U=store.session;D=store.data[U]||(store.data[U]=fresh())}
-render();
+
+(async()=>{if(TOK){try{D=await loadState()}catch(e){TOK=null;U=null;D=null}}else U=null;render()})();
 </script></body></html>
