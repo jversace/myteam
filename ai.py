@@ -9,7 +9,7 @@ from store import Err
 def call_ai(s, system, messages):
     key, url, model = s.get("apiKey", ""), s.get("url", "").rstrip("/"), s.get("model", "")
     if not key:
-        raise Err(400, "Clé API manquante pour le service « %s »" % s.get("name", "?"))
+        raise Err(400, "Clé API manquante pour le service « %s » : ouvrez l’onglet Services IA et cliquez sur « Configurer la clé »" % s.get("name", "?"))
     anth = s.get("kind") == "anthropic"
     if anth:
         u = url + "/messages"

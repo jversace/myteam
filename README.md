@@ -23,9 +23,9 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 5. **Ouvrir** http://127.0.0.1:8000 dans le navigateur et créer un compte (« Créer le compte »).
 
 ## Premier usage
-1. **Services IA** : modifiez le service voulu et renseignez la **clé API** et le **modèle**.
+1. **Services IA** : cliquez sur **Configurer la clé** : un lien ouvre la console du fournisseur, vous y créez une clé API et la collez dans l'application, qui la **teste** aussitôt (bouton **Tester**). Le modèle se règle via **Modifier**. L'assistant se rouvre automatiquement si vous recrutez un agent ou lui écrivez alors que son service n'a pas de clé.
 2. **Projets** : créez un projet, puis dans *Git & releases* > *Configurer* : URL du dépôt GitHub, branche de base, **token** (le dépôt et le token sont propres au projet).
-3. **Équipe** : recrutez des agents (service IA, rôle, branche, droits). Le premier est l'**agent principal** (modifiable). À l'onboarding, chaque agent reçoit les règles, sa branche est créée si besoin et son fichier `.agents/<Prénom>.md` est poussé.
+3. **Équipe** (mode de connexion par agent : **API** automatique, ou **chat manuel** pour utiliser votre abonnement de chat sans payer l'API : l'application prépare le prompt dans un bandeau en haut du projet, vous le collez dans le chatbot, puis collez sa réponse) : recrutez des agents (service IA, rôle, branche, droits). Le premier est l'**agent principal** (modifiable). À l'onboarding, chaque agent reçoit les règles, sa branche est créée si besoin et son fichier `.agents/<Prénom>.md` est poussé.
 4. **Dialogue** avec n'importe quel agent, ou prompt global vers l'agent principal dans la *Vue globale* : il peut écrire aux autres agents, créer des tâches, tenir les spécifications à jour.
 5. **Modules, tâches, bugs** : une tâche ou un bug peut appartenir à plusieurs modules. **▶ Exécuter** lance une tâche affectée à un agent.
 6. **Fichiers du dépôt** : les agents peuvent lister, lire, écrire et supprimer des fichiers **sur leur branche** (jamais sur la branche de base), et vous voyez leurs commits dans *Git & releases*.

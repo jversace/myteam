@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import engine
 import store
+from ai import call_ai
 from store import Err, LOCK, SESSIONS, USERS, rj, wj
 
 STATIC = store.ROOT / "static"
@@ -129,6 +130,19 @@ class H(BaseHTTPRequestHandler):
                 s = rj(SESSIONS, {})
                 s.pop(t, None)
                 wj(SESSIONS, s)
+            return self.out(200, {"ok": True})
+        if p == "/api/service/test":
+            sv = next((x for x in store.load(u).get("services", []) if x.get("id") == d.get("serviceId")), None)
+            if not sv:
+                raise Err(404, "Service IA introuvable")
+            return self.out(200, {"ok": True, "sample": call_ai(sv, "Réponds uniquement par OK.", [{"role": "user", "content": "ping"}])[:80]})
+        if p == "/api/manual/answer":
+            if not str(d.get("text", "")).strip():
+                raise Err(400, "Réponse vide")
+            engine.manual_answer(u, str(d.get("id")), str(d["text"]))
+            return self.out(200, {"ok": True})
+        if p == "/api/manual/cancel":
+            engine.manual_cancel(u, str(d.get("id")))
             return self.out(200, {"ok": True})
         if p == "/api/job":
             engine.start(u, d)

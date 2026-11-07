@@ -14,6 +14,8 @@ from ai import call_ai
 from store import DATA, Err, load, mutate
 
 MAX_STEPS, MAX_DEPTH = 6, 3
+MANUAL_TIMEOUT = 24 * 3600   # attente maximale d'une réponse manuelle
+WAIT = {}                    # échanges manuels en attente : id -> {u, ev, text}
 F = "`" * 3
 RULES = [
     "Tu es un agent IA membre d’une équipe de développement pilotée depuis une application web. Tu réponds en français, de façon concise et factuelle.",
@@ -176,12 +178,14 @@ def ask(u, pid, aid, text, frm, depth=0):
             if not a:
                 break
             s = by_id(p["_svc"], a.get("service"))
-            if not s:
+            manual = a.get("mode") == "manual"
+            if not s and not manual:
                 raise Err(400, "Service IA révoqué pour %s" % a["name"])
             h = list(a.get("history", []))[-30:]
             while h and h[0]["role"] != "user":
                 h.pop(0)
-            out = call_ai(s, sys_prompt(p, a), h + [{"role": "user", "content": msg}])
+            sp = sys_prompt(p, a)
+            out = manual_exchange(u, pid, a, s, sp, h, msg) if manual else call_ai(s, sp, h + [{"role": "user", "content": msg}])
             clean, acts = parse_acts(out)
             keep = msg if len(msg) < 3000 else msg[:3000] + "\n[…tronqué]"
 
@@ -206,6 +210,46 @@ def ask(u, pid, aid, text, frm, depth=0):
         return final
     finally:
         work(u, pid, aid, -1)
+
+
+def manual_exchange(u, pid, a, svc, system, h, msg):
+    """Mode « chat manuel » : l'application prépare le prompt, l'utilisateur le colle dans le chatbot
+    de son choix puis colle la réponse (aucune API, aucun accès automatisé au site du chatbot)."""
+    hist = "\n".join("%s : %s" % ("Toi" if x["role"] == "assistant" else "Application", x["content"][:600]) for x in h[-6:])
+    full = ("Tu vas tenir le rôle d'un agent dans une application de gestion de projets de développement. "
+            "Voici tes instructions permanentes, à respecter pendant toute la conversation :\n\n<<<INSTRUCTIONS\n%s\nINSTRUCTIONS>>>\n\n%sMessage à traiter :\n%s"
+            % (system, ("Historique récent :\n%s\n\n" % hist) if hist else "", msg))
+    short = "(Suite de la même conversation, mêmes instructions.)\n\n%s\n\nRappel : si tu dois agir, termine par des blocs d'action." % msg
+    item = {"id": uid(), "agent": a["id"], "name": a["name"], "service": (svc or {}).get("name", ""),
+            "full": full, "short": short, "new": not a.get("session"), "d": now()}
+    WAIT[item["id"]] = {"u": u, "ev": threading.Event(), "text": None}
+    mp(u, pid, lambda pp: pp.setdefault("pending", []).append(item))
+    log(u, pid, "Système", a["name"], "Prompt prêt pour %s : copiez-le dans le chatbot puis collez sa réponse (bandeau en haut du projet)." % a["name"])
+    try:
+        WAIT[item["id"]]["ev"].wait(MANUAL_TIMEOUT)
+        text = WAIT[item["id"]]["text"]
+    finally:
+        WAIT.pop(item["id"], None)
+        mp(u, pid, lambda pp: pp.__setitem__("pending", [x for x in pp.get("pending", []) if x["id"] != item["id"]]))
+    if text is None:
+        raise Err(408, "Échange manuel annulé ou expiré pour %s" % a["name"])
+    mp(u, pid, lambda pp: by_id(pp["agents"], a["id"]).__setitem__("session", True))
+    return text
+
+
+def manual_answer(u, xid, text):
+    w = WAIT.get(xid)
+    if not w or w["u"] != u:
+        raise Err(404, "Échange introuvable ou déjà traité")
+    w["text"] = text
+    w["ev"].set()
+
+
+def manual_cancel(u, xid):
+    w = WAIT.get(xid)
+    if not w or w["u"] != u:
+        raise Err(404, "Échange introuvable ou déjà traité")
+    w["ev"].set()
 
 
 def do_act(u, pid, aid, x, depth):
@@ -474,6 +518,7 @@ def recover():
         def fix(st):
             for p in st.get("projects", []):
                 p["releasing"] = False
+                p["pending"] = []
                 for a in p.get("agents", []):
                     a["work"] = 0
                 for t in p.get("tasks", []):

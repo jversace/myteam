@@ -28,6 +28,8 @@ Application de gestion de projets de développement par une **équipe d'agents I
 - `POST /api/register|login` → `{token}` ; `POST /api/logout`
 - `GET /api/state` → `{rev, ser, state}` ; `GET /api/state?ser=N` → `{same:true}` si rien n'a changé (sondage du front, toutes les 2 s)
 - `PUT /api/state` `{rev, state}` → `{rev, ser, state}` : le serveur **fusionne** l'état du navigateur avec l'état courant (voir ci-dessous) et renvoie le résultat.
+- `POST /api/service/test` `{serviceId}` : appel minimal au service IA (valide la clé). Les clés API se créent dans la console du fournisseur (aucun flux OAuth public ne permet de les générer : vérifié pour Anthropic et OpenAI) ; le front guide la saisie (`keyset`) et teste aussitôt.
+- `POST /api/manual/answer` `{id,text}` / `POST /api/manual/cancel` `{id}` : réponse (ou annulation) d'un échange **manuel** en attente.
 - `POST /api/job` `{type, projectId, ...}` : lance un travail en arrière-plan (un thread). Types : `say{agentId,text}`, `run_task{taskId}`, `onboard{agentId}`, `sync`, `release{version,notes}`. Le front fait `flush()` (PUT) avant chaque travail.
 
 ## Concurrence navigateur / serveur (important)
@@ -52,6 +54,11 @@ Projet : `{id,name,open,desc,rules,spec,mainId, repo:{url,branch,token}, roles[]
 - Tâches (`run_task`) : quota 429/529 → agent `suspendu`, `retry_at`, reprise automatique par `threading.Timer` ; `recover()` au démarrage remet les compteurs à zéro, marque les tâches interrompues et replanifie les reprises.
 - Release (`release`) : pour chaque branche d'agent ≠ base → PR + fusion, puis tag + release GitHub ; échecs consignés sans bloquer la suite.
 - Agent principal (`mainId`) : dialogue via le prompt de la Vue globale ; écrit à tous, crée les tâches, tient les spécifications, réalise MR + tag.
+
+## Modes de connexion d'un agent (`agent.mode`)
+- `api` (défaut) : `ai.call_ai` avec la clé du service. `manual` : **chat manuel**, sans API : `engine.manual_exchange` publie un prompt dans `p.pending` (`{id,agent,name,service,full,short,new,d}`), le thread **attend** (`WAIT`, 24 h) que l'utilisateur colle la réponse du chatbot (`/api/manual/answer`) ; les actions de la réponse sont ensuite exécutées comme d'habitude (les retours de lecture arrivent dans un nouveau prompt). `full` = instructions complètes (nouvelle conversation), `short` = suite (`agent.session` mémorise qu'une conversation existe).
+- **Décision : on n'automatise pas les sites de chat** (claude.ai, chatgpt.com…) : pas d'API publique pour les abonnements grand public, conditions d'utilisation contraires (Anthropic l'applique techniquement), fragile. Alternatives gratuites sans automatisation de site : API à offre gratuite (ex. Gemini via AI Studio, avec limites) ou modèle local compatible OpenAI (ex. Ollama : service `kind:"openai"`, URL `http://localhost:11434/v1`, clé factice).
+- `p.pending` est écrit par le serveur uniquement ; `recover()` le vide au démarrage.
 
 ## Conventions de travail
 - Modifier `static/index.html` par remplacements ciblés ; vérifier la syntaxe JS (extraire le `<script>` et `node --check`).

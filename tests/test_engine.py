@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
@@ -196,6 +197,56 @@ class Engine(unittest.TestCase):
         self.assertEqual(len(p["mrs"]), 2)
         self.assertFalse(p["releasing"])
 
+    def _attendre_prompt(self, sauf=None):
+        for _ in range(200):
+            for x in proj().get("pending", []):
+                if x["id"] != sauf:
+                    return x
+            time.sleep(0.02)
+        self.fail("aucun prompt manuel en attente")
+
+    def test_mode_manuel_sans_api(self):
+        st = store.load("u"); st["projects"][0]["agents"][1]["mode"] = "manual"; store.wj(store.state_path("u"), st)
+        res = {}
+
+        def boom(*a):
+            raise AssertionError("l'API ne doit pas être appelée en mode manuel")
+        with mock.patch.object(engine, "call_ai", boom):
+            th = threading.Thread(target=lambda: res.update(r=engine.ask("u", "p1", "a2", "écris m.txt", "Vous")))
+            th.start()
+            x1 = self._attendre_prompt()
+            self.assertTrue(x1["new"])
+            self.assertIn("écris m.txt", x1["full"])
+            self.assertIn("Prénom : Bob", x1["full"])                        # instructions complètes dans le 1er prompt
+            engine.manual_answer("u", x1["id"], 'Je le fais.\n```action\n{"do":"write_file","path":"m.txt","content":"manuel","message":"feat: manuel"}\n```\n```action\n{"do":"read_file","path":"m.txt"}\n```')
+            x2 = self._attendre_prompt(sauf=x1["id"])                        # le retour de lecture arrive dans un 2e prompt
+            self.assertFalse(x2["new"])
+            self.assertIn("manuel", x2["short"])
+            engine.manual_answer("u", x2["id"], "Terminé.")
+            th.join(5)
+        self.assertEqual(res["r"], "Terminé.")
+        self.assertEqual(BR["agent/bob"]["m.txt"], "manuel")
+        self.assertEqual(proj()["pending"], [])
+        self.assertTrue(proj()["agents"][1]["session"])
+
+    def test_mode_manuel_annule(self):
+        st = store.load("u"); st["projects"][0]["agents"][1]["mode"] = "manual"; store.wj(store.state_path("u"), st)
+        res = {}
+
+        def run():
+            try:
+                engine.ask("u", "p1", "a2", "x", "Vous")
+            except Err as e:
+                res["e"] = e
+        th = threading.Thread(target=run); th.start()
+        engine.manual_cancel("u", self._attendre_prompt()["id"])
+        th.join(5)
+        self.assertEqual(res["e"].code, 408)
+        self.assertEqual(proj()["pending"], [])
+        self.assertEqual(proj()["agents"][1]["work"], 0)
+        with self.assertRaises(Err):
+            engine.manual_answer("u", "inconnu", "x")
+
     def test_quota_suspend_puis_reprise_planifiee(self):
         def quota(s, system, msgs):
             raise Err(429, "quota", 7)
@@ -247,6 +298,18 @@ class Http(unittest.TestCase):
         self.assertEqual([(x["id"], x["title"]) for x in r2["state"]["projects"][0]["tasks"]], [("t1", "b"), ("t2", "agent")])
         self.assertEqual(self.call("GET", "/api/state?ser=%d" % r2["ser"], tok=t), {"same": True})
         self.assertEqual(self.call("GET", "/api/state")["_code"], 401)
+
+    def test_test_de_cle(self):
+        import server
+        self.call("POST", "/api/register", {"user": "h2", "password": "x"})
+        t = self.call("POST", "/api/login", {"user": "h2", "password": "x"})["token"]
+        r0 = self.call("GET", "/api/state", tok=t)
+        self.call("PUT", "/api/state", {"rev": r0["rev"], "state": {"services": [{"id": "s1", "name": "S", "kind": "openai", "url": "x", "model": "m", "apiKey": ""}], "projects": []}}, t)
+        r = self.call("POST", "/api/service/test", {"serviceId": "s1"}, t)          # sans clé : message actionnable
+        self.assertEqual(r["_code"], 400)
+        self.assertIn("Configurer la clé", r["error"])
+        with mock.patch.object(server, "call_ai", lambda s, sy, m: "OK"):
+            self.assertEqual(self.call("POST", "/api/service/test", {"serviceId": "s1"}, t)["sample"], "OK")
 
 
 if __name__ == "__main__":
