@@ -186,6 +186,8 @@ def ask(u, pid, aid, text, frm, depth=0):
                 h.pop(0)
             sp = sys_prompt(p, a)
             out = manual_exchange(u, pid, a, s, sp, h, msg) if manual else call_ai(s, sp, h + [{"role": "user", "content": msg}])
+            if getattr(out, "usage", None) and s:
+                record_usage(u, pid, aid, s, out.usage)
             clean, acts = parse_acts(out)
             keep = msg if len(msg) < 3000 else msg[:3000] + "\n[…tronqué]"
 
@@ -210,6 +212,43 @@ def ask(u, pid, aid, text, frm, depth=0):
         return final
     finally:
         work(u, pid, aid, -1)
+
+
+def num(x):
+    try:
+        return max(0.0, float(str(x).replace(",", ".")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def record_usage(u, pid, aid, svc, usage):
+    """Comptabilise les tokens d'un appel API et son coût estimé (tarifs saisis dans le service, en $ par million de tokens)."""
+    tin, tout = int(usage.get("in") or 0), int(usage.get("out") or 0)
+    cost = round(tin * num(svc.get("pin")) / 1e6 + tout * num(svc.get("pout")) / 1e6, 6)
+
+    def bump(d):
+        d["calls"] = d.get("calls", 0) + 1
+        d["in"] = d.get("in", 0) + tin
+        d["out"] = d.get("out", 0) + tout
+        d["cost"] = round(d.get("cost", 0) + cost, 6)
+
+    def f(pp):
+        a = by_id(pp["agents"], aid)
+        bump(pp.setdefault("usage", {}))
+        if a:
+            bump(a.setdefault("usage", {}))
+        led = pp.setdefault("ledger", [])
+        led.append({"d": now(), "agent": a["name"] if a else "?", "model": svc.get("model", ""), "in": tin, "out": tout, "cost": cost})
+        del led[:-300]
+    mp(u, pid, f)
+
+
+def reset_usage(u, pid):
+    def f(pp):
+        pp["usage"], pp["ledger"] = {}, []
+        for a in pp["agents"]:
+            a["usage"] = {}
+    mp(u, pid, f)
 
 
 def manual_exchange(u, pid, a, svc, system, h, msg):
@@ -495,7 +534,8 @@ def start(u, j):
             "run_task": lambda: run_task(u, pid, j.get("taskId")),
             "onboard": lambda: onboard(u, pid, j.get("agentId")),
             "sync": lambda: sync_all(u, pid),
-            "release": lambda: release(u, pid, str(j.get("version", "")), str(j.get("notes", "")))}
+            "release": lambda: release(u, pid, str(j.get("version", "")), str(j.get("notes", ""))),
+            "reset_usage": lambda: reset_usage(u, pid)}
     if t not in jobs:
         raise Err(400, "Type de travail inconnu")
 

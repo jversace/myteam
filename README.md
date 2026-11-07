@@ -30,7 +30,8 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 5. **Modules, tâches, bugs** : une tâche ou un bug peut appartenir à plusieurs modules. **▶ Exécuter** lance une tâche affectée à un agent.
 6. **Fichiers du dépôt** : les agents peuvent lister, lire, écrire et supprimer des fichiers **sur leur branche** (jamais sur la branche de base), et vous voyez leurs commits dans *Git & releases*.
 7. **Release** (*Git & releases*) : l'agent principal fusionne les branches des agents dans la branche de base et crée le tag.
-8. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
+8. **Coût** : l'onglet *Coût* donne, par agent et pour tout le projet, les appels, les tokens (entrée/sortie) et le coût estimé. Renseignez d'abord le **tarif** (en $ par million de tokens) de chaque service via *Services IA > Modifier* ; sans tarif, seuls les tokens sont comptés. Estimation indicative : la facture du fournisseur fait foi.
+9. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
 
 Token GitHub : permissions *Contents* et *Pull requests* en lecture/écriture sur le dépôt concerné.
 

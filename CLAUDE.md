@@ -40,10 +40,11 @@ Le navigateur et le moteur modifient le même état. `store.put` fait une fusion
 
 ## Modèle de données (état utilisateur)
 `{services:[{id,name,url,kind,model,apiKey,account,pros,cons}], projects:[...]}`
-Projet : `{id,name,open,desc,rules,spec,mainId, repo:{url,branch,token}, roles[], agents[], tasks[], bugs[], modules[], log[], commits[], releases[], mrs[], releasing}`
+Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,token}, roles[], agents[], tasks[], bugs[], modules[], log[], commits[], releases[], mrs[], releasing}`
 - Agent : `{id,name,service,role,branch,canBug,talk[ids],notes,history[],state,work}` — **dépôt et token au niveau projet**, seule la **branche** varie par agent (peut être partagée).
 - Tâche : `{id,parent,title,desc,who,status("à faire|en cours|terminée"),modules[],result,running,retry_at}`. Bug : `{id,t,d,sev,status,modules[],by}`. Module : `{id,name,desc}`.
 - `log[]` : `{d,from,to,text}` = historique de **toutes** les discussions (Vous, agents, « Système », « Application »).
+- **Coûts** : `ai.call_ai` renvoie un `Reply(str)` avec `.usage={in,out}` (Anthropic : `input_tokens`+cache, `output_tokens` ; OpenAI : `prompt_tokens`, `completion_tokens`). `engine.record_usage` cumule `{calls,in,out,cost}` dans `agent.usage` et `p.usage` (le total survit à la révocation d'un agent) et ajoute une ligne à `p.ledger` (300 max). Coût = tokens × tarifs du service (`service.pin` / `service.pout`, **$ par million de tokens, saisis par l'utilisateur**, jamais préremplis car les tarifs changent). Écrit par le serveur uniquement : **le front n'ajoute pas de valeur par défaut à `usage`/`ledger`** (sinon la fusion à trois voies écraserait les compteurs). Job `reset_usage`. Les agents en chat manuel ne sont pas mesurés.
 - `ensure(p)` (front) complète les anciens états : **y ajouter tout nouveau champ**.
 
 ## Moteur d'agents (`engine.py`)

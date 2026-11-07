@@ -6,6 +6,11 @@ import urllib.request
 from store import Err
 
 
+class Reply(str):
+    """Texte de la réponse ; .usage = {"in": tokens d'entrée, "out": tokens de sortie} quand le fournisseur les donne."""
+    usage = None
+
+
 def call_ai(s, system, messages):
     key, url, model = s.get("apiKey", ""), s.get("url", "").rstrip("/"), s.get("model", "")
     if not key:
@@ -35,6 +40,14 @@ def call_ai(s, system, messages):
         raise Err(502, "Erreur du service IA (%s) : %s" % (e.code, txt))
     except urllib.error.URLError as e:
         raise Err(502, "Service IA injoignable : %s" % e.reason)
+    us = res.get("usage") or {}
     if anth:
-        return "".join(b.get("text", "") for b in res.get("content", []))
-    return res["choices"][0]["message"]["content"]
+        text = "".join(b.get("text", "") for b in res.get("content", []))
+        usage = {"in": us.get("input_tokens", 0) + us.get("cache_creation_input_tokens", 0) + us.get("cache_read_input_tokens", 0),
+                 "out": us.get("output_tokens", 0)}
+    else:
+        text = res["choices"][0]["message"]["content"] or ""
+        usage = {"in": us.get("prompt_tokens", 0), "out": us.get("completion_tokens", 0)}
+    r = Reply(text)
+    r.usage = usage
+    return r

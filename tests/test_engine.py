@@ -91,7 +91,8 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 os.environ["APM_GITHUB_API"] = "http://127.0.0.1:%d" % srv.server_port
 os.environ["APM_DATA"] = tempfile.mkdtemp()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import engine, store  # noqa: E402
+import ai, engine, store  # noqa: E402
+from ai import Reply  # noqa: E402
 from store import Err  # noqa: E402
 
 
@@ -125,6 +126,29 @@ def scripted(s, system, msgs):
             assert "salut" in last and "refusée" in last      # lecture renvoyée + refus de droits renvoyé
             return "Fichier écrit et relu."
     return "ok"
+
+
+class Usage(unittest.TestCase):
+    """call_ai : lecture des tokens consommés (formats Anthropic et compatible OpenAI)."""
+    def test_formats(self):
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                anth = self.path.endswith("/messages")
+                b = json.dumps({"content": [{"type": "text", "text": "salut"}], "usage": {"input_tokens": 21, "output_tokens": 9, "cache_read_input_tokens": 4}}
+                               if anth else {"choices": [{"message": {"content": "hello"}}], "usage": {"prompt_tokens": 11, "completion_tokens": 7}}).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        sv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=sv.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d/v1" % sv.server_port
+        r = ai.call_ai({"apiKey": "k", "url": base, "kind": "anthropic", "model": "m"}, "s", [{"role": "user", "content": "x"}])
+        self.assertEqual((str(r), r.usage), ("salut", {"in": 25, "out": 9}))
+        r = ai.call_ai({"apiKey": "k", "url": base, "kind": "openai", "model": "m"}, "s", [{"role": "user", "content": "x"}])
+        self.assertEqual((str(r), r.usage), ("hello", {"in": 11, "out": 7}))
+        sv.shutdown()
 
 
 class Merge(unittest.TestCase):
@@ -246,6 +270,26 @@ class Engine(unittest.TestCase):
         self.assertEqual(proj()["agents"][1]["work"], 0)
         with self.assertRaises(Err):
             engine.manual_answer("u", "inconnu", "x")
+
+    def test_cout_par_agent_et_global(self):
+        st = store.load("u"); st["services"][0].update(pin="3", pout="15"); store.wj(store.state_path("u"), st)
+
+        def fake(s, system, msgs):
+            r = Reply("ok")
+            r.usage = {"in": 1000, "out": 500}
+            return r
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.ask("u", "p1", "a1", "x", "Vous")
+            engine.ask("u", "p1", "a2", "y", "Vous")
+        p = proj()
+        a1 = p["agents"][0]["usage"]
+        self.assertEqual((a1["calls"], a1["in"], a1["out"]), (1, 1000, 500))
+        self.assertAlmostEqual(a1["cost"], 0.0105, 6)             # 1000×3/1e6 + 500×15/1e6
+        self.assertEqual(p["usage"]["calls"], 2)
+        self.assertAlmostEqual(p["usage"]["cost"], 0.021, 6)
+        self.assertEqual([e["agent"] for e in p["ledger"]], ["Alice", "Bob"])
+        engine.reset_usage("u", "p1")
+        self.assertEqual((proj()["usage"], proj()["ledger"], proj()["agents"][0]["usage"]), ({}, [], {}))
 
     def test_quota_suspend_puis_reprise_planifiee(self):
         def quota(s, system, msgs):
