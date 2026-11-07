@@ -9,7 +9,7 @@ from store import Err
 CAPS = ["subtask", "task_top", "module", "bug", "bug_update", "bug_verify", "link"]
 FREE, APPROVE, NO = "free", "approve", "no"
 MAX_TASK_DEPTH = 4
-STATUS = ("à faire", "en cours", "en attente", "terminée")
+STATUS = ("à faire", "en cours", "en attente", "à vérifier", "terminée")
 BUG_STATUS = ("ouvert", "en correction", "corrigé", "vérifié", "rouvert")
 BUG_CLOSED = ("vérifié", "résolu")        # « résolu » : ancien statut conservé
 

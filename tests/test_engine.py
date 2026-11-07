@@ -169,9 +169,13 @@ class Engine(unittest.TestCase):
         store.wj(store.state_path("u"), make_state())
         self.p = mock.patch.object(engine, "call_ai", scripted)
         self.p.start()
+        self.sp = mock.patch.object(engine, "spawn", lambda *a, **k: None)   # pas de thread d'arrière-plan dans les tests
+        self.sp.start()
+        engine.TIMERS.clear()
 
     def tearDown(self):
         self.p.stop()
+        self.sp.stop()
 
     def test_onboarding_cree_branche_et_contexte(self):
         engine.onboard("u", "p1", "a2")
@@ -319,8 +323,21 @@ class Droits(unittest.TestCase):
                        {"id": "t2", "parent": "", "title": "Autre", "desc": "", "who": "a1", "status": "à faire", "modules": [], "by": ""}]
         store.wj(store.state_path("u"), st)
 
+        self.spawned = []
+        self.sp = mock.patch.object(engine, "spawn", lambda fn, *a, **k: self.spawned.append((fn.__name__, a, k)))
+        self.sp.start()
+        engine.TIMERS.clear()
+
+    def tearDown(self):
+        self.sp.stop()
+
     def act(self, aid, **x):
         return engine.do_act("u", "p1", aid, x, 0)
+
+    def set_task(self, tid, **kw):
+        st = store.load("u")
+        next(x for x in st["projects"][0]["tasks"] if x["id"] == tid).update(kw)
+        store.wj(store.state_path("u"), st)
 
     def set(self, **kw):
         st = store.load("u"); st["projects"][0].update(kw); store.wj(store.state_path("u"), st)
@@ -361,7 +378,9 @@ class Droits(unittest.TestCase):
         note, _ = self.act("a1", do="bug_fix", bug=bug["id"], title="Corriger le crash", assignee="Bob")
         fix = [t for t in proj()["tasks"] if t.get("bug")][0]
         self.assertEqual((fix["parent"], fix["who"], proj()["bugs"][0]["status"]), (cont[0]["id"], "a2", "en correction"))
-        self.assertIn("corrigé", self.act("a2", do="task_status", id=fix["id"], status="terminée")[0])    # tâche finie -> bug corrigé
+        self.assertIn("à vérifier", self.act("a2", do="task_status", id=fix["id"], status="terminée")[0])  # le dév. ne clôture pas lui-même
+        self.assertEqual(proj()["bugs"][0]["status"], "en correction")
+        self.assertIn("corrigé", self.act("a1", do="task_review", id=fix["id"], verdict="accepted", comment="ok")[0])  # vérifiée -> bug corrigé
         self.assertEqual(proj()["bugs"][0]["status"], "corrigé")
         self.assertIn("refusé", self.act("a2", do="bug_status", id=bug["id"], status="vérifié")[1])       # un dév. ne vérifie pas
         self.assertIn("vérifié", self.act("a3", do="bug_status", id=bug["id"], status="vérifié")[0])      # le QA oui
@@ -380,7 +399,7 @@ class Droits(unittest.TestCase):
         with mock.patch.object(engine, "call_ai", fake):
             engine.decide("u", "p1", d["id"], "answer", answer="REST")
         p = proj()
-        self.assertEqual((p["decisions"][0]["status"], p["decisions"][0]["answer"], p["tasks"][0]["status"]), ("répondue", "REST", "en cours"))
+        self.assertEqual((p["decisions"][0]["status"], p["decisions"][0]["answer"], p["tasks"][0]["status"]), ("répondue", "REST", "à vérifier"))   # l'agent a repris sa tâche seul puis l'a soumise
         self.assertIn("REST", vus[0][1])                                                                  # l'agent reçoit la réponse
         self.assertTrue(any("REST ou GraphQL" in i["text"] for i in p["instructions"]))                   # décision structurante -> instructions
 
@@ -429,6 +448,195 @@ class Droits(unittest.TestCase):
         for i in range(engine.MAX_CREATE):
             engine.do_act("u", "p1", "a2", {"do": "task", "title": "T%d" % i, "parent": "t1"}, 0, ctx)
         self.assertIn("Trop de créations", engine.do_act("u", "p1", "a2", {"do": "task", "title": "T9", "parent": "t1"}, 0, ctx)[1])
+
+
+    # ---------- vérification des tâches, relances et suivi ----------
+    def test_fin_de_tache_passe_a_verifier(self):
+        with mock.patch.object(engine, "call_ai", lambda *a: "Livrable prêt."):
+            engine.run_task("u", "p1", "t1")
+        t = proj()["tasks"][0]
+        self.assertEqual((t["status"], t["result"], t["running"]), ("à vérifier", "Livrable prêt.", False))   # jamais « terminée » d'office
+        self.assertEqual([s[0] for s in self.spawned], ["review_task"])
+
+    def test_un_agent_ne_cloture_pas_lui_meme(self):
+        self.assertIn("à vérifier", self.act("a2", do="task_status", id="t1", status="terminée")[0])
+        self.assertEqual(proj()["tasks"][0]["status"], "à vérifier")
+        self.assertIn("refusée", self.act("a2", do="task_review", id="t1", verdict="accepted")[1])      # un dév. ne vérifie pas
+        self.set_task("t2", status="à vérifier")
+        self.assertIn("propre tâche", self.act("a1", do="task_review", id="t2", verdict="accepted")[1])  # ni sa propre tâche
+        self.assertIn("Verdict invalide", self.act("a3", do="task_review", id="t1", verdict="rejected")[1])  # refus sans motif
+
+    def test_verification_par_l_agent_principal(self):
+        self.act("a2", do="task_status", id="t1", status="à vérifier", note="Fait : API login")
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return 'Je vérifie.\n```action\n{"do":"task_review","id":"t1","verdict":"accepted","comment":"conforme"}\n```'
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.review_task("u", "p1", "t1")
+        t = proj()["tasks"][0]
+        self.assertEqual((t["status"], t["reviewed"]["by"], t.get("reviewing")), ("terminée", "Alice", None))
+        self.assertTrue("Aucune écriture" in vus[0] and '"agent":"Bob"' in vus[0] and "Fait : API login" in vus[0])   # preuves + consigne de relire les fichiers
+
+    def test_rejet_relance_puis_escalade(self):
+        for i in range(2):
+            self.set_task("t1", status="à vérifier")
+            engine.apply_review("u", "p1", "t1", "Alice", "rejected", "Il manque les tests")
+            t = proj()["tasks"][0]
+            self.assertEqual((t["status"], t["review_note"], t["reviews"]), ("à faire", "Il manque les tests", i + 1))
+        runs = [s for s in self.spawned if s[0] == "run_task"]
+        self.assertEqual(len(runs), 2)
+        self.assertIn("Il manque les tests", runs[0][1][4])                                            # l'agent reçoit le motif
+        self.set_task("t1", status="à vérifier")
+        engine.apply_review("u", "p1", "t1", "Alice", "rejected", "Toujours pas")
+        d = proj()["decisions"][-1]
+        self.assertEqual((proj()["tasks"][0]["status"], d["escalation"], d["task"]), ("en attente", True, "t1"))   # 3e refus : l'utilisateur décide
+
+    def test_preuves_de_travail(self):
+        st = store.load("u"); pr = st["projects"][0]
+        pr["tasks"][0]["started"] = 1000
+        pr["commits"] = [{"m": "feat: login", "by": "Bob", "ts": 2000, "sha": "abc1234", "d": ""},
+                         {"m": "chore(Bob) : contexte agent", "by": "Bob", "ts": 2000, "sha": "x", "d": ""},
+                         {"m": "ancien", "by": "Bob", "ts": 500, "sha": "y", "d": ""}]
+        store.wj(store.state_path("u"), st)
+        txt = engine.evidence(proj(), proj()["tasks"][0], proj()["agents"][1])
+        self.assertTrue("1 commit(s)" in txt and "feat: login" in txt and "ancien" not in txt)
+
+    def test_classification_et_delais(self):
+        c = engine.classify
+        self.assertEqual([c(Err(429, "q")), c(Err(402, "b")), c(Err(400, "Clé API manquante")), c(Err(502, "Erreur du service IA (401) : x")),
+                          c(Err(502, "Modèle ou URL introuvable (404) : x")), c(Err(502, "Service IA injoignable : x")),
+                          c(Err(502, "Erreur du service IA (503) : x")), c(Err(502, "Erreur du service IA (400) : x"))],
+                         ["quota", "budget", "auth", "auth", "model", "temp", "temp", "other"])
+        self.assertEqual([engine.backoff(0), engine.backoff(0, 7200), engine.backoff(1), engine.backoff(2), engine.backoff(3), engine.backoff(9)],
+                         [60, 3600, 300, 900, 1800, 3600])
+
+    def test_erreur_temporaire_relancee_puis_remontee(self):
+        def down(*a):
+            raise Err(502, "Service IA injoignable : timeout")
+        with mock.patch.object(engine, "call_ai", down), mock.patch.object(engine.threading, "Timer") as T:
+            engine.run_task("u", "p1", "t1")
+        t = proj()["tasks"][0]
+        self.assertEqual((t["retries"], "fail" in t, t["status"], T.call_args[0][0]), (1, False, "à faire", 60))
+        engine.TIMERS.clear()
+        self.set_task("t1", retries=engine.MAX_TEMP)
+        with mock.patch.object(engine, "call_ai", down):
+            engine.run_task("u", "p1", "t1")
+        t = proj()["tasks"][0]
+        self.assertEqual((t["fail"]["kind"], "retry_at" in t), ("temp", False))                        # trop d'échecs : on remonte
+
+    def test_quota_reessaye_toutes_les_heures(self):
+        def quota(*a):
+            raise Err(429, "quota", 60)
+        self.set_task("t1", retries=4)
+        with mock.patch.object(engine, "call_ai", quota), mock.patch.object(engine.threading, "Timer") as T:
+            engine.run_task("u", "p1", "t1")
+        self.assertEqual((proj()["tasks"][0]["retries"], T.call_args[0][0]), (5, 3600))                # plus aucune escalade pour un simple quota
+        self.assertNotIn("fail", proj()["tasks"][0])
+
+    def test_suivi_budget_remonte_a_l_utilisateur(self):
+        self.set_task("t1", status="à faire", fail={"kind": "budget", "msg": "Plafond de budget atteint", "ts": 1})
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("pas d'appel IA pour un plafond atteint")):
+            engine.tick("u", "p1")
+        p = proj()
+        d = p["decisions"][0]
+        self.assertEqual((d["escalation"], d["task"], p["tasks"][0]["status"], p["tasks"][0]["blocked"]), (True, "t1", "en attente", d["id"]))
+        self.assertEqual(d["options"][0], "Relancer la tâche")
+
+    def test_suivi_interroge_le_principal_puis_escalade(self):
+        self.set_task("t1", status="à faire", fail={"kind": "other", "msg": "réponse incohérente", "ts": 1})
+        vus = []
+        with mock.patch.object(engine, "call_ai", lambda s, sy, m: vus.append(m[-1]["content"]) or "Je regarde."):
+            engine.tick("u", "p1")
+        self.assertTrue(len(vus) == 1 and "semblent bloquées" in vus[0] and "Login" in vus[0] and "relaunch" in vus[0])
+        self.assertEqual(proj()["tasks"][0]["sup_n"], 1)
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("délai de carence : pas de nouvel appel")):
+            engine.tick("u", "p1")
+        self.assertEqual(proj().get("decisions", []), [])
+        self.set_task("t1", sup_n=2)                                                                    # déjà relancé deux fois sans succès
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("escalade directe")):
+            engine.tick("u", "p1")
+        self.assertTrue(proj()["decisions"][0]["escalation"])
+
+    def test_suivi_tache_inactive(self):
+        self.set_task("t1", status="en cours", started=1, touched=time.time() - 4000)
+        vus = []
+        with mock.patch.object(engine, "call_ai", lambda s, sy, m: vus.append(m[-1]["content"]) or "ok"):
+            engine.tick("u", "p1")
+        self.assertIn("aucune activité", vus[0])
+
+    def test_suivi_relances_et_verifications_planifiees(self):
+        self.set_task("t1", status="à faire", retry_at=time.time() + 100)
+        self.set_task("t2", status="à vérifier")
+        recorded = []
+        with mock.patch.object(engine, "schedule", lambda u, pid, tid, w: recorded.append((tid, round(w)))):
+            engine.tick("u", "p1")
+        self.assertEqual(recorded[0][0], "t1")
+        self.assertTrue(90 <= recorded[0][1] <= 100)
+        self.assertIn(("review_task", ("u", "p1", "t2"), {}), self.spawned)
+
+    def test_suivi_desactive(self):
+        self.set(supervision="off")
+        self.set_task("t1", status="à faire", fail={"kind": "budget", "msg": "x", "ts": 1})
+        engine.tick("u", "p1")
+        self.assertEqual(proj().get("decisions", []), [])
+
+    def test_principal_manuel_escalade_sans_ia(self):
+        st = store.load("u"); st["projects"][0]["agents"][0]["mode"] = "manual"; store.wj(store.state_path("u"), st)
+        self.set_task("t1", status="à faire", fail={"kind": "other", "msg": "bizarre", "ts": 1})
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("le principal est en chat manuel")):
+            engine.tick("u", "p1")
+        self.assertTrue(proj()["decisions"][0]["escalation"])
+
+    def test_validation_par_l_utilisateur_sans_verificateur(self):
+        st = store.load("u")
+        for ag in st["projects"][0]["agents"]:
+            if ag["id"] in ("a1", "a3"):
+                ag["mode"] = "manual"
+        store.wj(store.state_path("u"), st)
+        self.set_task("t1", status="à vérifier", result="Terminé selon l'agent")
+        engine.review_task("u", "p1", "t1")
+        engine.review_task("u", "p1", "t1")                                                             # pas de doublon de question
+        d = proj()["decisions"]
+        self.assertEqual((len(d), d[0]["review"], proj()["tasks"][0]["status"]), (1, "t1", "à vérifier"))
+        engine.decide("u", "p1", d[0]["id"], "answer", answer="Oui, la valider")
+        t = proj()["tasks"][0]
+        self.assertEqual((t["status"], t["reviewed"]["by"]), ("terminée", "Vous"))
+
+    def test_reponses_a_une_escalade(self):
+        def escalade():
+            self.set_task("t1", status="à faire", fail={"kind": "budget", "msg": "x", "ts": 1}, blocked=None)
+            engine.tick("u", "p1")
+            return proj()["decisions"][-1]
+        d = escalade()
+        engine.decide("u", "p1", d["id"], "answer", answer=d["options"][1])                            # pause
+        self.assertEqual(proj()["tasks"][0]["status"], "en attente")
+        d = escalade()
+        vus = []
+        with mock.patch.object(engine, "call_ai", lambda s, sy, m: vus.append(m[-1]["content"]) or "Fait."):
+            engine.decide("u", "p1", d["id"], "answer", answer="Utilise plutôt SQLite")                 # relance avec consigne libre
+        self.assertIn("Utilise plutôt SQLite", vus[0])
+        self.assertEqual(proj()["tasks"][0]["status"], "à vérifier")
+        d = escalade()
+        engine.decide("u", "p1", d["id"], "answer", answer=d["options"][2])                            # abandon
+        t = proj()["tasks"][0]
+        self.assertEqual((t["status"], t["abandoned"]), ("terminée", True))
+
+    def test_relance_par_le_principal(self):
+        self.assertIn("Relance", self.act("a1", do="relaunch", task="t1", note="Reprends avec SQLite")[0])
+        self.assertEqual([s[0] for s in self.spawned], ["run_task"])
+        self.assertIn("réservée", self.act("a2", do="relaunch", task="t1")[1])
+        for _ in range(engine.MAX_RELAUNCH):
+            self.act("a1", do="relaunch", task="t1")
+        self.assertIn("Trop de relances", self.act("a1", do="relaunch", task="t1")[1])
+
+    def test_lecture_de_la_branche_d_un_autre_agent(self):
+        engine.repo_act("u", "p1", proj(), proj()["agents"][1], {"path": "api.py", "content": "print(1)", "message": "feat"}, "write_file")
+        _, back = engine.repo_act("u", "p1", proj(), proj()["agents"][0], {"path": "api.py", "agent": "Bob"}, "read_file")
+        self.assertIn("print(1)", back)
+        self.assertIn("Agent inconnu", engine.repo_act("u", "p1", proj(), proj()["agents"][0], {"path": "api.py", "agent": "Zed"}, "read_file")[1])
+        self.assertIn("introuvable", engine.repo_act("u", "p1", proj(), proj()["agents"][0], {"path": "api.py"}, "read_file")[1])   # sa propre branche
 
 
 class Http(unittest.TestCase):

@@ -152,5 +152,6 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     engine.recover()
+    engine.start_supervisor()
     print("MyTeam demarre : http://%s:%d   (Ctrl+C pour arreter)" % (HOST, PORT), flush=True)
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()

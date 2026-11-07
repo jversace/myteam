@@ -11,7 +11,7 @@ Application de gestion de projets de développement par une **équipe d'agents I
 - Front : `static/index.html`, SPA **fichier unique** (HTML + CSS + JS, sans framework ni build), servie par le backend.
 - Persistance : fichiers JSON dans `data/` (ignoré par git) : `users.json` (hash PBKDF2), `sessions.json`, `users/<user>.json` (**état complet** d'un utilisateur). Pas de base de données pour l'instant.
 - Git/GitHub : **API REST GitHub** via `urllib` (pas de git local). Dépôt + token au niveau projet.
-- Variables : `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`, `APM_GITHUB_API` (tests). Windows : `start.bat`.
+- Variables : `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`, `APM_GITHUB_API` (tests), `APM_SUPERVISE_SECONDS` (passage du suivi, 300 ; 0 = désactivé). Windows : `start.bat`.
 
 ## Fichiers
 | Fichier | Rôle |
@@ -67,6 +67,15 @@ Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,to
 - `get_progress` répond depuis l'état, **sans appel IA**. **Plafond de budget** : `p.budget` (client) ; `engine.check_budget` refuse tout appel API (erreur 402) quand `p.usage.cost` l'atteint.
 - Écrits **uniquement par le serveur** (le front ne les modifie pas, et n'ajoute pas de valeur par défaut) : `decisions, instructions, seq, spec_n`, `agent.seen_seq`. Côté client : `autonomy`, `budget`, `role.caps`.
 
+## Vérification des tâches et suivi (`engine.py`)
+- **Statuts de tâche** : `à faire, en cours, en attente, à vérifier, terminée`. **Une tâche n'est jamais « terminée » d'office** : en fin de `run_task`, ou sur `task_status terminée` d'un agent (converti), elle passe `à vérifier` ; seuls `task_review accepted` (agent principal, ou agent avec `bug_verify` libre, jamais l'assigné) ou l'utilisateur la clôturent. Une validation manuelle dans l'interface contourne la vérification.
+- **Vérification** (`review_task`, thread) : réservation atomique (`task.reviewing`), prompt avec description, compte rendu et **preuves** (`evidence` : commits de l'agent depuis `task.started`, ou « aucune écriture ») ; le vérificateur relit les fichiers via `read_file` + `"agent":"<prénom>"` (lecture seule sur la branche d'un autre agent, ou `"base"`). `apply_review` : `accepted` → `terminée` (+ `on_task_done` des bugs) ; `rejected` (motif obligatoire) → `à faire` et relance de l'agent avec le motif ; au `MAX_REVIEWS`=3ᵉ refus → escalade à l'utilisateur. Vérificateur muet 2 fois, ou personne d'éligible (principal en chat manuel…) → question de validation à l'utilisateur (`decision.review`).
+- **Échecs d'appel** (`classify`) : `quota` et `temp` (réseau, 5xx) → **relance automatique** (`backoff` : délai du fournisseur puis 5, 15, 30 min, puis **toutes les heures** ; `temp` abandonné après `MAX_TEMP`=6 essais ; `quota` sans limite), l'agent est « suspendu » ; `budget` (402), `auth`, `model` → **escalade directe** à l'utilisateur (l'agent principal n'y peut rien) ; `other` → `task.fail`.
+- **Suivi** (`tick`, boucle `supervisor_loop`, désactivable par projet : `p.supervision = "off"`) : replanifie les reprises manquantes, déclenche les vérifications en attente, repère les tâches en échec (`fail`) ou **inactives** (`en cours` lancée par le moteur, sans activité depuis `STALL_SECONDS`=30 min) ; il **interroge l'agent principal** (message « [Suivi automatique] », un seul par passage, délai de carence `SUP_COOLDOWN`=1 h) qui peut interroger l'agent (`message`), le relancer (`relaunch`, max `MAX_RELAUNCH`=3) ou remonter via `ask_user` ; après 2 interventions sans succès, ou si le principal est en chat manuel, **escalade directe** : décision à l'utilisateur (`add_escalation` : relancer / pause / abandonner, `decision.escalation`).
+- **Décisions** : répondre à une question liée à une tâche **relance automatiquement la tâche** (`run_task` avec la décision) ; l'agent n'a plus besoin d'être relancé à la main. Escalade : option 1 ou texte libre → relance (le texte devient la consigne), option 2 → `en attente`, option 3 → abandon (`terminée` + `abandoned`).
+- Champs de tâche écrits **par le serveur uniquement** : `started, touched, retries, retry_at, fail, reviewing, reviews, review_note, reviewed, review_fail, review_asked, review_err, sup_n, sup_ts, relaunch_n, abandoned, blocked` ; projet : `sup_err_ts`. Côté client : `supervision`.
+- **Tests** : toujours patcher `engine.spawn` (threads d'arrière-plan : vérifications, relances) et vider `engine.TIMERS`, sinon des threads fuient d'un test à l'autre.
+
 ## Modes de connexion d'un agent (`agent.mode`)
 - `api` (défaut) : `ai.call_ai` avec la clé du service. `manual` : **chat manuel**, sans API : `engine.manual_exchange` publie un prompt dans `p.pending` (`{id,agent,name,service,full,short,new,d}`), le thread **attend** (`WAIT`, 24 h) que l'utilisateur colle la réponse du chatbot (`/api/manual/answer`) ; les actions de la réponse sont ensuite exécutées comme d'habitude (les retours de lecture arrivent dans un nouveau prompt). `full` = instructions complètes (nouvelle conversation), `short` = suite (`agent.session` mémorise qu'une conversation existe).
 - **Décision : on n'automatise pas les sites de chat** (claude.ai, chatgpt.com…) : pas d'API publique pour les abonnements grand public, conditions d'utilisation contraires (Anthropic l'applique techniquement), fragile. Alternatives gratuites sans automatisation de site : API à offre gratuite (ex. Gemini via AI Studio, avec limites) ou modèle local compatible OpenAI (ex. Ollama : service `kind:"openai"`, URL `http://localhost:11434/v1`, clé factice).
@@ -79,6 +88,7 @@ Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,to
 - Token GitHub requis : *Contents* et *Pull requests* en lecture/écriture (sinon fusion en 403 avec message explicite).
 
 ## Limites connues / suite prévue
+- La détection de tâche « inactive » ne concerne que les tâches lancées par le moteur (`started`) ; une relance déclenchée par une réponse en chat (`say`) n'est vérifiée qu'au passage suivant du suivi si l'agent n'est pas passé par `run_task`.
 - Les noms de modèles préconfigurés vieillissent (ex. `gemini-2.0-flash` a été retiré par Google, remplacé par `gemini-3.8-flash`) : à revérifier auprès du fournisseur ; une erreur 404 du service signale presque toujours un nom de modèle périmé.
 - Pas de base de données ; sessions sans expiration ; clés API stockées en clair dans `data/`.
 - Un serveur redémarré perd les travaux en cours (tâches marquées « Interrompu ») ; pas de file d'attente persistante.

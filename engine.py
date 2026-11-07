@@ -3,6 +3,7 @@
 Tout s'exécute dans des threads du serveur : le travail continue navigateur fermé.
 L'état est modifié via store.mutate (lecture-modification-écriture atomique)."""
 import json
+import os
 import re
 import secrets
 import threading
@@ -16,6 +17,12 @@ from rights import by_id, mod_ids, now, uid
 from store import DATA, Err, load, mutate
 
 MAX_STEPS, MAX_DEPTH, MAX_CREATE = 6, 3, 8   # tours par échange, profondeur des messages, créations par échange
+MAX_TEMP = 6                          # tentatives automatiques après erreur temporaire avant de remonter le problème
+BACKOFF = [0, 300, 900, 1800, 3600]   # délais minimaux entre relances (s) ; ensuite : toutes les heures
+STALL_SECONDS, SUP_COOLDOWN = 1800, 3600
+MAX_REVIEWS, MAX_RELAUNCH = 3, 3      # refus de vérification, relances par l'agent principal
+SUP_INTERVAL = int(os.environ.get("APM_SUPERVISE_SECONDS", "300"))   # 0 = suivi périodique désactivé
+TIMERS = set()                        # reprises planifiées : (utilisateur, projet, tâche)
 MANUAL_TIMEOUT = 24 * 3600   # attente maximale d'une réponse manuelle
 WAIT = {}                    # échanges manuels en attente : id -> {u, ev, text}
 F = "`" * 3
@@ -29,17 +36,20 @@ RULES = [
     "Les instructions de l’utilisateur et les spécifications sont partagées par toute l’équipe : respecte-les. L’agent principal les tient à jour ; si tu constates un manque ou une contradiction, écris-lui.",
     "Pour connaître l’avancement d’un autre agent, utilise d’abord get_progress (sans coût) ; n’interroge l’agent par message que pour obtenir une précision.",
     "Une tâche ou un bug peut être rattaché à un ou plusieurs modules, sans obligation (ex. le cahier des charges est global). Un bug se corrige par des sous-tâches de correction (bug_fix) ; quand elles sont terminées, il passe à « corrigé » et le QA le vérifie.",
+    "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
-    '{"do":"list_files","path":"<dossier, vide pour la racine>"} : lister un dossier du dépôt (ta branche)',
-    '{"do":"read_file","path":"..."} : lire un fichier du dépôt (ta branche)',
+    '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
+    '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>"} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
     '{"do":"write_file","path":"...","content":"<contenu complet>","message":"<message de commit>"} : créer ou remplacer un fichier sur ta branche',
     '{"do":"delete_file","path":"...","message":"..."} : supprimer un fichier sur ta branche',
     '{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable (sa réponse te revient)',
     '{"do":"get_progress","agent":"<prénom ou all>"} : avancement d’un agent ou de toute l’équipe (sans coût)',
     '{"do":"context","text":"..."} : réécrire tes notes personnelles (fichier de contexte)',
     '{"do":"task","title":"...","desc":"...","assignee":"<prénom>","parent":"<id de la tâche parente, vide = 1er niveau>","modules":["<module>"],"why":"<justification>"} : créer une tâche (sous-tâche libre sous tes tâches ; 1er niveau selon tes droits)',
-    '{"do":"task_status","id":"<id>","status":"à faire|en cours|en attente|terminée"} : statut d’une de tes tâches',
+    '{"do":"task_status","id":"<id>","status":"à faire|en cours|en attente|à vérifier","note":"<compte rendu>"} : statut d’une de tes tâches (« à vérifier » = fini de ton côté ; la clôture se fait par vérification)',
+    '{"do":"task_review","id":"<id>","verdict":"accepted|rejected","comment":"<ce qui manque, si rejected>"} : (agent principal / QA) vérifier une tâche « à vérifier » : accepted seulement si le travail est réellement fait',
+    '{"do":"relaunch","task":"<id>","note":"<consigne>"} : (agent principal) relancer l’agent d’une tâche bloquée',
     '{"do":"module","name":"...","desc":"...","why":"..."} : créer un module (selon tes droits)',
     '{"do":"link_modules","kind":"task|bug","id":"<id>","modules":["<module>"]} : rattacher une tâche ou un bug à des modules (liste vide = global)',
     '{"do":"bug","title":"...","desc":"...","sev":"mineur|majeur|critique","modules":["<module>"]} : déclarer un bug (selon tes droits)',
@@ -93,7 +103,7 @@ def work(u, pid, aid, d):
 
 
 def record_commit(u, pid, by, msg, sha):
-    mp(u, pid, lambda p: p.setdefault("commits", []).append({"m": msg, "by": by, "d": now(), "sha": sha[:7]}))
+    mp(u, pid, lambda p: p.setdefault("commits", []).append({"m": msg, "by": by, "d": now(), "ts": time.time(), "sha": sha[:7]}))
 
 
 def ctx_text(p, a):
@@ -132,7 +142,7 @@ def sys_prompt(p, a):
         ("# Nouveautés depuis ta dernière activité\n" + "\n".join(news)) if news else "",
         "# Toi\nPrénom : %s\nRôle : %s — %s\nBranche git : %s (branche de base : %s)\n%s" % (
             a["name"], r["name"], r["desc"], a["branch"], repo.get("branch", "main"),
-            "Tu es l’AGENT PRINCIPAL : tu peux écrire à tous les agents et tu tiens les spécifications à jour. Quand l’utilisateur te donne un élément durable (consigne, contrainte, décision), enregistre-le avec l’action instruction et mets les spécifications à jour si besoin." if mn else ""),
+            "Tu es l’AGENT PRINCIPAL : tu peux écrire à tous les agents et tu tiens les spécifications à jour. Quand l’utilisateur te donne un élément durable (consigne, contrainte, décision), enregistre-le avec l’action instruction et mets les spécifications à jour si besoin. Tu assures aussi le suivi : tu vérifies chaque tâche « à vérifier » (task_review : accepted seulement si le travail demandé est réellement fait — lis les fichiers de l’agent avec read_file et \"agent\" —, sinon rejected avec ce qui manque), tu interroges et relances (relaunch) les agents qui semblent bloqués, et tu remontes à l’utilisateur (ask_user) tout problème autre qu’un simple manque de tokens (ceux-là sont relancés automatiquement)." if mn else ""),
         "# Tes droits\n" + rights.rights_text(p, a, mn),
         "# Équipe\n" + ("\n".join("- %s (%s%s, branche %s)%s" % (x["name"], role(p, x)["name"], ", agent principal" if is_main(p, x) else "", x["branch"], "" if can(x) else " [non joignable]") for x in others) or "(seul)"),
         "# Projet %s\n%s" % (p["name"], p.get("desc", "")),
@@ -387,19 +397,47 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             except Err:
                 return "Contexte mis à jour (dépôt non configuré : fichier non poussé).", None
         if kind == "task_status":
-            if x.get("status") not in rights.STATUS:
-                return refuse("Statut invalide : %s." % x.get("status"))
+            st = x.get("status")
+            if st not in rights.STATUS:
+                return refuse("Statut invalide : %s." % st)
+            if st == "terminée":
+                st = "à vérifier"          # seule une vérification (task_review) ou l'utilisateur clôture une tâche
 
             def f(pp):
                 t = by_id(pp["tasks"], x.get("id"))
                 if not t or (not mn and t.get("who") != aid):
                     return None
-                t["status"] = x["status"]
-                t.pop("blocked", None) if x["status"] != "en attente" else None
-                b = rights.on_task_done(pp, t) if x["status"] == "terminée" else None
-                return "Tâche « %s » : %s.%s" % (t["title"], x["status"], (" Bug « %s » corrigé : à vérifier par le QA." % b["t"]) if b else "")
+                t["status"], t["touched"] = st, time.time()
+                if st != "en attente":
+                    t.pop("blocked", None)
+                if x.get("note"):
+                    t["result"] = str(x["note"])
+                return "Tâche « %s » : %s.%s" % (t["title"], st, " Elle sera vérifiée avant clôture." if st == "à vérifier" else "")
             r = mp(u, pid, f)
             return refuse("Changement de statut refusé.") if r is None else (r, None)
+        if kind == "task_review":
+            t = by_id(p["tasks"], x.get("id"))
+            if not t or t["status"] != "à vérifier":
+                return refuse("Cette tâche n’est pas en attente de vérification.")
+            if not (mn or lv("bug_verify") == rights.FREE):
+                return refuse("Vérification refusée pour ton rôle.")
+            if t.get("who") == aid:
+                return refuse("Tu ne peux pas vérifier ta propre tâche.")
+            verdict, comment = x.get("verdict"), str(x.get("comment", "")).strip()
+            if verdict not in ("accepted", "rejected") or (verdict == "rejected" and not comment):
+                return refuse("Verdict invalide : accepted, ou rejected avec la liste précise de ce qui manque.")
+            return apply_review(u, pid, t["id"], a["name"], verdict, comment), None
+        if kind == "relaunch":
+            if not mn:
+                return refuse("Relance réservée à l’agent principal.")
+            t = by_id(p["tasks"], x.get("task"))
+            if not t or not t.get("who") or t["status"] in ("terminée", "à vérifier") or t.get("running"):
+                return refuse("Relance impossible pour cette tâche.")
+            if t.get("relaunch_n", 0) >= MAX_RELAUNCH:
+                return refuse("Trop de relances (%d) : remonte le problème à l’utilisateur avec ask_user." % MAX_RELAUNCH)
+            mp(u, pid, lambda pp: by_id(pp["tasks"], t["id"]).__setitem__("relaunch_n", t.get("relaunch_n", 0) + 1))
+            spawn(run_task, u, pid, t["id"], False, "[Agent principal] " + (str(x.get("note", "")).strip() or "Reprends la tâche."))
+            return "Relance de « %s » demandée." % t["title"], None
         if kind == "task":
             parent = x.get("parent") if by_id(p["tasks"], x.get("parent")) else ""
             as_ = byname(x.get("assignee"))
@@ -513,6 +551,7 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
         ans = str(answer or "").strip()
         if not ans:
             raise Err(400, "Réponse vide")
+        opts, tid = d.get("options") or [], d.get("task") or ""
 
         def f(pp):
             dd = by_id(pp["decisions"], did)
@@ -520,14 +559,31 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
             if dd.get("structural"):
                 pp.setdefault("instructions", []).append({"id": uid(), "n": rights.next_seq(pp), "d": now(), "by": "Décision", "scope": "global",
                                                           "active": True, "text": "Décision (%s) : %s → %s" % (dd["byName"], dd["question"], ans)})
-            t = by_id(pp["tasks"], dd.get("task"))
+            t = by_id(pp["tasks"], tid)
             if t and t.get("blocked") == did:
-                t["status"] = "en cours"
                 t.pop("blocked", None)
+                t["touched"] = time.time()
+                if not dd.get("escalation"):
+                    t["status"] = "en cours"
         mp(u, pid, f)
-        log(u, pid, "Vous", ag["name"] if ag else "?", "Réponse à la question « %s » : %s" % (title, ans))
-        if ag:
-            ask(u, pid, ag["id"], "Réponse de l’utilisateur à ta question « %s » : %s%s" % (title, ans, ("\nTu peux reprendre la tâche %s." % d["task"]) if d.get("task") else ""), "Vous")
+        log(u, pid, "Vous", ag["name"] if ag else "Suivi", "Réponse à la question « %s » : %s" % (title, ans))
+        if d.get("review"):                                   # validation de fin de tâche par l'utilisateur
+            if ans == opts[0]:
+                log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "accepted", "Validée par l’utilisateur"))
+            else:
+                log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "rejected", ans if ans != opts[1] else "Refusée par l’utilisateur"))
+        elif d.get("escalation"):                             # décision sur une tâche bloquée
+            if len(opts) > 2 and ans == opts[1]:
+                mp(u, pid, lambda pp: by_id(pp["tasks"], tid).__setitem__("status", "en attente"))
+            elif len(opts) > 2 and ans == opts[2]:
+                mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(status="terminée", abandoned=True, result="Abandonnée sur décision de l’utilisateur."))
+            else:
+                mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(relaunch_n=0, sup_n=0))
+                run_task(u, pid, tid, note="[Décision de l’utilisateur] " + ("Reprends la tâche." if ans == opts[0] else ans))
+        elif tid and ag:                                      # l'agent reprend lui-même sa tâche, sans nouvelle demande
+            run_task(u, pid, tid, note="[Décision de l’utilisateur] Réponse à ta question « %s » : %s\nReprends la tâche en tenant compte de cette décision." % (title, ans))
+        elif ag:
+            ask(u, pid, ag["id"], "Réponse de l’utilisateur à ta question « %s » : %s" % (title, ans), "Vous")
         return
     if decision == "accept":
         pay = dict(d["payload"])
@@ -561,7 +617,18 @@ def repo_act(u, pid, p, a, x, kind):
     if kind in ("write_file", "delete_file") and b == rp.base:
         m = "Écriture refusée : ta branche est la branche de base (%s)." % b
         return m, m
-    rp.ensure_branch(b)
+    tgt = str(x.get("agent") or "").strip()
+    if tgt and kind in ("list_files", "read_file"):      # lecture seule sur la branche d'un autre agent (ou « base »)
+        g = next((g for g in p["agents"] if g["name"].lower() == tgt.lower()), None)
+        if g:
+            b = g["branch"]
+        elif tgt.lower() == "base":
+            b = rp.base
+        else:
+            m = "Agent inconnu : %s." % tgt
+            return m, m
+    else:
+        rp.ensure_branch(b)
     if kind == "list_files":
         items = rp.list_dir(b, path)
         if items is None:
@@ -625,18 +692,60 @@ def sync_all(u, pid):
 def say(u, pid, aid, text):
     try:
         ask(u, pid, aid, text, "Vous")
+        for t in snap(u, pid)["tasks"]:               # une tâche passée « à vérifier » pendant la conversation
+            if t["status"] == "à vérifier" and not t.get("reviewing"):
+                spawn(review_task, u, pid, t["id"])
     except Err as e:
         a = by_id(snap(u, pid)["agents"], aid) or {"name": "?"}
         log(u, pid, "Système", a["name"], ("Quota du service atteint : réessayez dans %s s." % (e.retry or 60)) if e.code == 429 else "Erreur : " + e.msg)
 
 
+def spawn(fn, *a, **k):
+    """Lance un travail dans un thread ; une exception est tracée au lieu de disparaître."""
+    def run():
+        try:
+            fn(*a, **k)
+        except Exception as e:
+            print("Erreur travail d'arrière-plan (%s) : %s" % (getattr(fn, "__name__", "?"), e), flush=True)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def classify(e):
+    """Nature d'un échec d'appel : quota, temp (réseau / 5xx), budget, auth, model ou other."""
+    m = e.msg or ""
+    if e.code == 429:
+        return "quota"
+    if e.code == 402:
+        return "budget"
+    if "Clé API" in m or "(401)" in m or "(403)" in m:
+        return "auth"
+    if "Modèle ou URL introuvable" in m:
+        return "model"
+    if "injoignable" in m or re.search(r"\(5\d\d\)", m):
+        return "temp"
+    return "other"
+
+
+def backoff(n, retry_after=None):
+    """Délai avant la tentative n+1 : au moins le délai du fournisseur, de plus en plus long, puis toutes les heures."""
+    return int(min(3600, max(int(retry_after or 60), BACKOFF[min(n, len(BACKOFF) - 1)], 5)))
+
+
 def schedule(u, pid, tid, wait):
-    t = threading.Timer(wait, lambda: run_task(u, pid, tid, retry=True))
+    key = (u, pid, tid)
+    if key in TIMERS:
+        return
+    TIMERS.add(key)
+
+    def go():
+        TIMERS.discard(key)
+        run_task(u, pid, tid, retry=True)
+    t = threading.Timer(wait, go)
     t.daemon = True
     t.start()
 
 
-def run_task(u, pid, tid, retry=False):
+def run_task(u, pid, tid, retry=False, note=""):
     p = snap(u, pid)
     t = by_id(p["tasks"], tid)
     a = t and by_id(p["agents"], t.get("who"))
@@ -645,43 +754,235 @@ def run_task(u, pid, tid, retry=False):
 
     def start(pp):
         tt = by_id(pp["tasks"], tid)
-        tt.update(running=True, status="en cours")
-        tt.pop("retry_at", None)
+        tt.update(running=True, status="en cours", started=time.time(), touched=time.time())
+        for k in ("retry_at", "fail", "blocked"):
+            tt.pop(k, None)
         by_id(pp["agents"], a["id"])["state"] = "actif"
     mp(u, pid, start)
-    msg = "Exécute cette tâche (id %s) : %s%s%s\nRéponds avec ton livrable, puis mets à jour le statut avec l’action task_status." % (
+    msg = "Exécute cette tâche (id %s) : %s%s%s%s\nRéponds avec ton livrable. Quand tu as terminé, mets le statut à « à vérifier » avec task_status et un compte rendu précis de ce qui est fait ; s’il reste du travail ou un blocage, ne dis pas que c’est terminé : décris ce qui manque ou pose la question avec ask_user." % (
         tid, t["title"], ("\n" + t["desc"]) if t.get("desc") else "",
-        ("\nModules : " + ", ".join(mod_names(p, t.get("modules")))) if t.get("modules") else "")
+        ("\nModules : " + ", ".join(mod_names(p, t.get("modules")))) if t.get("modules") else "", ("\n" + note) if note else "")
     try:
         r = ask(u, pid, a["id"], msg, "Application")
 
         def ok(pp):
             tt = by_id(pp["tasks"], tid)
             if tt:
-                tt["result"] = r
-                tt["running"] = False
+                tt["result"], tt["running"], tt["touched"] = r, False, time.time()
+                tt.pop("retries", None)
                 if tt["status"] == "en cours":
-                    tt["status"] = "terminée"
-                if tt["status"] == "terminée":
-                    rights.on_task_done(pp, tt)
+                    tt["status"] = "à vérifier"     # jamais « terminée » d'office : l'agent principal vérifie
         mp(u, pid, ok)
+        spawn(review_task, u, pid, tid)
     except Err as e:
-        wait = max(5, min(int(e.retry or 60), 3600)) if e.code == 429 else 0
+        kind = classify(e)
 
         def ko(pp):
             tt = by_id(pp["tasks"], tid)
             if not tt:
-                return
-            tt["running"], tt["status"] = False, "à faire"
-            if wait:
-                tt["retry_at"] = time.time() + wait
-                tt["result"] = "Suspendu (quota atteint) — reprise automatique dans %d s." % wait
+                return None
+            tt["running"], tt["status"], tt["touched"] = False, "à faire", time.time()
+            n = tt.get("retries", 0)
+            if kind == "quota" or (kind == "temp" and n < MAX_TEMP):
+                w = backoff(n, e.retry)
+                tt["retries"], tt["retry_at"] = n + 1, time.time() + w
+                tt["result"] = "Suspendu (%s) — nouvelle tentative automatique vers %s (tentative %d)." % (
+                    "quota atteint" if kind == "quota" else "service momentanément indisponible",
+                    time.strftime("%H:%M", time.localtime(tt["retry_at"])), n + 1)
                 by_id(pp["agents"], a["id"])["state"] = "suspendu"
-            else:
-                tt["result"] = "Erreur : " + e.msg
-        mp(u, pid, ko)
-        if wait:
-            schedule(u, pid, tid, wait)
+                return w
+            tt["fail"] = {"kind": kind, "msg": e.msg, "ts": time.time()}
+            tt["result"] = "Erreur : " + e.msg
+            return None
+        w = mp(u, pid, ko)
+        if w:
+            schedule(u, pid, tid, w)
+
+
+def add_escalation(pp, t, reason, review=False):
+    """Question à l'utilisateur : tâche bloquée (relancer / pause / abandonner) ou validation de fin de tâche."""
+    ag = by_id(pp["agents"], t.get("who")) or {}
+    d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": ag.get("id", ""), "byName": "Suivi", "d": now(),
+         "status": "attente", "task": t["id"], "structural": False, "impact": "", "recommendation": ""}
+    if review:
+        d.update(question="La tâche « %s » (%s) est soumise à vérification et aucun agent ne peut la vérifier. %s Le travail demandé est-il vraiment fait ?" % (
+            t["title"], ag.get("name", "?"), reason), options=["Oui, la valider", "Non, à refaire"], review=t["id"])
+    else:
+        d.update(question="La tâche « %s » (%s) est bloquée : %s Que faites-vous ?" % (t["title"], ag.get("name", "?"), reason),
+                 options=["Relancer la tâche", "Mettre en pause (je m’en occupe)", "Abandonner la tâche"], escalation=True)
+        d["recommendation"] = "Relancer la tâche"
+        t["blocked"], t["status"] = d["id"], "en attente"
+    t["touched"] = time.time()
+    pp.setdefault("decisions", []).append(d)
+    return d
+
+
+def apply_review(u, pid, tid, by, verdict, comment):
+    """Verdict de vérification : clôture la tâche (accepted) ou la renvoie à l'agent (rejected)."""
+    def f(pp):
+        t = by_id(pp["tasks"], tid)
+        if not t:
+            return "Tâche introuvable.", False
+        t["touched"] = time.time()
+        if verdict == "accepted":
+            t.update(status="terminée", reviewed={"by": by, "d": now(), "note": comment})
+            for k in ("review_note", "reviews", "relaunch_n", "fail", "retries", "review_fail", "review_asked", "review_err"):
+                t.pop(k, None)
+            b = rights.on_task_done(pp, t)
+            return "Tâche « %s » vérifiée par %s : terminée.%s" % (t["title"], by, (" Bug « %s » corrigé : à vérifier par le QA." % b["t"]) if b else ""), False
+        n = t.get("reviews", 0) + 1
+        t["reviews"], t["review_note"] = n, comment
+        if n >= MAX_REVIEWS:
+            add_escalation(pp, t, "son travail a été refusé %d fois à la vérification (dernier motif : %s)." % (n, comment))
+            return "Tâche « %s » refusée %d fois à la vérification : question transmise à l’utilisateur." % (t["title"], n), False
+        t["status"] = "à faire"
+        return "Tâche « %s » refusée à la vérification par %s : %s" % (t["title"], by, comment), True
+    msg, again = mp(u, pid, f)
+    if again:
+        spawn(run_task, u, pid, tid, False, "[Vérification par %s] Travail refusé : %s\nCorrige ce qui manque, puis soumets à nouveau la tâche (task_status « à vérifier »)." % (by, comment))
+    return msg
+
+
+def evidence(p, t, a):
+    since = t.get("started", 0)
+    cs = [c for c in p.get("commits", []) if c.get("by") == a["name"] and c.get("ts", 0) >= since and not c["m"].startswith("chore(")]
+    lines = "\n".join("  - %s (%s)" % (c["m"], c.get("sha", "")) for c in cs[-10:])
+    return "Preuves : %d commit(s) de %s sur la branche %s depuis le début de la tâche%s" % (
+        len(cs), a["name"], a["branch"], (" :\n" + lines) if lines else ". Aucune écriture dans le dépôt n’a été enregistrée.")
+
+
+def pick_reviewer(p, t):
+    ok = lambda g: g and g.get("mode") != "manual" and g["id"] != t.get("who")
+    mg = by_id(p["agents"], p.get("mainId"))
+    if ok(mg):
+        return mg
+    return next((g for g in p["agents"] if ok(g) and rights.level(p, g, "bug_verify") == rights.FREE), None)
+
+
+def review_task(u, pid, tid):
+    """Fait vérifier par l'agent principal (ou un agent habilité) qu'une tâche soumise est réellement terminée."""
+    if snap(u, pid).get("supervision") == "off":
+        return
+
+    def claim(pp):
+        t = by_id(pp["tasks"], tid)
+        if not t or t["status"] != "à vérifier" or t.get("reviewing"):
+            return False
+        t["reviewing"] = True
+        return True
+    if not mp(u, pid, claim):
+        return
+    try:
+        p = snap(u, pid)
+        t = by_id(p["tasks"], tid)
+        a = by_id(p["agents"], t.get("who")) or {"name": "?", "branch": "?"}
+        rv = pick_reviewer(p, t)
+        if rv is None:                                  # personne ne peut vérifier : l'utilisateur tranche
+            def ask_user(pp):
+                tt = by_id(pp["tasks"], tid)
+                if not tt.get("review_asked"):
+                    tt["review_asked"] = True
+                    add_escalation(pp, tt, "Compte rendu de l’agent : %s." % (tt.get("result") or "aucun")[:300], review=True)
+            mp(u, pid, ask_user)
+            return
+        msg = ("[Application — vérification] La tâche « %s » (id %s), réalisée par %s, est soumise à vérification.\nDescription demandée : %s\n"
+               "Compte rendu de l’agent : %s\n%s\n"
+               "Vérifie que le travail demandé est EFFECTIVEMENT fait : lis les fichiers concernés avec read_file en précisant \"agent\":\"%s\", compare avec la description et les spécifications. "
+               "Conclus obligatoirement par task_review : accepted seulement si tout est fait, sinon rejected avec la liste précise de ce qui manque.") % (
+            t["title"], tid, a["name"], t.get("desc") or "(aucune)", (t.get("result") or "(aucun)")[:1500], evidence(p, t, a), a["name"])
+        ask(u, pid, rv["id"], msg, "Vérification")
+        if by_id(snap(u, pid)["tasks"], tid)["status"] == "à vérifier":
+            def nofinal(pp):
+                tt = by_id(pp["tasks"], tid)
+                tt["review_fail"] = tt.get("review_fail", 0) + 1
+                if tt["review_fail"] >= 2 and not tt.get("review_asked"):
+                    tt["review_asked"] = True
+                    add_escalation(pp, tt, "Le vérificateur n’a pas rendu de verdict.", review=True)
+            mp(u, pid, nofinal)
+        mp(u, pid, lambda pp: by_id(pp["tasks"], tid).pop("review_err", None))
+    except Err as e:                                    # nouvelle tentative au prochain passage du suivi
+        def err(pp):
+            tt = by_id(pp["tasks"], tid)
+            tt["review_err"] = tt.get("review_err", 0) + 1
+            return tt["review_err"]
+        if mp(u, pid, err) == 1:
+            log(u, pid, "Système", "Vous", "Vérification de la tâche impossible pour le moment : %s (nouvel essai automatique)." % e.msg)
+    finally:
+        mp(u, pid, lambda pp: (by_id(pp["tasks"], tid) or {}).pop("reviewing", None))
+
+
+def tick(u, pid):
+    """Passage du suivi : relances après quota, vérifications en attente, tâches bloquées (agent principal, puis utilisateur)."""
+    p = snap(u, pid)
+    if p.get("supervision") == "off":
+        return
+    t0 = time.time()
+
+    def stamp(pp):
+        for tt in pp["tasks"]:
+            if tt["status"] == "en cours" and "touched" not in tt:
+                tt["touched"] = t0
+    mp(u, pid, stamp)
+    p = snap(u, pid)
+    for t in p["tasks"]:
+        if t.get("retry_at"):
+            schedule(u, pid, t["id"], max(0, t["retry_at"] - t0))
+        if t["status"] == "à vérifier" and not t.get("reviewing"):
+            spawn(review_task, u, pid, t["id"])
+    mg = by_id(p["agents"], p.get("mainId"))
+    can_ask = bool(mg) and mg.get("mode") != "manual"
+    report, esc = [], []
+    for t in p["tasks"]:
+        a = by_id(p["agents"], t.get("who"))
+        if not a or t.get("retry_at") or t.get("running") or t.get("blocked") or t.get("reviewing") or a.get("work"):
+            continue
+        if t["status"] == "à faire" and t.get("fail"):
+            kind, cause = t["fail"]["kind"], "erreur : " + t["fail"]["msg"][:200]
+        elif t["status"] == "en cours" and t.get("started") and t0 - t.get("touched", t0) > STALL_SECONDS:
+            kind, cause = "stall", "aucune activité depuis %d min" % ((t0 - t["touched"]) // 60)
+        else:
+            continue
+        if kind in ("budget", "auth", "model") or not can_ask or t.get("sup_n", 0) >= 2:
+            esc.append((t, cause))
+        elif t0 - t.get("sup_ts", 0) >= SUP_COOLDOWN:
+            report.append((t, a, cause))
+    for t, cause in esc:
+        mp(u, pid, lambda pp, i=t["id"], c=cause: add_escalation(pp, by_id(pp["tasks"], i), c))
+        log(u, pid, "Système", "Vous", "Tâche « %s » bloquée (%s) : votre décision est demandée (onglet Décisions)." % (t["title"], cause))
+    if report:
+        msg = ("[Suivi automatique] Des tâches semblent bloquées (les simples manques de tokens sont relancés automatiquement et ne figurent pas ici) :\n%s\n"
+               "Pour chacune : interroge l’agent concerné (message) pour comprendre ; si le problème est résolu ou contournable, relance-le avec relaunch ; "
+               "sinon (décision à prendre, information manquante, erreur répétée), remonte-le à l’utilisateur avec ask_user en indiquant la tâche.") % "\n".join(
+            "- %s « %s » — agent %s — %s" % (t["id"], t["title"], a["name"], cause) for t, a, cause in report)
+        try:
+            ask(u, pid, mg["id"], msg, "Suivi automatique")
+
+            def mark(pp):
+                for t, _, _ in report:
+                    tt = by_id(pp["tasks"], t["id"])
+                    if tt:
+                        tt["sup_n"], tt["sup_ts"] = tt.get("sup_n", 0) + 1, time.time()
+            mp(u, pid, mark)
+        except Err as e:
+            if time.time() - snap(u, pid).get("sup_err_ts", 0) > SUP_COOLDOWN:
+                log(u, pid, "Système", "Vous", "Suivi : impossible d’interroger l’agent principal (%s)." % e.msg)
+                mp(u, pid, lambda pp: pp.__setitem__("sup_err_ts", time.time()))
+
+
+def supervisor_loop():
+    while True:
+        time.sleep(SUP_INTERVAL)
+        for f in (DATA / "users").glob("*.json"):
+            for p in load(f.stem).get("projects", []):
+                try:
+                    tick(f.stem, p["id"])
+                except Exception as e:
+                    print("Erreur du suivi (%s/%s) : %s" % (f.stem, p.get("id"), e), flush=True)
+
+
+def start_supervisor():
+    if SUP_INTERVAL > 0:
+        threading.Thread(target=supervisor_loop, daemon=True).start()
 
 
 def release(u, pid, version, notes):
@@ -760,6 +1061,7 @@ def recover():
                         retries.append((p["id"], t["id"], max(0, t["retry_at"] - time.time())))
                     elif t.get("running"):
                         t["running"], t["status"], t["result"] = False, "à faire", "Interrompu par un redémarrage du serveur."
+                    t.pop("reviewing", None)
         mutate(u, fix)
         for pid, tid, w in retries:
             schedule(u, pid, tid, w)

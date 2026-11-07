@@ -33,6 +33,13 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 8. **Coût** : l'onglet *Coût* donne, par agent et pour tout le projet, les appels, les tokens (entrée/sortie) et le coût estimé. Renseignez d'abord le **tarif** (en $ par million de tokens) de chaque service via *Services IA > Modifier* ; sans tarif, seuls les tokens sont comptés. Estimation indicative : la facture du fournisseur fait foi.
 9. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
 
+## Suivi et vérification du travail
+- **Une tâche n'est jamais « terminée » d'office** : quand un agent a fini, elle passe **« à vérifier »**. L'agent principal (ou le QA) relit le travail réellement fait dans le dépôt, avec les commits de l'agent comme preuve, puis la **clôture** ou la **refuse en listant ce qui manque** : l'agent la reprend alors avec ce motif. Après 3 refus, la question vous est posée.
+- **Manque de tokens ou service indisponible** : l'agent est relancé **automatiquement** (délai du fournisseur, puis 5, 15, 30 minutes, puis toutes les heures), sans rien vous demander.
+- **Autre problème** : l'agent principal interroge l'agent bloqué et le relance s'il peut. Si le problème persiste, ou s'il s'agit d'un plafond de budget, d'une clé invalide ou d'un modèle introuvable, **vous recevez une décision** (onglet *Décisions*) : relancer, mettre en pause ou abandonner.
+- **Réponse à une question d'un agent** : sa tâche **reprend toute seule**, sans relance de votre part.
+- Le suivi tourne toutes les 5 minutes côté serveur et se désactive par projet (*Vue globale* > **Suivi automatique**). Une validation manuelle dans l'interface (statut « terminée ») court-circuite la vérification.
+
 ## Droits des agents et décisions
 - **Droits par rôle** (onglet *Rôles*) : pour chaque capacité (sous-tâches, tâches de 1er niveau, modules, bugs, évolution et vérification des bugs, liens aux modules) : ✔ libre, ✋ soumis à votre validation, ou — interdit. Réglages par défaut : sous-tâches libres sous ses propres tâches, tâches de 1er niveau et modules soumis à validation pour le chef de projet et l'architecte, bugs libres pour tous sauf le rédacteur, vérification des bugs pour le QA.
 - **Autonomie du projet** (*Vue globale*) : *Prudent* (tout à valider), *Équilibré* (selon les rôles, par défaut), *Autonome* (seules les questions remontent).
@@ -62,6 +69,7 @@ Aucun réseau ni clé nécessaires (faux GitHub local, IA simulée).
 | `APM_HOST` | `127.0.0.1` | `0.0.0.0` pour écouter sur le réseau |
 | `APM_DATA` | `./data` | dossier de données |
 | `APM_ALLOW_REGISTER` | `1` | `0` pour fermer la création de comptes |
+| `APM_SUPERVISE_SECONDS` | `300` | période du suivi automatique des tâches (`0` = désactivé) |
 
 ## Déploiement sur serveur Linux (plus tard)
 Même commande : `APM_HOST=127.0.0.1 python3 server.py`, derrière un reverse proxy HTTPS (nginx ou Caddy), lancé par une unité systemd. Ne jamais exposer le port en HTTP clair sur Internet.
