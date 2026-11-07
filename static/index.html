@@ -95,9 +95,9 @@ function render(){
   const open=D.projects.filter(p=>p.open);
   let nav=`<nav><h1>Atelier d’agents IA</h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}${pendN(p)+(p.pending||[]).length?` <span class="tag wa">${pendN(p)+(p.pending||[]).length}</span>`:""}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
   let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():projView();
-  const keep={},ae=document.activeElement,fid=ae&&ae.id,fs=ae&&ae.selectionStart;document.querySelectorAll("[data-keep]").forEach(e=>{keep[e.id]=e.value});
+  const keep={},ae=document.activeElement,fid=ae&&ae.id,fs=ae&&ae.selectionStart;document.querySelectorAll("[data-keep]").forEach(e=>{keep[e.id]=e.value});const sc={};document.querySelectorAll("[data-scroll]").forEach(e=>{sc[e.id]={t:e.scrollTop,b:e.scrollHeight-e.scrollTop-e.clientHeight<40}});
   $("#root").innerHTML=`<div id="app">${nav}<main>${body}</main></div>`;
-  Object.keys(keep).forEach(i=>{const e=document.getElementById(i);if(e)e.value=keep[i]});const fe=fid&&document.getElementById(fid);if(fe){fe.focus();try{if(fs!=null)fe.setSelectionRange(fs,fs)}catch(e){}}
+  Object.keys(keep).forEach(i=>{const e=document.getElementById(i);if(e)e.value=keep[i]});document.querySelectorAll("[data-scroll]").forEach(e=>{const o=sc[e.id];e.scrollTop=(!o||o.b)?e.scrollHeight:o.t});const fe=fid&&document.getElementById(fid);if(fe){fe.focus();try{if(fs!=null)fe.setSelectionRange(fs,fs)}catch(e){}}
   document.querySelectorAll("nav [data-v]").forEach(b=>b.onclick=()=>{view=b.dataset.v;render()});
   document.querySelectorAll("nav [data-p]").forEach(b=>b.onclick=()=>{pid=b.dataset.p;view="p";tab="glob";render()});
   $("#lo").onclick=logout;bind();
@@ -128,7 +128,7 @@ const modIds=(p,v)=>(v||[]).map(x=>(p.modules.find(m=>m.id==x||m.name.toLowerCas
 const mtags=(p,ids)=>modNames(p,ids).map(n=>`<span class="tag">${esc(n)}</span>`).join(" ");
 function log(p,from,to,text){p.log.push({d:now(),from,to,text})}
 function chatBox(p,a,n){const L=p.log.filter(m=>(m.from=="Vous"&&m.to==a.name)||(m.to=="Vous"&&m.from==a.name)||(m.from=="Système"&&m.to==a.name)).slice(-n);
-  return `<div class="card" style="max-height:340px;overflow:auto">${L.map(m=>`<div style="margin-bottom:8px"><b>${esc(m.from)}</b> <span class="mu">${esc(m.d)}</span><div style="white-space:pre-wrap">${esc(m.text)}</div></div>`).join("")||`<span class="mu">Aucun message.</span>`}${(a.work||0)>0?`<div class="mu">⏳ ${esc(a.name)} travaille…</div>`:""}</div>`}
+  return `<div class="card" id="cb-${a.id}-${n}" data-scroll style="max-height:340px;overflow:auto">${L.map(m=>`<div style="margin-bottom:8px"><b>${esc(m.from)}</b> <span class="mu">${esc(m.d)}</span><div style="white-space:pre-wrap">${esc(m.text)}</div></div>`).join("")||`<span class="mu">Aucun message.</span>`}${(a.work||0)>0?`<div class="mu">⏳ ${esc(a.name)} travaille…</div>`:""}</div>`}
 const chatInput=(id,aid)=>`<div class="row" style="margin-top:8px"><input id="${id}" data-keep placeholder="Votre message…"><button class="b" data-a="say" data-i="${aid}" data-j="${id}">Envoyer</button></div>`;
 function recap(p,k){const L=[],pct=ts=>ts.length?Math.round(100*ts.filter(t=>t.status=="terminée").length/ts.length):0,ob=p.bugs.filter(b=>bugOpen(b));
   if(k=="f"){L.push("# "+p.name+" — récapitulatif fonctionnel","",p.desc||"","","## Spécifications",p.spec||"(non renseignées : l’agent principal les tient à jour)","","## Modules");
