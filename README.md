@@ -33,6 +33,14 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 8. **Coût** : l'onglet *Coût* donne, par agent et pour tout le projet, les appels, les tokens (entrée/sortie) et le coût estimé. Renseignez d'abord le **tarif** (en $ par million de tokens) de chaque service via *Services IA > Modifier* ; sans tarif, seuls les tokens sont comptés. Estimation indicative : la facture du fournisseur fait foi.
 9. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
 
+## Droits des agents et décisions
+- **Droits par rôle** (onglet *Rôles*) : pour chaque capacité (sous-tâches, tâches de 1er niveau, modules, bugs, évolution et vérification des bugs, liens aux modules) : ✔ libre, ✋ soumis à votre validation, ou — interdit. Réglages par défaut : sous-tâches libres sous ses propres tâches, tâches de 1er niveau et modules soumis à validation pour le chef de projet et l'architecte, bugs libres pour tous sauf le rédacteur, vérification des bugs pour le QA.
+- **Autonomie du projet** (*Vue globale*) : *Prudent* (tout à valider), *Équilibré* (selon les rôles, par défaut), *Autonome* (seules les questions remontent).
+- **Décisions** (onglet *Décisions*, avec pastille de notification) : vos validations (vous pouvez corriger le titre et la description avant d'accepter, ou refuser avec un motif) et les **questions** des agents (ambiguïtés, décisions structurantes) avec options et recommandation. Votre réponse leur est transmise ; si la décision est structurante, elle s'ajoute aux instructions partagées.
+- **Bugs** : ouvert, en correction, corrigé, vérifié ou rouvert. Un bug crée une tâche « Corrections : module » avec des sous-tâches de correction ; une fois terminées, il passe à « corrigé » et le QA le vérifie.
+- **Instructions partagées** (*Vue globale*) : ce que vous dites de durable à l'agent principal y est consigné et transmis aux agents concernés (global, par rôle, par agent ou par module). Les spécifications sont lisibles par tous les agents.
+- **Plafond de budget** (onglet *Coût*) : au-delà, les agents en mode API sont mis en pause.
+
 Token GitHub : permissions *Contents* et *Pull requests* en lecture/écriture sur le dépôt concerné.
 
 Chaque agent garde son historique (20 derniers messages) et le renvoie au service IA à chaque tâche. Si le service répond « quota atteint » (HTTP 429), l'agent passe en **suspendu** puis relance la tâche automatiquement après le délai indiqué.

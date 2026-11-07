@@ -101,8 +101,8 @@ def make_state():
     return {"services": [{"id": "s1", "name": "S", "kind": "openai", "url": "x", "model": "m", "apiKey": "k"}],
             "projects": [{"id": "p1", "name": "Demo", "rules": "Toujours des tests.", "spec": "", "mainId": "a1",
                           "repo": {"url": "https://github.com/o/r", "branch": "main", "token": "t"},
-                          "roles": [{"id": "r1", "name": "Dev", "desc": "Développe"}],
-                          "agents": [ag("a1", "Alice", canBug=True), ag("a2", "Bob") | {"talk": ["a1"]}],
+                          "roles": [{"id": "r1", "name": "Chef de projet", "desc": "Coordonne"}, {"id": "r2", "name": "Développeur back-end", "desc": "Développe"}, {"id": "r3", "name": "Testeur QA", "desc": "Teste"}],
+                          "agents": [ag("a1", "Alice", canBug=True), ag("a2", "Bob", role="r2", talk=["a1"])],
                           "tasks": [], "bugs": [], "modules": [{"id": "m1", "name": "Auth", "desc": ""}],
                           "log": [], "commits": [], "releases": [], "mrs": []}]}
 
@@ -186,9 +186,11 @@ class Engine(unittest.TestCase):
         p = proj()
         self.assertEqual(BR["agent/bob"]["hello.txt"], "salut")             # écriture sur la branche de Bob
         self.assertNotIn("hello.txt", BR["main"])                           # jamais sur la base
-        self.assertEqual([t["title"] for t in p["tasks"]], ["Suivi hello"])  # Bob n'a pas pu créer « interdit »
-        self.assertEqual(p["tasks"][0]["who"], "a2")
-        self.assertEqual(p["tasks"][0]["modules"], ["m1"])
+        self.assertEqual(p["tasks"], [])                                     # 1er niveau : soumis à validation (même pour le principal) ; Bob n'a pas pu créer « interdit »
+        self.assertEqual([(d["kind"], d["payload"]["title"], d["status"]) for d in p["decisions"]], [("task", "Suivi hello", "attente")])
+        engine.decide("u", "p1", p["decisions"][0]["id"], "accept")
+        p = proj()
+        self.assertEqual([(t["title"], t["who"], t["modules"], t["by"]) for t in p["tasks"]], [("Suivi hello", "a2", ["m1"], "Alice")])
         self.assertEqual(p["spec"], "# Spec\nhello")
         self.assertEqual(BR["agent/alice"]["SPEC.md"], "# Spec\nhello")
         texts = [(m["from"], m["to"], m["text"]) for m in p["log"]]
@@ -304,6 +306,129 @@ class Engine(unittest.TestCase):
         self.assertIn("retry_at", p["tasks"][0])
         self.assertEqual(T.call_args[0][0], 7)                               # reprise planifiée au délai demandé
         self.assertFalse(p["tasks"][0]["running"])
+
+
+class Droits(unittest.TestCase):
+    """Capacités par rôle, validations, bugs, questions à l'utilisateur, instructions partagées, budget."""
+    def setUp(self):
+        reset()
+        st = make_state()
+        pr = st["projects"][0]
+        pr["agents"].append({"id": "a3", "name": "Carol", "service": "s1", "role": "r3", "branch": "agent/carol", "canBug": False, "talk": [], "history": [], "notes": ""})
+        pr["tasks"] = [{"id": "t1", "parent": "", "title": "Login", "desc": "", "who": "a2", "status": "en cours", "modules": [], "by": ""},
+                       {"id": "t2", "parent": "", "title": "Autre", "desc": "", "who": "a1", "status": "à faire", "modules": [], "by": ""}]
+        store.wj(store.state_path("u"), st)
+
+    def act(self, aid, **x):
+        return engine.do_act("u", "p1", aid, x, 0)
+
+    def set(self, **kw):
+        st = store.load("u"); st["projects"][0].update(kw); store.wj(store.state_path("u"), st)
+
+    def test_sous_taches_selon_responsabilite(self):
+        note, back = self.act("a2", do="task", title="Écrire l'API", parent="t1")            # sous sa tâche : libre
+        self.assertIn("Tâche créée", note)
+        self.assertIsNone(back)
+        note, back = self.act("a2", do="task", title="Intrus", parent="t2")                   # tâche d'un autre : refusé
+        self.assertIn("pas responsable", back)
+        note, back = self.act("a1", do="task", title="Sous Autre", parent="t2")              # le principal : partout
+        self.assertIn("Tâche créée", note)
+        self.assertEqual([t["title"] for t in proj()["tasks"] if t.get("parent")], ["Écrire l'API", "Sous Autre"])
+        self.assertIn("doublon", self.act("a2", do="task", title="écrire l'api", parent="t1")[1])
+
+    def test_autonomie_du_projet(self):
+        self.set(autonomy="prudent")
+        self.assertIn("Proposition", self.act("a2", do="task", title="Sous prudent", parent="t1")[0])   # tout à valider
+        self.assertEqual(proj()["decisions"][0]["kind"], "task")
+        self.set(autonomy="auto")
+        self.assertIn("Tâche créée", self.act("a1", do="task", title="Direct")[0])                       # 1er niveau libre en mode autonome
+
+    def test_module_propose_puis_accepte(self):
+        self.assertIn("refusée", self.act("a2", do="module", name="Paiement")[1])                          # un dév. ne crée pas de module
+        self.assertIn("Proposition", self.act("a1", do="module", name="Paiement", desc="CB", why="besoin")[0])
+        did = proj()["decisions"][0]["id"]
+        engine.decide("u", "p1", did, "accept", fields={"name": "Paiements"})                              # modifié puis accepté
+        self.assertEqual([m["name"] for m in proj()["modules"]], ["Auth", "Paiements"])
+        self.assertEqual(proj()["decisions"][0]["status"], "acceptée")
+
+    def test_cycle_de_vie_d_un_bug(self):
+        note, _ = self.act("a2", do="bug", title="Crash login", sev="majeur", modules=["Auth"])
+        p = proj()
+        bug = p["bugs"][0]
+        self.assertEqual((bug["status"], bug["modules"]), ("ouvert", ["m1"]))
+        cont = [t for t in p["tasks"] if t.get("system")]
+        self.assertEqual([t["title"] for t in cont], ["Corrections : Auth"])                               # conteneur créé sans validation
+        note, _ = self.act("a1", do="bug_fix", bug=bug["id"], title="Corriger le crash", assignee="Bob")
+        fix = [t for t in proj()["tasks"] if t.get("bug")][0]
+        self.assertEqual((fix["parent"], fix["who"], proj()["bugs"][0]["status"]), (cont[0]["id"], "a2", "en correction"))
+        self.assertIn("corrigé", self.act("a2", do="task_status", id=fix["id"], status="terminée")[0])    # tâche finie -> bug corrigé
+        self.assertEqual(proj()["bugs"][0]["status"], "corrigé")
+        self.assertIn("refusé", self.act("a2", do="bug_status", id=bug["id"], status="vérifié")[1])       # un dév. ne vérifie pas
+        self.assertIn("vérifié", self.act("a3", do="bug_status", id=bug["id"], status="vérifié")[0])      # le QA oui
+        self.assertEqual(proj()["bugs"][0]["status"], "vérifié")
+
+    def test_question_bloquante_et_reponse(self):
+        self.act("a2", do="ask_user", question="REST ou GraphQL ?", options=["REST", "GraphQL"], recommendation="REST", impact="coût", structural=True, task="t1")
+        p = proj()
+        d = p["decisions"][0]
+        self.assertEqual((p["tasks"][0]["status"], p["tasks"][0]["blocked"], d["kind"], d["status"]), ("en attente", d["id"], "question", "attente"))
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append((system, msgs[-1]["content"]))
+            return "Compris."
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.decide("u", "p1", d["id"], "answer", answer="REST")
+        p = proj()
+        self.assertEqual((p["decisions"][0]["status"], p["decisions"][0]["answer"], p["tasks"][0]["status"]), ("répondue", "REST", "en cours"))
+        self.assertIn("REST", vus[0][1])                                                                  # l'agent reçoit la réponse
+        self.assertTrue(any("REST ou GraphQL" in i["text"] for i in p["instructions"]))                   # décision structurante -> instructions
+
+    def test_refus_renvoye_a_l_agent(self):
+        self.act("a1", do="module", name="X", why="y")
+        vus = []
+        with mock.patch.object(engine, "call_ai", lambda s, sy, m: vus.append(m[-1]["content"]) or "ok"):
+            engine.decide("u", "p1", proj()["decisions"][0]["id"], "refuse", note="pas maintenant")
+        self.assertEqual(proj()["decisions"][0]["status"], "refusée")
+        self.assertTrue("refusé" in vus[0] and "pas maintenant" in vus[0])
+        with self.assertRaises(Err):
+            engine.decide("u", "p1", proj()["decisions"][0]["id"], "accept")                              # déjà traitée
+
+    def test_avancement_sans_ia(self):
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("aucun appel IA attendu")):
+            back = self.act("a1", do="get_progress", agent="Bob")[1]
+        self.assertIn("Bob", back)
+        self.assertIn("1 en cours", back)
+
+    def test_instructions_et_specs_partagees(self):
+        self.assertIn("refusé", self.act("a2", do="instruction", text="x")[1])                              # réservé au principal
+        self.act("a1", do="instruction", text="Toujours en Python 3.12", scope="global")
+        self.act("a1", do="instruction", text="Style strict", scope="role:Développeur back-end")
+        self.act("a1", do="spec", text="# Cahier des charges\nLogin")
+        p = proj()
+        bob, carol = p["agents"][1], p["agents"][2]
+        sb, sc = engine.sys_prompt(p, bob), engine.sys_prompt(p, carol)
+        self.assertIn("Toujours en Python 3.12", sb)
+        self.assertIn("Style strict", sb)
+        self.assertNotIn("Style strict", sc)                                                              # portée « rôle »
+        self.assertIn("Cahier des charges", sc)                                                           # spécifications partagées
+        self.assertIn("Nouveautés depuis ta dernière activité", sb)
+        with mock.patch.object(engine, "call_ai", lambda *a: "ok"):
+            engine.ask("u", "p1", "a2", "salut", "Vous")
+        self.assertNotIn("Nouveautés depuis", engine.sys_prompt(proj(), proj()["agents"][1]))              # vu : plus signalé
+
+    def test_plafond_de_budget(self):
+        self.set(budget="0.01", usage={"calls": 1, "in": 1, "out": 1, "cost": 0.02})
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("pas d'appel au-delà du plafond")):
+            with self.assertRaises(Err) as c:
+                engine.ask("u", "p1", "a2", "x", "Vous")
+        self.assertEqual(c.exception.code, 402)
+
+    def test_limite_de_creations_par_echange(self):
+        ctx = {"n": 0}
+        for i in range(engine.MAX_CREATE):
+            engine.do_act("u", "p1", "a2", {"do": "task", "title": "T%d" % i, "parent": "t1"}, 0, ctx)
+        self.assertIn("Trop de créations", engine.do_act("u", "p1", "a2", {"do": "task", "title": "T9", "parent": "t1"}, 0, ctx)[1])
 
 
 class Http(unittest.TestCase):
