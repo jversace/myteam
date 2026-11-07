@@ -37,6 +37,8 @@ def call_ai(s, system, messages):
             except ValueError:
                 wait = 60
             raise Err(429, "Quota atteint : " + txt, wait)
+        if e.code == 404:
+            raise Err(502, "Modèle ou URL introuvable (404) : vérifiez les champs « Modèle » et « URL de base » dans Services IA > Modifier (les noms de modèles changent souvent). Réponse du fournisseur : %s" % txt)
         raise Err(502, "Erreur du service IA (%s) : %s" % (e.code, txt))
     except urllib.error.URLError as e:
         raise Err(502, "Service IA injoignable : %s" % e.reason)

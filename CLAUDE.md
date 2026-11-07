@@ -68,6 +68,7 @@ Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,to
 - Token GitHub requis : *Contents* et *Pull requests* en lecture/écriture (sinon fusion en 403 avec message explicite).
 
 ## Limites connues / suite prévue
+- Les noms de modèles préconfigurés vieillissent (ex. `gemini-2.0-flash` a été retiré par Google, remplacé par `gemini-3.8-flash`) : à revérifier auprès du fournisseur ; une erreur 404 du service signale presque toujours un nom de modèle périmé.
 - Pas de base de données ; sessions sans expiration ; clés API stockées en clair dans `data/`.
 - Un serveur redémarré perd les travaux en cours (tâches marquées « Interrompu ») ; pas de file d'attente persistante.
 - Les agents ne peuvent pas exécuter de code ni lancer de tests ; ils lisent/écrivent des fichiers du dépôt.
