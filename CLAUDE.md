@@ -20,7 +20,7 @@ Application de gestion de projets de développement par une **équipe d'agents I
 | `store.py` | lecture/écriture de l'état, `mutate()` atomique, révisions, **fusion à trois voies** `merge3` |
 | `rights.py` | **droits des agents** : capacités par rôle, autonomie du projet, création de tâches/modules/bugs, cycle de vie des bugs, instructions |
 | `engine.py` | **moteur d'agents serveur** : dialogues, actions, tâches, onboarding, releases, reprise après quota |
-| `github.py` | classe `Repo` : branches, lecture/écriture/suppression de fichiers, PR+fusion, release |
+| `github.py` | classe `Repo` : branches, fichiers, **fusions (`/merges`), comparaisons, détection et résolution de conflits (commit de fusion à 2 parents via l'API Git Data)**, PR, release |
 | `ai.py` | `call_ai` : API Anthropic ou compatible OpenAI |
 | `static/index.html` | toute l'IHM (aucune logique d'agent : elle envoie des travaux au serveur) |
 | `tests/test_engine.py` | tests (faux GitHub local + IA scriptée) : `python -m unittest discover -s tests` |
@@ -31,17 +31,17 @@ Application de gestion de projets de développement par une **équipe d'agents I
 - `PUT /api/state` `{rev, state}` → `{rev, ser, state}` : le serveur **fusionne** l'état du navigateur avec l'état courant (voir ci-dessous) et renvoie le résultat.
 - `POST /api/service/test` `{serviceId}` : appel minimal au service IA (valide la clé). Les clés API se créent dans la console du fournisseur (aucun flux OAuth public ne permet de les générer : vérifié pour Anthropic et OpenAI) ; le front guide la saisie (`keyset`) et teste aussitôt.
 - `POST /api/manual/answer` `{id,text}` / `POST /api/manual/cancel` `{id}` : réponse (ou annulation) d'un échange **manuel** en attente.
-- `POST /api/job` `{type, projectId, ...}` : lance un travail en arrière-plan (un thread). Types : `say{agentId,text}`, `run_task{taskId}`, `onboard{agentId}`, `sync`, `release{version,notes}`, `reset_usage`, `decide{decisionId,decision:accept|refuse|answer,note,fields,answer}`, `instr_add{scope,text}`, `instr_del{instrId}`. Le front fait `flush()` (PUT) avant chaque travail.
+- `POST /api/job` `{type, projectId, ...}` : lance un travail en arrière-plan (un thread). Types : `say{agentId,text}`, `run_task{taskId}`, `onboard{agentId}`, `sync`, `release{version,notes}` (publication), `cycle_start{version}`, `mr_retry{mrId}`, `reset_usage`, `decide{decisionId,decision:accept|refuse|answer,note,fields,answer}`, `instr_add{scope,text}`, `instr_del{instrId}`. Le front fait `flush()` (PUT) avant chaque travail.
 
 ## Concurrence navigateur / serveur (important)
 Le navigateur et le moteur modifient le même état. `store.put` fait une fusion **à trois voies** : base = dernier instantané reçu par le navigateur (`rev`, 8 gardés + celui servant de base), theirs = état disque, mine = état envoyé. Les listes d'objets avec `id` sont fusionnées par id (suppressions locales respectées, créations serveur conservées) ; en cas de vrai conflit sur une valeur, **le navigateur gagne**. Conséquences :
 - Tout nouvel élément de liste doit avoir un `id`. Les listes sans `id` (`log`, `commits`, `history`…) sont écrites **uniquement par le serveur**.
-- Champs écrits par le serveur : `log, commits, mrs, releases, spec, releasing`, `agent.{history,notes,work,state}`, `task.{running,result,retry_at}`, tâches/bugs créés par les agents. Le navigateur ne doit pas les modifier (`ensure()` ne doit que **compléter** les champs manquants).
+- Champs écrits par le serveur : `log, commits, mrs, releases, cycle, conflicts, spec, releasing`, `agent.{history,notes,work,state}`, `task.{running,result,retry_at}`, tâches/bugs créés par les agents. Le navigateur ne doit pas les modifier (`ensure()` ne doit que **compléter** les champs manquants).
 - Le front adopte l'état serveur (sondage ou réponse du PUT) sauf s'il a des modifications en attente ou une fenêtre modale ouverte.
 
 ## Modèle de données (état utilisateur)
 `{services:[{id,name,url,kind,model,apiKey,account,pros,cons}], projects:[...]}`
-Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,token}, roles[], agents[], tasks[], bugs[], modules[], log[], commits[], releases[], mrs[], releasing}`
+Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,token}, cycle:{version,branch,started}, conflict_policy, conflicts[], roles[], agents[], tasks[], bugs[], modules[], log[], commits[], releases[], mrs[], releasing}`
 - Agent : `{id,name,service,role,branch,canBug,talk[ids],notes,history[],state,work}` — **dépôt et token au niveau projet**, seule la **branche** varie par agent (peut être partagée).
 - Tâche : `{id,parent,title,desc,who,status("à faire|en cours|terminée"),modules[],result,running,retry_at}`. Bug : `{id,t,d,sev,status,modules[],by}`. Module : `{id,name,desc}`.
 - `log[]` : `{d,from,to,text}` = historique de **toutes** les discussions (Vous, agents, « Système », « Application »).
@@ -54,7 +54,7 @@ Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,to
 - **Toute nouvelle règle ou action se déclare dans `RULES` / `ACTIONS`** (elles alimentent le prompt système ET le fichier `.agents/<Prénom>.md`).
 - Onboarding/synchronisation (`provision`) : crée la branche de l'agent si absente et pousse `.agents/<Prénom>.md` (règles équipe + projet, rôle, droits, actions, notes).
 - Tâches (`run_task`) : quota 429/529 → agent `suspendu`, `retry_at`, reprise automatique par `threading.Timer` ; `recover()` au démarrage remet les compteurs à zéro, marque les tâches interrompues et replanifie les reprises.
-- Release (`release`) : pour chaque branche d'agent ≠ base → PR + fusion, puis tag + release GitHub ; échecs consignés sans bloquer la suite.
+- **Release et intégration** : voir « Workflow git » ci-dessous.
 - Agent principal (`mainId`) : dialogue via le prompt de la Vue globale ; écrit à tous, crée les tâches, tient les spécifications, réalise MR + tag.
 
 ## Droits, décisions et instructions (`rights.py` + `engine.py`)
@@ -66,6 +66,16 @@ Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,to
 - **Instructions partagées** : `p.instructions` (`{id,n,d,by,scope,text,active}`, portée `global | role:<nom> | agent:<prénom> | module:<nom>`), écrites par l'agent principal (action `instruction`) ou l'utilisateur (job `instr_add`) ; injectées dans le prompt de chaque agent concerné avec un bloc « Nouveautés » basé sur `p.seq` / `agent.seen_seq`. Les spécifications (`p.spec`, `p.spec_n`) sont aussi dans le prompt de **tous** les agents (6000 car. max).
 - `get_progress` répond depuis l'état, **sans appel IA**. **Plafond de budget** : `p.budget` (client) ; `engine.check_budget` refuse tout appel API (erreur 402) quand `p.usage.cost` l'atteint.
 - Écrits **uniquement par le serveur** (le front ne les modifie pas, et n'ajoute pas de valeur par défaut) : `decisions, instructions, seq, spec_n`, `agent.seen_seq`. Côté client : `autonomy`, `budget`, `role.caps`.
+
+## Workflow git : branche de travail par release (`engine.py` + `github.py`)
+- **La branche principale (`repo.branch`) est réservée à la release finale.** Chaque release a une **branche de travail** `release/<version>` (`p.cycle`), créée depuis la principale par `cycle_start`. `Repo.work` = branche de travail du cycle, sinon la base ; `Repo.ensure_branch(b)` crée depuis `work`. Aucun agent n'écrit sur la base ni sur la branche de travail (`repo_act`, `provision`).
+- **Pull** (`pull`) : fusion de la branche de travail dans la branche de l'agent (`POST /merges`) — automatique au démarrage de `run_task` et avant une MR, ou via l'action `pull`. États : `uptodate | merged | conflict | skip`.
+- **Merge request** : `submit_mr` (action `merge_request`, ou automatique en fin de `run_task`) → pull, puis PR agent → branche de travail, enregistrée dans `p.mrs` (`{id,n,from,to,by,by_id,task,status: ouverte|fusionnée|conflit|refusée,note}`) → `review_mr` (thread) : l'**agent principal** (ou un agent `bug_verify`, jamais l'auteur) relit fichiers/commits et conclut par `mr_review approved|rejected` (`apply_mr_review` → `merge_mr`) ; pas de validateur possible → question à l'utilisateur (`decision.mr_review`). Refus : motif renvoyé à l'auteur.
+- **Dépendances** : `task.deps` (ids) ; `run_task` ne démarre pas tant que `deps_unmet` n'est pas vide (tâche non terminée **ou** MR de cette tâche encore `ouverte|conflit`) ; `task.waiting` l'indique ; `merge_mr` logue les tâches débloquées.
+- **Conflits** (`open_conflict`, `p.conflicts`) : détectés par `Repo.conflict_info` (fichiers modifiés des deux côtés depuis l'ancêtre commun et différents). **Règle du projet `p.conflict_policy`** : `ask` (défaut : décision à l'utilisateur, options `CONFLICT_OPTS` : auteur / agent principal / pause), `author` (l'auteur de la branche résout), `agent:<id>` (agent désigné) ; un agent en chat manuel n'est jamais désigné automatiquement. Le résolveur reçoit base / sa version / version de la branche de travail et répond par `resolve_merge {conflict, files:[{path, content}]}` : `merge_with_resolution` crée un **commit de fusion à deux parents** sur la branche de l'auteur (arbre de l'auteur + changements de la branche de travail, fichiers en conflit remplacés). Résolution incomplète ou avec marqueurs → refusée et renvoyée à l'agent ; 2 échecs, conflit trop gros (> 8 fichiers ou 60 000 car.) ou résolveur injoignable → escalade à l'utilisateur. Après résolution (`after_conflict`) : MR fusionnée, soumission reprise, ou tâche relancée. Pause : l'utilisateur résout sur GitHub puis `mr_retry`.
+- **Publication** (`release`) : exige un cycle actif et aucune MR `ouverte|conflit` ; PR branche de travail → base fusionnée, tag + release GitHub, `p.cycle` supprimé. Sans dépôt configuré : enregistrement local seulement.
+- Limites : les modes de fichier (exécutable) ne sont pas conservés lors d'une résolution ; `compare` GitHub est limité à 300 fichiers ; une branche d'agent créée avant le cycle se met à jour par pull.
+- **Tests** : `tests/test_engine.py` embarque un faux GitHub à historique de commits (ancêtre commun, fusion à trois voies, conflits) — la classe `Integration` couvre ce workflow.
 
 ## Vérification des tâches et suivi (`engine.py`)
 - **Statuts de tâche** : `à faire, en cours, en attente, à vérifier, terminée`. **Une tâche n'est jamais « terminée » d'office** : en fin de `run_task`, ou sur `task_status terminée` d'un agent (converti), elle passe `à vérifier` ; seuls `task_review accepted` (agent principal, ou agent avec `bug_verify` libre, jamais l'assigné) ou l'utilisateur la clôturent. Une validation manuelle dans l'interface contourne la vérification.
@@ -94,4 +104,4 @@ Projet : `{id,name,open,desc,rules,spec,mainId,usage,ledger, repo:{url,branch,to
 - Un serveur redémarré perd les travaux en cours (tâches marquées « Interrompu ») ; pas de file d'attente persistante.
 - Les agents ne peuvent pas exécuter de code ni lancer de tests ; ils lisent/écrivent des fichiers du dépôt.
 - Fusion à trois voies : si le navigateur reste très longtemps sans adopter l'état serveur (plus de 8 instantanés), le repli est « le navigateur gagne » (perte possible de données serveur récentes).
-- Non testé : exécution sous Windows 11, fusion de PR et release sur le vrai GitHub avec un token disposant des droits.
+- Non testé : exécution sous Windows 11 ; fusions, merge requests, conflits et release contre le **vrai** GitHub (tout est testé contre un faux GitHub qui imite l'API) ; le token doit avoir *Contents* et *Pull requests* en écriture.

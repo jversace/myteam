@@ -29,9 +29,16 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 4. **Dialogue** avec n'importe quel agent, ou prompt global vers l'agent principal dans la *Vue globale* : il peut écrire aux autres agents, créer des tâches, tenir les spécifications à jour.
 5. **Modules, tâches, bugs** : une tâche ou un bug peut appartenir à plusieurs modules. **▶ Exécuter** lance une tâche affectée à un agent.
 6. **Fichiers du dépôt** : les agents peuvent lister, lire, écrire et supprimer des fichiers **sur leur branche** (jamais sur la branche de base), et vous voyez leurs commits dans *Git & releases*.
-7. **Release** (*Git & releases*) : l'agent principal fusionne les branches des agents dans la branche de base et crée le tag.
+7. **Release** (*Git & releases*) : voir « Release et branches » ci-dessous.
 8. **Coût** : l'onglet *Coût* donne, par agent et pour tout le projet, les appels, les tokens (entrée/sortie) et le coût estimé. Renseignez d'abord le **tarif** (en $ par million de tokens) de chaque service via *Services IA > Modifier* ; sans tarif, seuls les tokens sont comptés. Estimation indicative : la facture du fournisseur fait foi.
 9. **Récapitulatif** (fonctionnel/technique) et **Historique** (toutes les discussions) sont accessibles à tout moment.
+
+## Release et branches
+- **La branche principale n'est utilisée que pour la release finale.** Pour chaque release, cliquez sur **Démarrer une release** (*Git & releases*) : l'application crée une **branche de travail** `release/<version>`.
+- Chaque agent travaille sur **sa branche**. Il se **synchronise (pull)** avec la branche de travail au démarrage de chaque tâche et avant sa merge request, puis, quand son travail est prêt, **soumet une merge request** vers la branche de travail. L'**agent principal la valide** (il relit les fichiers et les commits) ou la refuse en expliquant ce qu'il faut corriger.
+- **Tâches dépendantes** : une tâche peut dépendre d'autres tâches (bouton *Dépend de…*, ou demandé par l'agent principal). Elle ne démarre que lorsque celles-ci sont terminées **et leurs merge requests fusionnées**.
+- **Conflits de fusion** : la règle se choisit dans *Git & releases* > **Conflits de fusion** : *je décide* (une question vous est posée : l'auteur de la branche, l'agent principal, ou vous), *l'auteur de la branche résout*, ou *un agent désigné résout*. Si l'agent n'y arrive pas, la question vous revient. Si vous choisissez de vous en occuper, résolvez-le sur GitHub puis cliquez sur **Réessayer** sur la merge request.
+- **Publier la release** : fusionne la branche de travail dans la branche principale, crée le tag et la release GitHub. Impossible tant qu'une merge request est ouverte.
 
 ## Suivi et vérification du travail
 - **Une tâche n'est jamais « terminée » d'office** : quand un agent a fini, elle passe **« à vérifier »**. L'agent principal (ou le QA) relit le travail réellement fait dans le dépôt, avec les commits de l'agent comme preuve, puis la **clôture** ou la **refuse en listant ce qui manque** : l'agent la reprend alors avec ce motif. Après 3 refus, la question vous est posée.

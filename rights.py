@@ -101,7 +101,7 @@ def owns(pp, a, t):
     return False
 
 
-def create_task(pp, title, desc="", parent="", who="", modules=(), by="", why="", bug="", system=False):
+def create_task(pp, title, desc="", parent="", who="", modules=(), by="", why="", bug="", system=False, deps=()):
     title = str(title or "").strip()
     if not title:
         raise Err(400, "titre de tâche vide")
@@ -111,6 +111,8 @@ def create_task(pp, title, desc="", parent="", who="", modules=(), by="", why=""
         raise Err(409, "doublon : la tâche « %s » existe déjà à cet endroit" % title)
     t = {"id": uid(), "parent": parent, "title": title, "desc": str(desc or ""), "who": who, "status": "à faire",
          "modules": list(modules), "by": by, "why": str(why or "")}
+    if deps:
+        t["deps"] = [i for i in deps if by_id(pp["tasks"], i)]
     if bug:
         t["bug"] = bug
     if system:
@@ -174,7 +176,7 @@ def on_task_done(pp, t):
 def create_from(pp, kind, d, by):
     """Crée l'élément d'une proposition (tâche, module ou bug) ; retourne un message pour l'historique."""
     if kind == "task":
-        t = create_task(pp, d.get("title"), d.get("desc", ""), d.get("parent", ""), d.get("who", ""), d.get("modules", []), by, d.get("why", ""))
+        t = create_task(pp, d.get("title"), d.get("desc", ""), d.get("parent", ""), d.get("who", ""), d.get("modules", []), by, d.get("why", ""), deps=d.get("deps", []))
         return "Tâche créée : %s%s" % (t["title"], " (sous-tâche)" if t["parent"] else "")
     if kind == "module":
         return "Module créé : %s" % create_module(pp, d.get("name"), d.get("desc", ""), by)["name"]

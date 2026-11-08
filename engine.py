@@ -23,12 +23,13 @@ STALL_SECONDS, SUP_COOLDOWN = 1800, 3600
 MAX_REVIEWS, MAX_RELAUNCH = 3, 3      # refus de vérification, relances par l'agent principal
 SUP_INTERVAL = int(os.environ.get("APM_SUPERVISE_SECONDS", "300"))   # 0 = suivi périodique désactivé
 TIMERS = set()                        # reprises planifiées : (utilisateur, projet, tâche)
+CONFLICT_OPTS = ["L’auteur de la branche résout", "L’agent principal résout", "Je m’en occupe (mettre en pause)"]
 MANUAL_TIMEOUT = 24 * 3600   # attente maximale d'une réponse manuelle
 WAIT = {}                    # échanges manuels en attente : id -> {u, ev, text}
 F = "`" * 3
 RULES = [
     "Tu es un agent IA membre d’une équipe de développement pilotée depuis une application web. Tu réponds en français, de façon concise et factuelle.",
-    "Tu travailles uniquement sur ta branche git, jamais directement sur la branche de base. Les merge requests et le tag sont réalisés par l’agent principal lors des releases.",
+    "Tu travailles uniquement sur ta branche git, jamais directement sur la branche de base. La release finale (fusion dans la branche de base et tag) est réalisée par l’agent principal.",
     "Tu lis et écris les fichiers du dépôt avec les actions list_files, read_file, write_file, delete_file (sur ta branche). write_file remplace le fichier entier : donne toujours le contenu complet. Messages de commit clairs. Ne touche ni à .github/ ni aux fichiers .agents/ des autres.",
     "Ton fichier de contexte (.agents/<ton prénom>.md sur ta branche) fait foi : respecte-le rigoureusement et mets-le à jour avec l’action « context » dès qu’une décision ou une convention durable apparaît.",
     "Tu respectes tes droits (section « Tes droits »). Quand une création est soumise à validation, ta proposition est enregistrée dans la boîte « Décisions » de l’utilisateur : continue ce qui n’en dépend pas, sans la recréer.",
@@ -36,6 +37,7 @@ RULES = [
     "Les instructions de l’utilisateur et les spécifications sont partagées par toute l’équipe : respecte-les. L’agent principal les tient à jour ; si tu constates un manque ou une contradiction, écris-lui.",
     "Pour connaître l’avancement d’un autre agent, utilise d’abord get_progress (sans coût) ; n’interroge l’agent par message que pour obtenir une précision.",
     "Une tâche ou un bug peut être rattaché à un ou plusieurs modules, sans obligation (ex. le cahier des charges est global). Un bug se corrige par des sous-tâches de correction (bug_fix) ; quand elles sont terminées, il passe à « corrigé » et le QA le vérifie.",
+    "Chaque release a une branche de travail (release/<version>) ; la branche principale est réservée à la release finale. Tu te synchronises avec la branche de travail par pull (fait automatiquement au démarrage d’une tâche et avant une merge request) ; quand ton travail est prêt, tu soumets une merge request (merge_request) vers cette branche ; l’agent principal la valide. Une tâche qui dépend d’une autre ne démarre que lorsque celle-ci est terminée et sa merge request fusionnée. En cas de conflit de fusion, la règle du projet décide qui le résout (l’utilisateur, l’auteur de la branche ou un agent désigné) ; si le conflit t’est confié, résous-le avec resolve_merge.",
     "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
@@ -43,10 +45,14 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>"} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
     '{"do":"write_file","path":"...","content":"<contenu complet>","message":"<message de commit>"} : créer ou remplacer un fichier sur ta branche',
     '{"do":"delete_file","path":"...","message":"..."} : supprimer un fichier sur ta branche',
+    '{"do":"pull"} : récupérer dans ta branche les changements de la branche de travail de la release (fusion ; en cas de conflit, la règle du projet s’applique)',
+    '{"do":"merge_request","title":"...","body":"...","task":"<id de la tâche, facultatif>"} : soumettre ta branche à la branche de travail de la release (l’agent principal la valide)',
+    '{"do":"mr_review","id":"<id de la MR>","verdict":"approved|rejected","comment":"..."} : (agent principal / QA) valider (fusion) ou refuser une merge request',
+    '{"do":"resolve_merge","conflict":"<id>","files":[{"path":"...","content":"<contenu final complet, ou null pour supprimer>"}],"message":"..."} : résoudre un conflit de fusion qui t’est confié (un élément par fichier en conflit)',
     '{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable (sa réponse te revient)',
     '{"do":"get_progress","agent":"<prénom ou all>"} : avancement d’un agent ou de toute l’équipe (sans coût)',
     '{"do":"context","text":"..."} : réécrire tes notes personnelles (fichier de contexte)',
-    '{"do":"task","title":"...","desc":"...","assignee":"<prénom>","parent":"<id de la tâche parente, vide = 1er niveau>","modules":["<module>"],"why":"<justification>"} : créer une tâche (sous-tâche libre sous tes tâches ; 1er niveau selon tes droits)',
+    '{"do":"task","title":"...","desc":"...","assignee":"<prénom>","parent":"<id de la tâche parente, vide = 1er niveau>","modules":["<module>"],"depends_on":["<id d’une tâche à terminer avant>"],"why":"<justification>"} : créer une tâche (sous-tâche libre sous tes tâches ; 1er niveau selon tes droits)',
     '{"do":"task_status","id":"<id>","status":"à faire|en cours|en attente|à vérifier","note":"<compte rendu>"} : statut d’une de tes tâches (« à vérifier » = fini de ton côté ; la clôture se fait par vérification)',
     '{"do":"task_review","id":"<id>","verdict":"accepted|rejected","comment":"<ce qui manque, si rejected>"} : (agent principal / QA) vérifier une tâche « à vérifier » : accepted seulement si le travail est réellement fait',
     '{"do":"relaunch","task":"<id>","note":"<consigne>"} : (agent principal) relancer l’agent d’une tâche bloquée',
@@ -120,6 +126,15 @@ def ctx_text(p, a):
         "\n## " + ACTIONS, "\n## Notes de l’agent (à tenir à jour)\n" + (a.get("notes") or "(vides)")])
 
 
+def repo_text(p, a):
+    rp, cy, pol = p.get("repo") or {}, p.get("cycle"), p.get("conflict_policy") or "ask"
+    ptxt = {"ask": "l’utilisateur décide", "author": "l’auteur de la branche résout"}.get(pol) or "l’agent %s résout" % (by_id(p["agents"], pol[6:]) or {}).get("name", "?")
+    return "Branche principale : %s (réservée à la release finale).\n%s\nTa branche : %s.\nConflits de fusion : %s." % (
+        rp.get("branch", "main"),
+        ("Release en cours : %s, branche de travail %s (pull et merge requests)." % (cy["version"], cy["branch"])) if cy
+        else "Aucune release en cours : tu ne peux pas soumettre de merge request tant que l’utilisateur n’en a pas démarré une.", a["branch"], ptxt)
+
+
 def sys_prompt(p, a):
     mn, r = is_main(p, a), role(p, a)
     others = [x for x in p["agents"] if x["id"] != a["id"]]
@@ -127,7 +142,7 @@ def sys_prompt(p, a):
     who = lambda t: (by_id(p["agents"], t.get("who")) or {}).get("name", "—")
     tasks = [t for t in p.get("tasks", []) if mn or t.get("who") == a["id"] or t.get("by") == a["name"]][:80]
     ts = "\n".join("%s | %s | %s | %s | parent : %s%s" % (t["id"], t["title"], t["status"], who(t), t.get("parent") or "—",
-                   (" | modules : " + ",".join(mod_names(p, t.get("modules")))) if t.get("modules") else "") for t in tasks)
+                   (" | modules : " + ",".join(mod_names(p, t.get("modules")))) if t.get("modules") else "") + ((" | dépend de : " + ",".join(t["deps"])) if t.get("deps") else "") for t in tasks)
     bs = "\n".join("%s | %s | %s | %s%s" % (b["id"], b["t"], b["sev"], b["status"], (" | modules : " + ",".join(mod_names(p, b.get("modules")))) if b.get("modules") else "")
                    for b in p.get("bugs", []) if b["status"] not in rights.BUG_CLOSED)[:3000]
     pend = [d for d in p.get("decisions", []) if d["status"] == "attente"]
@@ -144,6 +159,7 @@ def sys_prompt(p, a):
             a["name"], r["name"], r["desc"], a["branch"], repo.get("branch", "main"),
             "Tu es l’AGENT PRINCIPAL : tu peux écrire à tous les agents et tu tiens les spécifications à jour. Quand l’utilisateur te donne un élément durable (consigne, contrainte, décision), enregistre-le avec l’action instruction et mets les spécifications à jour si besoin. Tu assures aussi le suivi : tu vérifies chaque tâche « à vérifier » (task_review : accepted seulement si le travail demandé est réellement fait — lis les fichiers de l’agent avec read_file et \"agent\" —, sinon rejected avec ce qui manque), tu interroges et relances (relaunch) les agents qui semblent bloqués, et tu remontes à l’utilisateur (ask_user) tout problème autre qu’un simple manque de tokens (ceux-là sont relancés automatiquement)." if mn else ""),
         "# Tes droits\n" + rights.rights_text(p, a, mn),
+        "# Dépôt et intégration\n" + repo_text(p, a),
         "# Équipe\n" + ("\n".join("- %s (%s%s, branche %s)%s" % (x["name"], role(p, x)["name"], ", agent principal" if is_main(p, x) else "", x["branch"], "" if can(x) else " [non joignable]") for x in others) or "(seul)"),
         "# Projet %s\n%s" % (p["name"], p.get("desc", "")),
         "# Modules\n" + ("\n".join("- %s : %s" % (m["name"], m.get("desc", "")) for m in p.get("modules", [])) or "(aucun)"),
@@ -442,7 +458,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             parent = x.get("parent") if by_id(p["tasks"], x.get("parent")) else ""
             as_ = byname(x.get("assignee"))
             data = {"title": x.get("title", ""), "desc": x.get("desc", ""), "parent": parent, "who": as_["id"] if as_ else "",
-                    "modules": mod_ids(p, x.get("modules")), "why": str(x.get("why", ""))}
+                    "modules": mod_ids(p, x.get("modules")), "why": str(x.get("why", "")),
+                    "deps": [i for i in (x.get("depends_on") or []) if by_id(p["tasks"], i)]}
             if parent:
                 par = by_id(p["tasks"], parent)
                 if not mn and not rights.owns(p, a, par):
@@ -508,6 +525,43 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                     t["status"], t["blocked"] = "en attente", d["id"]
             mp(u, pid, f)
             return "Question transmise à l’utilisateur : %s%s" % (q, " (tâche en attente de décision)" if tid else ""), None
+        if kind == "pull":
+            st, msg = pull(u, pid, aid)
+            return msg, msg
+        if kind == "merge_request":
+            st, msg = submit_mr(u, pid, aid, str(x.get("title", "")), str(x.get("body", "")), x.get("task") if by_id(p["tasks"], x.get("task")) else "")
+            return msg, msg
+        if kind == "mr_review":
+            m = by_id(p.get("mrs", []), x.get("id"))
+            if not m or m.get("status") != "ouverte":
+                return refuse("Cette merge request n’est pas en attente de validation.")
+            if not (mn or lv("bug_verify") == rights.FREE):
+                return refuse("Validation de merge request refusée pour ton rôle.")
+            if m.get("by_id") == aid:
+                return refuse("Tu ne peux pas valider ta propre merge request.")
+            verdict, comment = x.get("verdict"), str(x.get("comment", "")).strip()
+            if verdict not in ("approved", "rejected") or (verdict == "rejected" and not comment):
+                return refuse("Verdict invalide : approved, ou rejected avec ce qu’il faut corriger.")
+            return apply_mr_review(u, pid, m["id"], a["name"], verdict, comment), None
+        if kind == "resolve_merge":
+            c = by_id(p.get("conflicts", []), x.get("conflict"))
+            if not c or c["status"] != "ouvert" or c.get("resolver") != aid:
+                return refuse("Aucun conflit ouvert ne t’est confié sous cet identifiant.")
+            res = {}
+            for f in x.get("files") or []:
+                if isinstance(f, dict) and isinstance(f.get("path"), str) and (f.get("content") is None or isinstance(f.get("content"), str)):
+                    res[safe_path(f["path"])] = f.get("content")
+            owner, rp = by_id(p["agents"], c["agent"]), github.Repo(p)
+            missing = [i["path"] for i in rp.conflict_info(owner["branch"], rp.work) if i["path"] not in res]
+            if missing:
+                return refuse("Résolution incomplète : il manque %s." % ", ".join(missing))
+            if any("<<<<<<<" in (v or "") or ">>>>>>>" in (v or "") for v in res.values()):
+                return refuse("Ne laisse pas de marqueurs de conflit (<<<<<<<) dans les fichiers.")
+            sha = rp.merge_with_resolution(owner["branch"], rp.work, res, str(x.get("message") or "Résolution du conflit avec %s" % rp.work))
+            record_commit(u, pid, a["name"], "merge : résolution du conflit (%s)" % ", ".join(res), sha)
+            mp(u, pid, lambda pp: by_id(pp["conflicts"], c["id"]).update(status="résolu", resolved_by=a["name"], done=now()))
+            spawn(after_conflict, u, pid, c["id"])
+            return "Conflit résolu : fusion commitée sur %s." % owner["branch"], None
         if kind == "instruction":
             if not mn:
                 return refuse("Enregistrement d’instruction refusé : réservé à l’agent principal (écris-lui un message).")
@@ -572,6 +626,18 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                 log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "accepted", "Validée par l’utilisateur"))
             else:
                 log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "rejected", ans if ans != opts[1] else "Refusée par l’utilisateur"))
+        elif d.get("conflict"):                               # qui résout le conflit de fusion
+            cid = d["conflict"]
+            if by_id(snap(u, pid).get("conflicts", []), cid):
+                if ans == opts[2]:
+                    mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).__setitem__("status", "pause"))
+                    log(u, pid, "Système", "Vous", "Conflit mis en pause : résolvez-le sur GitHub puis utilisez « Réessayer » sur la merge request.")
+                else:
+                    mgr = by_id(p["agents"], p.get("mainId"))
+                    c = by_id(snap(u, pid)["conflicts"], cid)
+                    resolve_conflict(u, pid, cid, mgr["id"] if (ans == opts[1] and mgr) else c["agent"])
+        elif d.get("mr_review"):                              # validation de merge request par l'utilisateur
+            log(u, pid, "Système", "Vous", apply_mr_review(u, pid, d["mr_review"], "Vous", "approved" if ans == opts[0] else "rejected", "" if ans == opts[0] else "Refusée par l’utilisateur"))
         elif d.get("escalation"):                             # décision sur une tâche bloquée
             if len(opts) > 2 and ans == opts[1]:
                 mp(u, pid, lambda pp: by_id(pp["tasks"], tid).__setitem__("status", "en attente"))
@@ -614,7 +680,7 @@ def instr_add(u, pid, scope, text):
 def repo_act(u, pid, p, a, x, kind):
     rp, b = github.Repo(p), a["branch"]
     path = safe_path(x.get("path"), write=kind in ("write_file", "delete_file"))
-    if kind in ("write_file", "delete_file") and b == rp.base:
+    if kind in ("write_file", "delete_file") and b in (rp.base, rp.work):
         m = "Écriture refusée : ta branche est la branche de base (%s)." % b
         return m, m
     tgt = str(x.get("agent") or "").strip()
@@ -665,8 +731,8 @@ def provision(u, pid, aid):
         rp = github.Repo(p)
     except Err:
         return "Dépôt GitHub/token non configuré au niveau du projet : branche et fichier de contexte non créés."
-    if a["branch"] == rp.base:
-        return "La branche de l’agent est la branche de base : refusé, choisissez une branche dédiée."
+    if a["branch"] in (rp.base, rp.work):
+        return "La branche de l’agent est la branche de base ou d’intégration : refusé, choisissez une branche dédiée."
     try:
         created = rp.ensure_branch(a["branch"])
         msg = "chore(%s) : contexte agent" % a["name"]
@@ -752,16 +818,33 @@ def run_task(u, pid, tid, retry=False, note=""):
     if not a or (retry and not t.get("retry_at")) or t.get("running"):
         return
 
+    unmet = deps_unmet(p, t)
+    if unmet:
+        mp(u, pid, lambda pp: by_id(pp["tasks"], tid).__setitem__("waiting", unmet))
+        return log(u, pid, "Système", a["name"], "Tâche « %s » non lancée : elle attend %s." % (t["title"], ", ".join("« %s »" % x for x in unmet)))
+    if open_conflict_for(p, a["id"]):
+        return log(u, pid, "Système", a["name"], "Tâche « %s » non lancée : un conflit de fusion est en cours de résolution sur la branche de %s." % (t["title"], a["name"]))
+
     def start(pp):
         tt = by_id(pp["tasks"], tid)
         tt.update(running=True, status="en cours", started=time.time(), touched=time.time())
-        for k in ("retry_at", "fail", "blocked"):
+        for k in ("retry_at", "fail", "blocked", "waiting"):
             tt.pop(k, None)
         by_id(pp["agents"], a["id"])["state"] = "actif"
     mp(u, pid, start)
     msg = "Exécute cette tâche (id %s) : %s%s%s%s\nRéponds avec ton livrable. Quand tu as terminé, mets le statut à « à vérifier » avec task_status et un compte rendu précis de ce qui est fait ; s’il reste du travail ou un blocage, ne dis pas que c’est terminé : décris ce qui manque ou pose la question avec ask_user." % (
         tid, t["title"], ("\n" + t["desc"]) if t.get("desc") else "",
         ("\nModules : " + ", ".join(mod_names(p, t.get("modules")))) if t.get("modules") else "", ("\n" + note) if note else "")
+    pull_note = ""
+    try:                                                   # pull régulier : on repart de la branche de travail à jour
+        state, pm = pull(u, pid, a["id"], origin="pull", task=tid)
+        if state == "conflict":
+            mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(running=False, status="en attente"))
+            return
+        pull_note = "\n(Pull automatique : %s)" % pm
+    except Err as e:
+        pull_note = "\n(Pull impossible : %s)" % e.msg
+    msg += pull_note + "\nQuand ton travail est prêt, soumets une merge request vers la branche de travail de la release avec l’action merge_request, puis passe la tâche à « à vérifier »."
     try:
         r = ask(u, pid, a["id"], msg, "Application")
 
@@ -773,6 +856,12 @@ def run_task(u, pid, tid, retry=False, note=""):
                 if tt["status"] == "en cours":
                     tt["status"] = "à vérifier"     # jamais « terminée » d'office : l'agent principal vérifie
         mp(u, pid, ok)
+        try:
+            st, mm = submit_mr(u, pid, a["id"], "Tâche : %s" % t["title"], "", tid)
+            if st in ("submitted", "conflict"):
+                log(u, pid, "Système", a["name"], mm)
+        except Err as e:
+            log(u, pid, "Système", a["name"], "Merge request non soumise : %s" % e.msg)
         spawn(review_task, u, pid, tid)
     except Err as e:
         kind = classify(e)
@@ -844,6 +933,11 @@ def apply_review(u, pid, tid, by, verdict, comment):
 
 
 def evidence(p, t, a):
+    m = next((m for m in p.get("mrs", []) if m.get("id") and m.get("task") == t["id"]), None)
+    return _evidence(p, t, a) + (("\nMerge request #%s : %s%s." % (m["n"], m["status"], (" (" + m["note"] + ")") if m.get("note") else "")) if m else "\nAucune merge request liée à cette tâche.")
+
+
+def _evidence(p, t, a):
     since = t.get("started", 0)
     cs = [c for c in p.get("commits", []) if c.get("by") == a["name"] and c.get("ts", 0) >= since and not c["m"].startswith("chore(")]
     lines = "\n".join("  - %s (%s)" % (c["m"], c.get("sha", "")) for c in cs[-10:])
@@ -985,34 +1079,324 @@ def start_supervisor():
         threading.Thread(target=supervisor_loop, daemon=True).start()
 
 
+def open_conflict_for(p, aid):
+    return any(c["agent"] == aid and c["status"] in ("ouvert", "escalade", "pause") for c in p.get("conflicts", []))
+
+
+def deps_unmet(p, t):
+    """Titres des dépendances non satisfaites : tâche non terminée, ou sa merge request encore en cours."""
+    out = []
+    for i in t.get("deps") or []:
+        d = by_id(p["tasks"], i)
+        if d and (d["status"] != "terminée" or any(m.get("task") == i and m.get("status") in ("ouverte", "conflit") for m in p.get("mrs", []))):
+            out.append(d["title"])
+    return out
+
+
+def cycle_start(u, pid, version):
+    """Démarre une release : crée la branche de travail release/<version> depuis la branche de base."""
+    p = snap(u, pid)
+    version = version.strip()
+    if not version:
+        return log(u, pid, "Système", "Vous", "Version vide : release non démarrée.")
+    if p.get("cycle"):
+        return log(u, pid, "Système", "Vous", "Une release est déjà en cours (%s) : publiez-la d’abord." % p["cycle"]["version"])
+    try:
+        rp = github.Repo(p)
+        branch = "release/" + re.sub(r"[^\w.\-]+", "-", version)
+        rp.ensure_branch(branch, source=rp.base)
+    except Err as e:
+        return log(u, pid, "Système", "Vous", "Impossible de démarrer la release : %s" % e.msg)
+    mp(u, pid, lambda pp: pp.__setitem__("cycle", {"version": version, "branch": branch, "started": now()}))
+    log(u, pid, "Système", "Vous", "Release %s démarrée : branche de travail %s créée depuis %s. Les agents s’y synchronisent (pull) et y soumettent leurs merge requests ; %s reste réservée à la release finale." % (version, branch, rp.base, rp.base))
+
+
+def pull(u, pid, aid, origin="pull", task="", title="", body=""):
+    """Fusionne la branche de travail dans la branche de l'agent. Retourne (état, message) : uptodate | merged | conflict | skip."""
+    p = snap(u, pid)
+    a = by_id(p["agents"], aid)
+    try:
+        rp = github.Repo(p)
+    except Err:
+        return "skip", "Dépôt non configuré : pas de pull."
+    if rp.work == rp.base:
+        return "skip", "Aucune release en cours : pas de branche de travail à récupérer."
+    if a["branch"] in (rp.base, rp.work):
+        return "skip", "Ta branche ne peut pas être la branche de base ou la branche de travail."
+    rp.ensure_branch(a["branch"])
+    r = rp.merge_branch(a["branch"], rp.work, "pull : %s dans %s" % (rp.work, a["branch"]))
+    if r["state"] == "uptodate":
+        return "uptodate", "Ta branche est déjà à jour avec %s." % rp.work
+    if r["state"] == "merged":
+        record_commit(u, pid, a["name"], "pull : %s" % rp.work, r.get("sha", ""))
+        return "merged", "Pull réussi : %s est fusionnée dans ta branche." % rp.work
+    return "conflict", open_conflict(u, pid, aid, origin, task=task, title=title, body=body)
+
+
+def pick_resolver(p, owner):
+    """Qui résout un conflit selon la règle du projet : l'auteur, un agent désigné, ou personne (l'utilisateur décide)."""
+    pol = p.get("conflict_policy") or "ask"
+    g = owner if pol == "author" else (by_id(p["agents"], pol[6:]) if pol.startswith("agent:") else None)
+    return g if g and g.get("mode") != "manual" else None
+
+
+def conflict_decision(pp, c, reason=""):
+    owner = by_id(pp["agents"], c["agent"]) or {"name": "?"}
+    d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": c["agent"], "byName": "Fusion", "d": now(), "status": "attente",
+         "question": "Conflit de fusion entre la branche %s (%s) et %s sur : %s. %sQui doit le résoudre ?" % (
+             c["branch"], owner["name"], c.get("target", ""), ", ".join(c["files"]) or "(fichiers non identifiés)", (reason + " ") if reason else ""),
+         "options": list(CONFLICT_OPTS), "recommendation": CONFLICT_OPTS[0], "structural": False, "task": "", "conflict": c["id"],
+         "impact": "La fusion et les tâches qui en dépendent restent bloquées tant que le conflit n’est pas résolu."}
+    pp.setdefault("decisions", []).append(d)
+    return d
+
+
+def open_conflict(u, pid, aid, origin, mr_id="", task="", title="", body=""):
+    """Enregistre un conflit de fusion et applique la règle du projet (agent chargé de le résoudre, ou décision de l'utilisateur)."""
+    p = snap(u, pid)
+    a, rp = by_id(p["agents"], aid), github.Repo(p)
+    files = [i["path"] for i in rp.conflict_info(a["branch"], rp.work)]
+    resolver = pick_resolver(p, a) if files else None
+
+    def f(pp):
+        c = {"id": uid(), "n": rights.next_seq(pp), "agent": aid, "branch": a["branch"], "target": rp.work, "files": files, "origin": origin,
+             "mr": mr_id, "task": task, "title": title, "body": body, "status": "ouvert", "resolver": "", "tries": 0, "d": now()}
+        pp.setdefault("conflicts", []).append(c)
+        m = by_id(pp.get("mrs", []), mr_id)
+        if m:
+            m["status"] = "conflit"
+        if not resolver:
+            conflict_decision(pp, c, "" if files else "Le conflit n’a pas pu être détaillé automatiquement.")
+        return c["id"]
+    cid = mp(u, pid, f)
+    if resolver:
+        spawn(resolve_conflict, u, pid, cid, resolver["id"])
+        return "Conflit de fusion sur %d fichier(s) (%s) : la résolution est confiée à %s (règle du projet). Attends sa fin avant de poursuivre." % (len(files), ", ".join(files), resolver["name"])
+    return "Conflit de fusion sur %s : une décision est demandée à l’utilisateur (onglet Décisions). Attends-la avant de poursuivre." % (", ".join(files) or "des fichiers")
+
+
+def escalate_conflict(u, pid, cid, reason):
+    def f(pp):
+        c = by_id(pp["conflicts"], cid)
+        c["status"] = "escalade"
+        conflict_decision(pp, c, reason)
+    mp(u, pid, f)
+    log(u, pid, "Système", "Vous", "Conflit de fusion : %s Votre décision est demandée (onglet Décisions)." % reason)
+
+
+def resolve_conflict(u, pid, cid, rid):
+    """Demande à un agent de résoudre un conflit (l'agent répond par l'action resolve_merge) ; échec : l'utilisateur décide."""
+    p = snap(u, pid)
+    c = by_id(p.get("conflicts", []), cid)
+    if not c or c["status"] not in ("ouvert", "escalade", "pause"):
+        return
+    owner, rp = by_id(p["agents"], c["agent"]), github.Repo(p)
+    for attempt in range(2):
+        info = rp.conflict_info(owner["branch"], rp.work)
+        if not info:                                       # plus aucun vrai conflit : on poursuit
+            mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).__setitem__("status", "résolu"))
+            return after_conflict(u, pid, cid)
+        if len(info) > 8 or sum(len(i[k] or "") for i in info for k in ("base", "into", "source")) > 60000:
+            return escalate_conflict(u, pid, cid, "Le conflit est trop volumineux pour une résolution automatique.")
+        mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).update(resolver=rid, status="ouvert", tries=attempt + 1))
+        show = lambda v: ("```\n%s\n```" % v) if v is not None else "(absent)"
+        material = "\n\n".join("### %s\n- Version commune (base) :\n%s\n- Version de la branche de %s (%s) :\n%s\n- Version de la branche de travail (%s) :\n%s" % (
+            i["path"], show(i["base"]), owner["name"], owner["branch"], show(i["into"]), rp.work, show(i["source"])) for i in info)
+        msg = ("[Conflit de fusion] La branche %s (agent %s) ne peut pas être fusionnée avec %s : conflit (id %s) sur %d fichier(s). "
+               "Fusionne intelligemment les deux versions de chaque fichier, sans marqueur de conflit, puis réponds par UNE action resolve_merge "
+               "{\"conflict\":\"%s\",\"files\":[{\"path\":...,\"content\":<contenu final complet>}],\"message\":...} qui couvre tous les fichiers.\n\n%s") % (
+            owner["branch"], owner["name"], rp.work, cid, len(info), cid, material)
+        try:
+            ask(u, pid, rid, msg, "Conflit")
+        except Err as e:
+            return escalate_conflict(u, pid, cid, "Le résolveur n’a pas pu être sollicité (%s)." % e.msg)
+        if by_id(snap(u, pid)["conflicts"], cid)["status"] == "résolu":
+            return
+    escalate_conflict(u, pid, cid, "La résolution automatique a échoué à deux reprises.")
+
+
+def after_conflict(u, pid, cid):
+    """Suite d'un conflit résolu : fusion de la merge request, nouvelle soumission, ou reprise de la tâche."""
+    c = by_id(snap(u, pid).get("conflicts", []), cid)
+    if not c:
+        return
+    log(u, pid, "Système", "Vous", "Conflit résolu sur la branche %s." % c["branch"])
+    if c.get("mr"):
+        log(u, pid, "Système", "Vous", merge_mr(u, pid, c["mr"]))
+    elif c["origin"] == "mr":
+        log(u, pid, "Système", "Vous", submit_mr(u, pid, c["agent"], c.get("title", ""), c.get("body", ""), c.get("task", ""))[1])
+    elif c.get("task"):
+        spawn(run_task, u, pid, c["task"], False, "[Fusion] Le conflit de fusion est résolu et ta branche est à jour : reprends la tâche.")
+
+
+def submit_mr(u, pid, aid, title="", body="", task=""):
+    """Soumet la branche de l'agent à la branche de travail. Retourne (état, message) : submitted | exists | conflict | skip."""
+    p = snap(u, pid)
+    a = by_id(p["agents"], aid)
+    try:
+        rp = github.Repo(p)
+    except Err:
+        return "skip", "Dépôt GitHub/token non configuré : pas de merge request."
+    if rp.work == rp.base:
+        return "skip", "Aucune release en cours : l’utilisateur doit d’abord en démarrer une (%s est réservée à la release finale)." % rp.base
+    if a["branch"] in (rp.base, rp.work):
+        return "skip", "Ta branche ne peut pas être la branche de base ou la branche de travail."
+    if open_conflict_for(p, aid):
+        return "skip", "Un conflit de fusion est déjà en cours de résolution sur ta branche."
+    ex = next((m for m in p.get("mrs", []) if m.get("id") and m.get("from") == a["branch"] and m.get("status") in ("ouverte", "conflit")), None)
+    if ex:
+        return "exists", "Une merge request est déjà ouverte (#%s) : elle sera validée." % ex["n"]
+    state, msg = pull(u, pid, aid, origin="mr", task=task, title=title, body=body)
+    if state == "conflict":
+        return "conflict", msg
+    if not rp.compare(rp.work, a["branch"]).get("ahead_by"):
+        return "skip", "Rien à soumettre : ta branche n’a aucun commit en avance sur %s." % rp.work
+    title = title or "Merge request de %s" % a["name"]
+    r = rp.pr_open(a["branch"], title, body)
+    if r.get("skipped"):
+        return "skip", "Rien à fusionner."
+    mid = uid()
+    mp(u, pid, lambda pp: pp.setdefault("mrs", []).append({"id": mid, "n": r["number"], "from": a["branch"], "to": rp.work, "t": "#%d %s" % (r["number"], title),
+                                                           "title": title, "by": a["name"], "by_id": aid, "task": task, "d": now(), "status": "ouverte", "note": ""}))
+    spawn(review_mr, u, pid, mid)
+    return "submitted", "Merge request #%d soumise vers %s : l’agent principal va la valider." % (r["number"], rp.work)
+
+
+def add_mr_decision(pp, m):
+    pp.setdefault("decisions", []).append({
+        "id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": m.get("by_id", ""), "byName": "Fusion", "d": now(), "status": "attente", "task": "",
+        "question": "La merge request #%s « %s » (%s → %s) attend une validation et aucun agent ne peut la faire. La fusionner ?" % (m["n"], m.get("title", ""), m["from"], m["to"]),
+        "options": ["Oui, fusionner", "Non, la refuser"], "recommendation": "Oui, fusionner", "impact": "", "structural": False, "mr_review": m["id"]})
+
+
+def review_mr(u, pid, mid):
+    """Fait valider une merge request par l'agent principal (ou un agent habilité, sinon l'utilisateur)."""
+    if snap(u, pid).get("supervision") == "off":
+        return
+
+    def claim(pp):
+        m = by_id(pp.get("mrs", []), mid)
+        if not m or m.get("status") != "ouverte" or m.get("reviewing"):
+            return False
+        m["reviewing"] = True
+        return True
+    if not mp(u, pid, claim):
+        return
+    try:
+        p = snap(u, pid)
+        m = by_id(p["mrs"], mid)
+        rv = pick_reviewer(p, {"who": m["by_id"]})
+        if rv is None:
+            def ask_user(pp):
+                mm = by_id(pp["mrs"], mid)
+                if not mm.get("review_asked"):
+                    mm["review_asked"] = True
+                    add_mr_decision(pp, mm)
+            return mp(u, pid, ask_user)
+        cmp = github.Repo(p).compare(m["to"], m["from"])
+        commits = "\n".join("  - %s" % c["commit"]["message"].splitlines()[0] for c in cmp.get("commits", [])[-15:]) or "  (aucun)"
+        files = ", ".join(f["filename"] for f in cmp.get("files", [])[:30]) or "(aucun)"
+        task = by_id(p["tasks"], m.get("task"))
+        msg = ("[Application — validation de merge request] MR #%s « %s » de %s : branche %s vers %s.\nTâche liée : %s\nCommits :\n%s\nFichiers modifiés : %s\n"
+               "Valide cette merge request : relis les changements (read_file avec \"agent\":\"%s\"), vérifie qu’ils sont cohérents avec les spécifications et la branche de travail. "
+               "Conclus par mr_review : approved (elle sera fusionnée) ou rejected avec ce qu’il faut corriger.") % (
+            m["n"], m.get("title", ""), m["by"], m["from"], m["to"], task["title"] if task else "aucune", commits, files, m["by"])
+        ask(u, pid, rv["id"], msg, "Validation MR")
+        if by_id(snap(u, pid)["mrs"], mid)["status"] == "ouverte":
+            def nofinal(pp):
+                mm = by_id(pp["mrs"], mid)
+                mm["review_fail"] = mm.get("review_fail", 0) + 1
+                if mm["review_fail"] >= 2 and not mm.get("review_asked"):
+                    mm["review_asked"] = True
+                    add_mr_decision(pp, mm)
+            mp(u, pid, nofinal)
+    except Err as e:                                   # nouvelle tentative au prochain passage du suivi
+        def err(pp):
+            mm = by_id(pp["mrs"], mid)
+            mm["review_err"] = mm.get("review_err", 0) + 1
+            return mm["review_err"]
+        if mp(u, pid, err) == 1:
+            log(u, pid, "Système", "Vous", "Validation de la merge request impossible pour le moment : %s" % e.msg)
+    finally:
+        mp(u, pid, lambda pp: (by_id(pp.get("mrs", []), mid) or {}).pop("reviewing", None))
+
+
+def apply_mr_review(u, pid, mid, by, verdict, comment):
+    m = by_id(snap(u, pid).get("mrs", []), mid)
+    if not m or m["status"] != "ouverte":
+        return "Merge request introuvable ou déjà traitée."
+    if verdict == "approved":
+        mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(note="Validée par %s%s" % (by, (" : " + comment) if comment else "")))
+        return merge_mr(u, pid, mid)
+    mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(status="refusée", note=comment, done=now()))
+    spawn(ask, u, pid, m["by_id"], "[Validation MR par %s] Ta merge request #%s est refusée : %s\nCorrige puis soumets-la à nouveau avec merge_request." % (by, m["n"], comment), "Validation MR")
+    return "Merge request #%s refusée : %s" % (m["n"], comment)
+
+
+def merge_mr(u, pid, mid):
+    """Fusionne une merge request validée ; un conflit déclenche la règle du projet."""
+    p = snap(u, pid)
+    m = by_id(p.get("mrs", []), mid)
+    if not m or m["status"] not in ("ouverte", "conflit"):
+        return "Merge request introuvable ou déjà traitée."
+    if github.Repo(p).pr_merge_number(m["n"]) == "merged":
+        def f(pp):
+            by_id(pp["mrs"], mid).update(status="fusionnée", done=now())
+            for c in pp.get("conflicts", []):
+                if c.get("mr") == mid and c["status"] != "résolu":
+                    c["status"] = "résolu"
+            return [t["title"] for t in pp["tasks"] if t.get("deps") and t["status"] != "terminée" and not deps_unmet(pp, t)]
+        ready = mp(u, pid, f)
+        return "Merge request #%s fusionnée dans %s.%s" % (m["n"], m["to"], (" Tâches désormais débloquées : %s." % ", ".join("« %s »" % x for x in ready)) if ready else "")
+    tries = m.get("merge_tries", 0) + 1
+    mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(merge_tries=tries))
+    if tries > 3:
+        mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(status="conflit"))
+        return "Merge request #%s : toujours non fusionnable après %d essais ; intervention manuelle nécessaire (bouton « Réessayer »)." % (m["n"], tries - 1)
+    return open_conflict(u, pid, m["by_id"], "mr", mr_id=mid, task=m.get("task", ""))
+
+
+def mr_retry(u, pid, mid):
+    mp(u, pid, lambda pp: (by_id(pp.get("mrs", []), mid) or {}).pop("merge_tries", None))
+    log(u, pid, "Système", "Vous", merge_mr(u, pid, mid))
+
+
 def release(u, pid, version, notes):
+    """Release finale : fusionne la branche de travail dans la branche de base, crée le tag, termine le cycle."""
     p = snap(u, pid)
     mg = by_id(p["agents"], p.get("mainId"))
-    who, base = (mg["name"] if mg else "Système"), (p.get("repo") or {}).get("branch", "main")
+    who, cy = (mg["name"] if mg else "Système"), p.get("cycle")
+    version = version.strip() or (cy or {}).get("version", "")
     try:
         rp = github.Repo(p)
     except Err:
         mp(u, pid, lambda pp: pp["releases"].append({"v": version, "n": notes, "d": now()}))
         return log(u, pid, "Système", who, "Release %s enregistrée localement : dépôt/token non configuré, ni fusion ni tag." % version)
+    if not cy:
+        return log(u, pid, "Système", "Vous", "Aucune release en cours : démarrez-en une (« Démarrer une release ») avant de la publier.")
+    opn = [m for m in p.get("mrs", []) if m.get("status") in ("ouverte", "conflit")]
+    if opn:
+        return log(u, pid, "Système", "Vous", "Publication impossible : %d merge request(s) encore ouverte(s) (%s). Validez-les ou refusez-les d’abord." % (len(opn), ", ".join("#%s" % m["n"] for m in opn)))
     mp(u, pid, lambda pp: pp.__setitem__("releasing", True))
     out = []
     try:
-        for b in dict.fromkeys(a["branch"] for a in p["agents"] if a.get("branch") and a["branch"] != base):
-            try:
-                r = rp.pr_merge(b, "Release %s : fusion de %s" % (version, b), notes)
-                if r.get("skipped"):
-                    out.append("%s : rien à fusionner" % b)
-                else:
-                    mp(u, pid, lambda pp: pp["mrs"].append({"from": b, "to": base, "t": "#%d %s" % (r["number"], b), "d": now()}))
-                    out.append("%s : merge request #%d fusionnée" % (b, r["number"]))
-            except Err as e:
-                out.append("%s : ÉCHEC — %s" % (b, e.msg))
         try:
+            r = rp.pr_merge(cy["branch"], "Release %s" % version, notes)
+            if r.get("skipped"):
+                out.append("%s : rien à fusionner dans %s" % (cy["branch"], rp.base))
+            else:
+                mp(u, pid, lambda pp: pp["mrs"].append({"id": uid(), "n": r["number"], "from": cy["branch"], "to": rp.base, "t": "#%d release %s" % (r["number"], version),
+                                                        "title": "Release %s" % version, "by": who, "d": now(), "status": "fusionnée", "note": "Release finale"}))
+                out.append("%s fusionnée dans %s (MR #%d)" % (cy["branch"], rp.base, r["number"]))
             url = rp.release(version, "Release " + version, notes)
-            mp(u, pid, lambda pp: pp["releases"].append({"v": version, "n": notes, "d": now(), "url": url}))
-            out.append("Tag %s créé sur %s" % (version, base))
+
+            def done(pp):
+                pp["releases"].append({"v": version, "n": notes, "d": now(), "url": url})
+                pp.pop("cycle", None)
+            mp(u, pid, done)
+            out.append("Tag %s créé sur %s : la release est terminée." % (version, rp.base))
         except Err as e:
-            out.append("Tag : ÉCHEC — %s" % e.msg)
+            out.append("ÉCHEC — %s (la release reste en cours)" % e.msg)
         log(u, pid, who, "Vous", "Release %s :\n%s" % (version, "\n".join(out)))
     finally:
         mp(u, pid, lambda pp: pp.__setitem__("releasing", False))
@@ -1028,6 +1412,8 @@ def start(u, j):
             "sync": lambda: sync_all(u, pid),
             "release": lambda: release(u, pid, str(j.get("version", "")), str(j.get("notes", ""))),
             "reset_usage": lambda: reset_usage(u, pid),
+            "cycle_start": lambda: cycle_start(u, pid, str(j.get("version", ""))),
+            "mr_retry": lambda: mr_retry(u, pid, j.get("mrId")),
             "decide": lambda: decide(u, pid, j.get("decisionId"), str(j.get("decision", "")), str(j.get("note", "")), j.get("fields") or {}, str(j.get("answer", ""))),
             "instr_add": lambda: instr_add(u, pid, str(j.get("scope", "global")), str(j.get("text", ""))),
             "instr_del": lambda: mp(u, pid, lambda pp: pp.__setitem__("instructions", [i for i in pp.get("instructions", []) if i["id"] != j.get("instrId")]))}
@@ -1054,6 +1440,11 @@ def recover():
             for p in st.get("projects", []):
                 p["releasing"] = False
                 p["pending"] = []
+                for c in p.get("conflicts", []):
+                    if c.get("status") == "ouvert":
+                        c["status"] = "pause"
+                for m in p.get("mrs", []):
+                    m.pop("reviewing", None)
                 for a in p.get("agents", []):
                     a["work"] = 0
                 for t in p.get("tasks", []):

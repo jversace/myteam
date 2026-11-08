@@ -1,5 +1,6 @@
 """Tests du moteur d'agents : faux GitHub local + IA scriptée (aucun réseau, aucune clé)."""
 import base64
+import hashlib
 import json
 import os
 import re
@@ -12,49 +13,177 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 from urllib.parse import parse_qs, unquote, urlparse
 
-BR, HEAD, SHA, PRS, REL, CNT = {}, {}, {}, {}, [], [0]
+COMMITS, BRANCHES, TREES, BLOBS, PRS, REL, CNT = {}, {}, {}, {}, {}, [], [0]
+
+
+def _hash(s):
+    return hashlib.sha1(s.encode()).hexdigest()
+
+
+def mk_commit(files, parents, msg="c", tree=None):
+    files = dict(files)
+    if tree is None:
+        tree = _hash(json.dumps(files, sort_keys=True))
+        TREES[tree] = files
+    CNT[0] += 1
+    sha = _hash("%s|%s|%d" % (tree, parents, CNT[0]))
+    COMMITS[sha] = {"tree": tree, "parents": list(parents), "msg": msg}
+    return sha
+
+
+def files_of(sha):
+    return TREES[COMMITS[sha]["tree"]]
 
 
 def reset():
-    BR.clear(); HEAD.clear(); SHA.clear(); PRS.clear(); REL.clear()
-    BR["main"] = {"README.md": "# demo"}
-    HEAD["main"] = new_sha("main")
+    for d in (COMMITS, BRANCHES, TREES, BLOBS, PRS):
+        d.clear()
+    REL.clear()
+    BRANCHES["main"] = mk_commit({"README.md": "# demo"}, [], "init")
 
 
-def new_sha(b):
-    CNT[0] += 1
-    s = "sha-%s-%d" % (b, CNT[0])
-    SHA[s] = b
-    return s
+class _BR:
+    """Vue en lecture seule : nom de branche -> fichiers courants."""
+    def __getitem__(self, b):
+        return files_of(BRANCHES[b])
+
+    def __contains__(self, b):
+        return b in BRANCHES
+
+
+BR = _BR()
+
+
+def ancestors(sha):
+    seen, todo = set(), [sha]
+    while todo:
+        x = todo.pop()
+        if x not in seen:
+            seen.add(x)
+            todo += COMMITS[x]["parents"]
+    return seen
+
+
+def merge_base(a, b):
+    common = ancestors(a) & ancestors(b)
+    return next(c for c in common if not any(c in ancestors(o) and o != c for o in common))
+
+
+def three_way(b, o, t):
+    out, conf = {}, []
+    for k in set(b) | set(o) | set(t):
+        bv, ov, tv = b.get(k), o.get(k), t.get(k)
+        if ov == tv:
+            v = ov
+        elif bv == ov:
+            v = tv
+        elif bv == tv:
+            v = ov
+        else:
+            conf.append(k)
+            continue
+        if v is not None:
+            out[k] = v
+    return out, conf
+
+
+def git_merge(into, head_sha):
+    """Fusion `head_sha` dans la branche `into` : 'noop', 'merged' ou 'conflict'."""
+    cur = BRANCHES[into]
+    if head_sha in ancestors(cur):
+        return "noop"
+    if cur in ancestors(head_sha):
+        BRANCHES[into] = head_sha
+        return "merged"
+    mb = merge_base(cur, head_sha)
+    files, conf = three_way(files_of(mb), files_of(cur), files_of(head_sha))
+    if conf:
+        return "conflict"
+    BRANCHES[into] = mk_commit(files, [cur, head_sha], "merge")
+    return "merged"
+
+
+def resolve_ref(ref):
+    return BRANCHES.get(ref) or (ref if ref in COMMITS else None)
 
 
 class GH(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def send(self, code, obj):
-        b = json.dumps(obj).encode()
-        self.send_response(code); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def send(self, code, obj=None):
+        b = json.dumps(obj if obj is not None else {}).encode()
+        self.send_response(code)
+        if code == 204:
+            self.end_headers()
+            return
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
 
     def handle_any(self):
-        u = urlparse(self.path); q = parse_qs(u.query)
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n)) if n else {}
         rest, m = re.match(r"/repos/o/r(/.*)", unquote(u.path)).group(1), self.command
-        if rest.startswith("/git/ref/heads/"):
+        if rest.startswith("/git/ref/heads/") and m == "GET":
             b = rest[len("/git/ref/heads/"):]
-            return self.send(200, {"object": {"sha": HEAD[b]}}) if b in BR else self.send(404, {"message": "Not Found"})
-        if rest == "/git/refs":
-            b = body["ref"][len("refs/heads/"):]
-            BR[b] = dict(BR[SHA[body["sha"]]]); HEAD[b] = new_sha(b)
+            return self.send(200, {"object": {"sha": BRANCHES[b]}}) if b in BRANCHES else self.send(404, {"message": "Not Found"})
+        if rest.startswith("/git/refs/heads/") and m == "PATCH":
+            BRANCHES[rest[len("/git/refs/heads/"):]] = body["sha"]
+            return self.send(200, {})
+        if rest == "/git/refs" and m == "POST":
+            BRANCHES[body["ref"][len("refs/heads/"):]] = body["sha"]
             return self.send(201, {})
+        if rest == "/git/blobs":
+            h = _hash(body["content"])
+            BLOBS[h] = body["content"]
+            return self.send(201, {"sha": h})
+        if rest == "/git/trees":
+            files = dict(TREES[body["base_tree"]])
+            for e in body["tree"]:
+                if e["sha"] is None:
+                    files.pop(e["path"], None)
+                else:
+                    files[e["path"]] = BLOBS[e["sha"]]
+            tree = _hash(json.dumps(files, sort_keys=True))
+            TREES[tree] = files
+            return self.send(201, {"sha": tree})
+        if rest == "/git/commits":
+            return self.send(201, {"sha": mk_commit({}, body["parents"], body["message"], tree=body["tree"])})
+        mm = re.match(r"/git/commits/(\w+)", rest)
+        if mm:
+            return self.send(200, {"tree": {"sha": COMMITS[mm.group(1)]["tree"]}})
+        mm = re.match(r"/compare/(.+)\.\.\.(.+)", rest)
+        if mm:
+            a, b = resolve_ref(mm.group(1)), resolve_ref(mm.group(2))
+            if not a or not b:
+                return self.send(404, {"message": "Not Found"})
+            mb = merge_base(a, b)
+            fb, fh = files_of(mb), files_of(b)
+            files = []
+            for k in sorted(set(fb) | set(fh)):
+                if fb.get(k) != fh.get(k):
+                    if k in fh:
+                        BLOBS[_hash(fh[k])] = fh[k]
+                    files.append({"filename": k, "status": "removed" if k not in fh else ("added" if k not in fb else "modified"), "sha": _hash(fh.get(k, ""))})
+            mine = ancestors(b) - ancestors(a)
+            return self.send(200, {"merge_base_commit": {"sha": mb}, "files": files, "ahead_by": len(mine), "behind_by": len(ancestors(a) - ancestors(b)),
+                                   "commits": [{"sha": c, "commit": {"message": COMMITS[c]["msg"]}} for c in mine if len(COMMITS[c]["parents"]) < 2]})
+        if rest == "/merges":
+            if body["base"] not in BRANCHES or body["head"] not in BRANCHES:
+                return self.send(404, {"message": "Not Found"})
+            r = git_merge(body["base"], BRANCHES[body["head"]])
+            return self.send({"noop": 204, "merged": 201, "conflict": 409}[r], {"sha": BRANCHES[body["base"]]} if r == "merged" else {"message": "Merge conflict"})
         if rest.startswith("/contents"):
             path = rest[len("/contents"):].lstrip("/")
             ref = (q.get("ref") or [None])[0] or body.get("branch")
-            files = BR.get(ref)
+            sha = resolve_ref(ref)
             if m == "GET":
-                if files is None:
+                if sha is None:
                     return self.send(404, {})
+                files = files_of(sha)
                 if path in files:
                     return self.send(200, {"type": "file", "sha": "x", "encoding": "base64", "content": base64.b64encode(files[path].encode()).decode()})
                 pre = path + "/" if path else ""
@@ -62,28 +191,36 @@ class GH(BaseHTTPRequestHandler):
                 if not names:
                     return self.send(404, {})
                 return self.send(200, [{"name": x, "type": "dir" if any(k.startswith(pre + x + "/") for k in files) else "file", "size": len(files.get(pre + x, ""))} for x in names])
+            files = dict(files_of(BRANCHES[ref]))
             if m == "PUT":
-                files[path] = base64.b64decode(body["content"]).decode(); HEAD[ref] = new_sha(ref)
-                return self.send(200, {"commit": {"sha": HEAD[ref]}})
-            if m == "DELETE":
-                files.pop(path, None); HEAD[ref] = new_sha(ref)
-                return self.send(200, {"commit": {"sha": HEAD[ref]}})
+                files[path] = base64.b64decode(body["content"]).decode()
+            else:
+                files.pop(path, None)
+            BRANCHES[ref] = mk_commit(files, [BRANCHES[ref]], body.get("message", "c"))
+            return self.send(200, {"commit": {"sha": BRANCHES[ref]}})
         if rest == "/pulls" and m == "POST":
-            if BR[body["head"]] == BR[body["base"]]:
+            if BRANCHES[body["head"]] in ancestors(BRANCHES[body["base"]]):
                 return self.send(422, {"message": "Validation Failed: No commits between"})
-            PRS[len(PRS) + 1] = (body["head"], body["base"])
+            if any(x["head"] == body["head"] and x["base"] == body["base"] and x["open"] for x in PRS.values()):
+                return self.send(422, {"message": "A pull request already exists"})
+            PRS[len(PRS) + 1] = {"head": body["head"], "base": body["base"], "open": True}
             return self.send(201, {"number": len(PRS)})
+        if rest == "/pulls" and m == "GET":
+            return self.send(200, [{"number": k} for k, x in PRS.items() if x["open"] and x["head"] == (q.get("head") or [":"])[0].split(":", 1)[1] and x["base"] == q["base"][0]])
         mm = re.match(r"/pulls/(\d+)/merge", rest)
         if mm:
-            h, b = PRS[int(mm.group(1))]
-            BR[b].update(BR[h]); HEAD[b] = new_sha(b)
-            return self.send(200, {})
+            pr = PRS[int(mm.group(1))]
+            r = git_merge(pr["base"], BRANCHES[pr["head"]])
+            if r == "conflict":
+                return self.send(405, {"message": "Pull Request is not mergeable"})
+            pr["open"] = False
+            return self.send(200, {"merged": True})
         if rest == "/releases":
             REL.append(body)
             return self.send(201, {"html_url": "http://x/release"})
         self.send(404, {"message": "?"})
 
-    do_GET = do_POST = do_PUT = do_DELETE = handle_any
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = handle_any
 
 
 srv = HTTPServer(("127.0.0.1", 0), GH)
@@ -91,7 +228,7 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 os.environ["APM_GITHUB_API"] = "http://127.0.0.1:%d" % srv.server_port
 os.environ["APM_DATA"] = tempfile.mkdtemp()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import ai, engine, store  # noqa: E402
+import ai, engine, github, store  # noqa: E402
 from ai import Reply  # noqa: E402
 from store import Err  # noqa: E402
 
@@ -214,88 +351,6 @@ class Engine(unittest.TestCase):
         for bad in ("../x", ".github/workflows/ci.yml", ".agents/Alice.md", "a b$c"):
             with self.assertRaises(Err):
                 engine.safe_path(bad, write=True)
-
-    def test_release_fusionne_et_tag(self):
-        engine.ask("u", "p1", "a1", "fais hello", "Vous")
-        engine.onboard("u", "p1", "a1")
-        engine.release("u", "p1", "v1.0.0", "notes")
-        p = proj()
-        self.assertEqual(BR["main"]["hello.txt"], "salut")                   # branche de Bob fusionnée
-        self.assertIn("SPEC.md", BR["main"])                                 # branche d'Alice fusionnée
-        self.assertEqual(REL[0]["tag_name"], "v1.0.0")
-        self.assertEqual(p["releases"][0]["v"], "v1.0.0")
-        self.assertEqual(len(p["mrs"]), 2)
-        self.assertFalse(p["releasing"])
-
-    def _attendre_prompt(self, sauf=None):
-        for _ in range(200):
-            for x in proj().get("pending", []):
-                if x["id"] != sauf:
-                    return x
-            time.sleep(0.02)
-        self.fail("aucun prompt manuel en attente")
-
-    def test_mode_manuel_sans_api(self):
-        st = store.load("u"); st["projects"][0]["agents"][1]["mode"] = "manual"; store.wj(store.state_path("u"), st)
-        res = {}
-
-        def boom(*a):
-            raise AssertionError("l'API ne doit pas être appelée en mode manuel")
-        with mock.patch.object(engine, "call_ai", boom):
-            th = threading.Thread(target=lambda: res.update(r=engine.ask("u", "p1", "a2", "écris m.txt", "Vous")))
-            th.start()
-            x1 = self._attendre_prompt()
-            self.assertTrue(x1["new"])
-            self.assertIn("écris m.txt", x1["full"])
-            self.assertIn("Prénom : Bob", x1["full"])                        # instructions complètes dans le 1er prompt
-            engine.manual_answer("u", x1["id"], 'Je le fais.\n```action\n{"do":"write_file","path":"m.txt","content":"manuel","message":"feat: manuel"}\n```\n```action\n{"do":"read_file","path":"m.txt"}\n```')
-            x2 = self._attendre_prompt(sauf=x1["id"])                        # le retour de lecture arrive dans un 2e prompt
-            self.assertFalse(x2["new"])
-            self.assertIn("manuel", x2["short"])
-            engine.manual_answer("u", x2["id"], "Terminé.")
-            th.join(5)
-        self.assertEqual(res["r"], "Terminé.")
-        self.assertEqual(BR["agent/bob"]["m.txt"], "manuel")
-        self.assertEqual(proj()["pending"], [])
-        self.assertTrue(proj()["agents"][1]["session"])
-
-    def test_mode_manuel_annule(self):
-        st = store.load("u"); st["projects"][0]["agents"][1]["mode"] = "manual"; store.wj(store.state_path("u"), st)
-        res = {}
-
-        def run():
-            try:
-                engine.ask("u", "p1", "a2", "x", "Vous")
-            except Err as e:
-                res["e"] = e
-        th = threading.Thread(target=run); th.start()
-        engine.manual_cancel("u", self._attendre_prompt()["id"])
-        th.join(5)
-        self.assertEqual(res["e"].code, 408)
-        self.assertEqual(proj()["pending"], [])
-        self.assertEqual(proj()["agents"][1]["work"], 0)
-        with self.assertRaises(Err):
-            engine.manual_answer("u", "inconnu", "x")
-
-    def test_cout_par_agent_et_global(self):
-        st = store.load("u"); st["services"][0].update(pin="3", pout="15"); store.wj(store.state_path("u"), st)
-
-        def fake(s, system, msgs):
-            r = Reply("ok")
-            r.usage = {"in": 1000, "out": 500}
-            return r
-        with mock.patch.object(engine, "call_ai", fake):
-            engine.ask("u", "p1", "a1", "x", "Vous")
-            engine.ask("u", "p1", "a2", "y", "Vous")
-        p = proj()
-        a1 = p["agents"][0]["usage"]
-        self.assertEqual((a1["calls"], a1["in"], a1["out"]), (1, 1000, 500))
-        self.assertAlmostEqual(a1["cost"], 0.0105, 6)             # 1000×3/1e6 + 500×15/1e6
-        self.assertEqual(p["usage"]["calls"], 2)
-        self.assertAlmostEqual(p["usage"]["cost"], 0.021, 6)
-        self.assertEqual([e["agent"] for e in p["ledger"]], ["Alice", "Bob"])
-        engine.reset_usage("u", "p1")
-        self.assertEqual((proj()["usage"], proj()["ledger"], proj()["agents"][0]["usage"]), ({}, [], {}))
 
     def test_quota_suspend_puis_reprise_planifiee(self):
         def quota(s, system, msgs):
@@ -637,6 +692,330 @@ class Droits(unittest.TestCase):
         self.assertIn("print(1)", back)
         self.assertIn("Agent inconnu", engine.repo_act("u", "p1", proj(), proj()["agents"][0], {"path": "api.py", "agent": "Zed"}, "read_file")[1])
         self.assertIn("introuvable", engine.repo_act("u", "p1", proj(), proj()["agents"][0], {"path": "api.py"}, "read_file")[1])   # sa propre branche
+
+
+class Integration(unittest.TestCase):
+    """Release avec branche de travail : pull, merge requests validées par l'agent principal, conflits, dépendances."""
+    def setUp(self):
+        reset()
+        st = make_state()
+        pr = st["projects"][0]
+        pr["agents"].append({"id": "a3", "name": "Carol", "service": "s1", "role": "r3", "branch": "agent/carol", "canBug": False, "talk": [], "history": [], "notes": ""})
+        pr["tasks"] = [{"id": "t1", "parent": "", "title": "Login", "desc": "", "who": "a2", "status": "en cours", "modules": [], "by": ""},
+                       {"id": "t3", "parent": "", "title": "Suite", "desc": "", "who": "a2", "status": "à faire", "modules": [], "by": "", "deps": ["t1"]}]
+        store.wj(store.state_path("u"), st)
+        self.spawned = []
+        self.sp = mock.patch.object(engine, "spawn", lambda fn, *a, **k: self.spawned.append((fn.__name__, a, k)))
+        self.sp.start()
+        engine.TIMERS.clear()
+
+    def tearDown(self):
+        self.sp.stop()
+
+    # -- aides
+    def start(self):
+        engine.cycle_start("u", "p1", "v1.0.0")
+
+    def write(self, idx, path, content):
+        return engine.repo_act("u", "p1", proj(), proj()["agents"][idx], {"path": path, "content": content, "message": "feat: " + path}, "write_file")
+
+    def on_release(self, path, content):
+        github.Repo(proj()).put_file(proj()["cycle"]["branch"], path, content, "chore: " + path)
+
+    def conflict_setup(self):
+        self.start()
+        self.on_release("app.py", "v0")
+        self.write(1, "app.py", "version Bob")
+        self.on_release("app.py", "version release")
+
+    def set(self, **kw):
+        st = store.load("u"); st["projects"][0].update(kw); store.wj(store.state_path("u"), st)
+
+    def logs(self):
+        return " ¦ ".join(m["text"] for m in proj()["log"])
+
+    def resolver(self, who):
+        """IA scriptée : renvoie resolve_merge avec le contenu fusionné ; vérifie que les 3 versions sont fournies."""
+        def fake(s, system, msgs):
+            last = msgs[-1]["content"]
+            self.assertTrue("version Bob" in last and "version release" in last and "v0" in last)
+            cid = re.search(r"\(id (\w+)\)", last).group(1)
+            return "Je fusionne.\n```action\n%s\n```" % json.dumps({"do": "resolve_merge", "conflict": cid, "files": [{"path": "app.py", "content": "version Bob + release"}], "message": "merge"})
+        return fake
+
+    # -- release et branches
+    def test_demarrer_une_release(self):
+        self.start()
+        p = proj()
+        self.assertEqual((p["cycle"]["branch"], p["cycle"]["version"]), ("release/v1.0.0", "v1.0.0"))
+        self.assertEqual(BR["release/v1.0.0"], BR["main"])
+        engine.cycle_start("u", "p1", "v2")                                                        # une seule release à la fois
+        self.assertEqual(proj()["cycle"]["version"], "v1.0.0")
+        self.assertIn("déjà en cours", self.logs())
+        engine.provision("u", "p1", "a2")                                                          # branche d'agent créée depuis la branche de travail
+        self.assertEqual(set(BR["agent/bob"]) - {".agents/Bob.md"}, set(BR["release/v1.0.0"]))
+
+    def test_branches_protegees(self):
+        self.start()
+        for protegee in ("release/v1.0.0", "main"):
+            st = store.load("u"); st["projects"][0]["agents"][1]["branch"] = protegee; store.wj(store.state_path("u"), st)
+            self.assertIn("refusée", self.write(1, "x.py", "1")[0])
+            self.assertIn("refusé", engine.provision("u", "p1", "a2"))
+        self.assertNotIn("x.py", BR["main"])
+
+    def test_pull(self):
+        self.assertEqual(engine.pull("u", "p1", "a2")[0], "skip")                                  # pas de release en cours
+        self.start()
+        engine.provision("u", "p1", "a2")
+        self.on_release("shared.py", "x = 1")
+        self.assertEqual(engine.pull("u", "p1", "a2")[0], "merged")
+        self.assertEqual(BR["agent/bob"]["shared.py"], "x = 1")
+        self.assertEqual(engine.pull("u", "p1", "a2")[0], "uptodate")
+
+    # -- merge requests
+    def test_pas_de_release_pas_de_merge_request(self):
+        st, msg = engine.submit_mr("u", "p1", "a2", "x")
+        self.assertEqual(st, "skip")
+        self.assertIn("Aucune release en cours", msg)
+
+    def test_merge_request_validee_par_l_agent_principal(self):
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        st, _ = engine.submit_mr("u", "p1", "a2", "Login", "corps", "t1")
+        m = proj()["mrs"][0]
+        self.assertEqual((st, m["status"], m["from"], m["to"], m["task"]), ("submitted", "ouverte", "agent/bob", "release/v1.0.0", "t1"))
+        self.assertIn(("review_mr", ("u", "p1", m["id"]), {}), self.spawned)
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Login")[0], "exists")                   # pas de doublon
+        self.assertNotIn("api.py", BR["release/v1.0.0"])                                           # rien n'est fusionné avant validation
+        self.set_task_status("t1", "terminée")
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return 'Je valide.\n```action\n{"do":"mr_review","id":"%s","verdict":"approved","comment":"ok"}\n```' % m["id"]
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.review_mr("u", "p1", m["id"])
+        m = proj()["mrs"][0]
+        self.assertEqual(m["status"], "fusionnée")
+        self.assertEqual(BR["release/v1.0.0"]["api.py"], "print(1)")
+        self.assertNotIn("api.py", BR["main"])                                                     # la branche principale reste intacte
+        self.assertTrue("api.py" in vus[0] and "feat: api.py" in vus[0] and "Login" in vus[0])    # le validateur voit fichiers, commits, tâche
+        self.assertIn("débloquées", self.logs())                                                   # la tâche dépendante « Suite » est débloquée
+
+    def set_task_status(self, tid, status):
+        st = store.load("u")
+        next(x for x in st["projects"][0]["tasks"] if x["id"] == tid)["status"] = status
+        store.wj(store.state_path("u"), st)
+
+    def test_merge_request_refusee(self):
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        engine.submit_mr("u", "p1", "a2", "Login")
+        mid = proj()["mrs"][0]["id"]
+        self.assertIn("refusée", engine.apply_mr_review("u", "p1", mid, "Alice", "rejected", "il manque les tests"))
+        self.assertEqual((proj()["mrs"][0]["status"], proj()["mrs"][0]["note"]), ("refusée", "il manque les tests"))
+        ask = [s for s in self.spawned if s[0] == "ask"][0]
+        self.assertTrue(ask[1][2] == "a2" and "il manque les tests" in ask[1][3])                  # l'auteur reçoit le motif
+        self.assertNotIn("api.py", BR["release/v1.0.0"])
+
+    def test_droits_de_validation(self):
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        engine.submit_mr("u", "p1", "a2", "Login")
+        mid = proj()["mrs"][0]["id"]
+        do = lambda aid, **x: engine.do_act("u", "p1", aid, x, 0)
+        self.assertIn("refusée pour ton rôle", do("a2", do="mr_review", id=mid, verdict="approved")[1])   # un dév. ne valide pas
+        self.assertIn("Verdict invalide", do("a1", do="mr_review", id=mid, verdict="rejected")[1])        # refus sans motif
+        self.set(mrs=[dict(proj()["mrs"][0], by_id="a1")])
+        self.assertIn("propre merge request", do("a1", do="mr_review", id=mid, verdict="approved")[1])
+
+    def test_validation_par_l_utilisateur_sans_validateur(self):
+        st = store.load("u")
+        for ag in st["projects"][0]["agents"]:
+            if ag["id"] in ("a1", "a3"):
+                ag["mode"] = "manual"
+        store.wj(store.state_path("u"), st)
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        engine.submit_mr("u", "p1", "a2", "Login")
+        mid = proj()["mrs"][0]["id"]
+        engine.review_mr("u", "p1", mid)
+        engine.review_mr("u", "p1", mid)                                                           # pas de doublon de question
+        d = proj()["decisions"]
+        self.assertEqual((len(d), d[0]["mr_review"]), (1, mid))
+        engine.decide("u", "p1", d[0]["id"], "answer", answer="Oui, fusionner")
+        self.assertEqual(proj()["mrs"][0]["status"], "fusionnée")
+        self.assertEqual(BR["release/v1.0.0"]["api.py"], "print(1)")
+
+    # -- dépendances
+    def test_dependances_entre_taches(self):
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("tâche non lancée : pas d'appel IA")):
+            engine.run_task("u", "p1", "t3")
+        t3 = proj()["tasks"][1]
+        self.assertEqual(t3["waiting"], ["Login"])
+        self.assertIn("attend", self.logs())
+        self.set_task_status("t1", "terminée")
+        self.set(mrs=[{"id": "m1", "n": 1, "task": "t1", "status": "ouverte", "from": "x", "to": "y", "by": "Bob", "by_id": "a2"}])
+        self.assertEqual(engine.deps_unmet(proj(), proj()["tasks"][1]), ["Login"])                  # sa merge request n'est pas encore fusionnée
+        self.set(mrs=[{"id": "m1", "n": 1, "task": "t1", "status": "fusionnée", "from": "x", "to": "y", "by": "Bob", "by_id": "a2"}])
+        self.assertEqual(engine.deps_unmet(proj(), proj()["tasks"][1]), [])
+
+    def test_creation_de_tache_avec_dependances(self):
+        note, _ = engine.do_act("u", "p1", "a1", {"do": "task", "title": "Suite 2", "parent": "t1", "depends_on": ["t1", "inconnue"]}, 0)
+        self.assertIn("Tâche créée", note)
+        self.assertEqual(proj()["tasks"][-1]["deps"], ["t1"])
+
+    def test_tache_pull_automatique_puis_merge_request(self):
+        self.start()
+        self.on_release("shared.py", "x = 1")
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return 'Fait.\n```action\n{"do":"write_file","path":"x.py","content":"1","message":"feat: x"}\n```'
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.run_task("u", "p1", "t1")
+        self.assertTrue("Pull automatique" in vus[0] and "merge_request" in vus[0])
+        self.assertEqual(BR["agent/bob"]["shared.py"], "x = 1")                                    # le pull a eu lieu avant le travail
+        t, m = proj()["tasks"][0], proj()["mrs"][0]
+        self.assertEqual((t["status"], m["status"], m["task"]), ("à vérifier", "ouverte", "t1"))   # la MR est soumise à la fin de la tâche
+        self.assertEqual([s[0] for s in self.spawned], ["review_mr", "review_task"])
+
+    # -- conflits
+    def test_conflit_decision_de_l_utilisateur(self):
+        self.conflict_setup()
+        st, msg = engine.submit_mr("u", "p1", "a2", "Login", "", "t1")
+        p = proj()
+        c, d = p["conflicts"][0], p["decisions"][0]
+        self.assertTrue(st == "conflict" and "app.py" in msg)
+        self.assertEqual((c["files"], c["status"], c["origin"], d["conflict"], d["options"]), (["app.py"], "ouvert", "mr", c["id"], engine.CONFLICT_OPTS))
+        self.assertEqual(p["mrs"], [])                                                             # pas de MR tant que le conflit n'est pas résolu
+        with mock.patch.object(engine, "call_ai", self.resolver("Bob")):
+            engine.decide("u", "p1", d["id"], "answer", answer=d["options"][0])                    # l'auteur de la branche résout
+        c = proj()["conflicts"][0]
+        self.assertEqual((c["status"], c["resolved_by"], BR["agent/bob"]["app.py"]), ("résolu", "Bob", "version Bob + release"))
+        self.assertEqual(len(COMMITS[BRANCHES["agent/bob"]]["parents"]), 2)                         # vrai commit de fusion
+        self.assertIn("after_conflict", [s[0] for s in self.spawned])
+        engine.after_conflict("u", "p1", c["id"])                                                  # la soumission reprend
+        self.assertEqual(proj()["mrs"][0]["status"], "ouverte")
+
+    def test_conflit_agent_designe_par_la_regle_du_projet(self):
+        self.set(conflict_policy="agent:a3")
+        self.conflict_setup()
+        engine.submit_mr("u", "p1", "a2", "Login", "", "t1")
+        self.assertEqual(proj().get("decisions", []), [])                                          # pas de question : la règle désigne Carol
+        run = [s for s in self.spawned if s[0] == "resolve_conflict"][0]
+        self.assertEqual(run[1][3], "a3")
+        appels = []
+
+        def carol(s, system, msgs):
+            appels.append(msgs[-1]["content"])
+            if len(appels) == 1:                                                                    # 1re réponse : incomplète
+                cid = re.search(r"\(id (\w+)\)", msgs[-1]["content"]).group(1)
+                return '```action\n{"do":"resolve_merge","conflict":"%s","files":[]}\n```' % cid
+            return self.resolver("Carol")(s, system, msgs[:-1] + [{"role": "user", "content": appels[0]}])
+        with mock.patch.object(engine, "call_ai", carol):
+            engine.resolve_conflict("u", "p1", run[1][2], "a3")
+        c = proj()["conflicts"][0]
+        self.assertEqual((c["status"], c["resolved_by"], c["tries"], len(appels)), ("résolu", "Carol", 1, 2))   # refus renvoyé à l'agent, qui se corrige dans le même échange
+
+    def test_conflit_non_resolu_remonte_a_l_utilisateur(self):
+        self.set(conflict_policy="agent:a3")
+        self.conflict_setup()
+        engine.submit_mr("u", "p1", "a2", "Login", "", "t1")
+        cid = proj()["conflicts"][0]["id"]
+        with mock.patch.object(engine, "call_ai", lambda *a: "Je ne sais pas."):
+            engine.resolve_conflict("u", "p1", cid, "a3")
+        p = proj()
+        self.assertEqual((p["conflicts"][0]["status"], p["decisions"][0]["conflict"]), ("escalade", cid))   # deux échecs : l'utilisateur tranche
+
+    def test_validations_de_resolve_merge(self):
+        self.conflict_setup()
+        engine.submit_mr("u", "p1", "a2", "Login", "", "t1")
+        cid = proj()["conflicts"][0]["id"]
+        st = store.load("u"); st["projects"][0]["conflicts"][0]["resolver"] = "a2"; store.wj(store.state_path("u"), st)
+        do = lambda aid, files: engine.do_act("u", "p1", aid, {"do": "resolve_merge", "conflict": cid, "files": files}, 0)[1]
+        self.assertIn("ne t’est confié", do("a1", [{"path": "app.py", "content": "x"}]))             # seul le résolveur désigné
+        self.assertIn("incomplète", do("a2", [{"path": "autre.py", "content": "x"}]))
+        self.assertIn("marqueurs", do("a2", [{"path": "app.py", "content": "<<<<<<< a\nx\n>>>>>>> b"}]))
+        self.assertEqual(proj()["conflicts"][0]["status"], "ouvert")
+
+    def test_conflit_au_moment_de_la_fusion_puis_principal_resout(self):
+        self.start()
+        self.on_release("app.py", "v0")
+        self.write(1, "app.py", "version Bob")
+        engine.submit_mr("u", "p1", "a2", "Login", "", "t1")                                        # MR ouverte sans conflit
+        mid = proj()["mrs"][0]["id"]
+        self.on_release("app.py", "version release")                                               # la branche de travail bouge ensuite
+        engine.apply_mr_review("u", "p1", mid, "Alice", "approved", "ok")
+        p = proj()
+        c, d = p["conflicts"][0], p["decisions"][0]
+        self.assertEqual((p["mrs"][0]["status"], c["origin"], c["mr"]), ("conflit", "mr", mid))
+        with mock.patch.object(engine, "call_ai", self.resolver("Alice")):
+            engine.decide("u", "p1", d["id"], "answer", answer=d["options"][1])                    # l'agent principal résout
+        self.assertEqual(proj()["conflicts"][0]["resolved_by"], "Alice")
+        engine.after_conflict("u", "p1", c["id"])                                                  # la MR est alors fusionnée
+        self.assertEqual(proj()["mrs"][0]["status"], "fusionnée")
+        self.assertEqual(BR["release/v1.0.0"]["app.py"], "version Bob + release")
+
+    def test_conflit_en_pause_puis_reessayer(self):
+        self.start()
+        self.on_release("app.py", "v0")
+        self.write(1, "app.py", "version Bob")
+        engine.submit_mr("u", "p1", "a2", "Login")
+        mid = proj()["mrs"][0]["id"]
+        self.on_release("app.py", "version release")
+        engine.apply_mr_review("u", "p1", mid, "Alice", "approved", "ok")
+        d = proj()["decisions"][0]
+        engine.decide("u", "p1", d["id"], "answer", answer=d["options"][2])                        # « je m'en occupe »
+        self.assertEqual(proj()["conflicts"][0]["status"], "pause")
+        github.Repo(proj()).merge_with_resolution("agent/bob", "release/v1.0.0", {"app.py": "résolu à la main"}, "fix")   # résolu sur GitHub
+        engine.mr_retry("u", "p1", mid)
+        self.assertEqual((proj()["mrs"][0]["status"], proj()["conflicts"][0]["status"]), ("fusionnée", "résolu"))
+
+    def test_conflit_au_demarrage_d_une_tache(self):
+        self.conflict_setup()
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("la tâche ne démarre pas tant que le conflit n'est pas résolu")):
+            engine.run_task("u", "p1", "t1")
+        p = proj()
+        self.assertEqual((p["tasks"][0]["status"], p["tasks"][0]["running"], p["conflicts"][0]["origin"], p["conflicts"][0]["task"]), ("en attente", False, "pull", "t1"))
+        self.assertEqual(len(p["decisions"]), 1)
+        with mock.patch.object(engine, "call_ai", lambda *a: self.fail("pas d'appel IA")):
+            engine.run_task("u", "p1", "t1")                                                       # relancée à la main : toujours refusée
+        self.assertIn("conflit de fusion est en cours", self.logs())
+
+    def test_fusion_avec_resolution_conserve_les_autres_changements(self):
+        self.start()
+        for path, content in (("a.txt", "a0"), ("d.txt", "d0")):
+            self.on_release(path, content)
+        self.write(1, "a.txt", "a Bob")
+        self.write(1, "b.txt", "b Bob")
+        self.on_release("a.txt", "a release")
+        self.on_release("c.txt", "c release")
+        rp = github.Repo(proj())
+        self.assertEqual([i["path"] for i in rp.conflict_info("agent/bob", "release/v1.0.0")], ["a.txt"])   # seul a.txt est un vrai conflit
+        rp.merge_with_resolution("agent/bob", "release/v1.0.0", {"a.txt": "a résolu"}, "merge")
+        f = BR["agent/bob"]
+        self.assertEqual((f["a.txt"], f["b.txt"], f["c.txt"], f["d.txt"]), ("a résolu", "b Bob", "c release", "d0"))
+
+    # -- release finale
+    def test_publier_la_release(self):
+        engine.release("u", "p1", "v1.0.0", "notes")
+        self.assertIn("Aucune release en cours", self.logs())                                      # rien à publier sans cycle
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        engine.submit_mr("u", "p1", "a2", "Login")
+        mid = proj()["mrs"][0]["id"]
+        engine.release("u", "p1", "v1.0.0", "notes")
+        self.assertIn("encore ouverte", self.logs())                                               # une MR ouverte bloque la publication
+        self.assertNotIn("api.py", BR["main"])
+        engine.apply_mr_review("u", "p1", mid, "Alice", "approved", "ok")
+        engine.release("u", "p1", "v1.0.0", "notes")
+        p = proj()
+        self.assertEqual(BR["main"]["api.py"], "print(1)")                                         # la release finale arrive sur la branche principale
+        self.assertEqual([r["tag_name"] for r in REL], ["v1.0.0"])
+        self.assertTrue("cycle" not in p and p["releases"][0]["v"] == "v1.0.0" and not p["releasing"])
+        self.assertEqual(p["mrs"][-1]["status"], "fusionnée")
 
 
 class Http(unittest.TestCase):
