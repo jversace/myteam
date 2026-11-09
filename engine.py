@@ -19,10 +19,16 @@ from store import DATA, Err, load, mutate
 MAX_STEPS, MAX_DEPTH, MAX_CREATE = 6, 3, 8   # tours par échange, profondeur des messages, créations par échange
 MAX_TEMP = 6                          # tentatives automatiques après erreur temporaire avant de remonter le problème
 BACKOFF = [0, 300, 900, 1800, 3600]   # délais minimaux entre relances (s) ; ensuite : toutes les heures
-STALL_SECONDS, SUP_COOLDOWN = 1800, 3600
+STALL_SECONDS, SUP_COOLDOWN, STALE_RUNNING = 600, 600, 900   # inactivité, délai entre deux interventions, exécution « fantôme »
 MAX_REVIEWS, MAX_RELAUNCH = 3, 3      # refus de vérification, relances par l'agent principal
-SUP_INTERVAL = int(os.environ.get("APM_SUPERVISE_SECONDS", "300"))   # 0 = suivi périodique désactivé
+SUP_INTERVAL = int(os.environ.get("APM_SUPERVISE_SECONDS", "60"))   # 0 = suivi périodique désactivé
 TIMERS = set()                        # reprises planifiées : (utilisateur, projet, tâche)
+TICKING = set()                       # passages du suivi en cours : (utilisateur, projet)
+MAX_OTHER = 2                         # nouvelles tentatives automatiques après une erreur inattendue du service
+MAX_ROUNDS, MAX_ROUND_STEPS, MAX_AUTO = 6, 8, 8   # tours par tâche, étapes par tour, lancements automatiques par tâche
+NUDGE = ("Tu n’as pas déclaré la tâche terminée. Si le travail demandé est réellement fait, conclus avec task_status « à vérifier » et un compte rendu précis. "
+         "Sinon poursuis-le maintenant avec les actions ; si tu es bloqué, écris à l’agent concerné (message) ou pose la question à l’utilisateur (ask_user). "
+         "Ne t’arrête pas sur une erreur : analyse-la, corrige et continue.")
 CONFLICT_OPTS = ["L’auteur de la branche résout", "L’agent principal résout", "Je m’en occupe (mettre en pause)"]
 MANUAL_TIMEOUT = 24 * 3600   # attente maximale d'une réponse manuelle
 WAIT = {}                    # échanges manuels en attente : id -> {u, ev, text}
@@ -38,6 +44,8 @@ RULES = [
     "Pour connaître l’avancement d’un autre agent, utilise d’abord get_progress (sans coût) ; n’interroge l’agent par message que pour obtenir une précision.",
     "Une tâche ou un bug peut être rattaché à un ou plusieurs modules, sans obligation (ex. le cahier des charges est global). Un bug se corrige par des sous-tâches de correction (bug_fix) ; quand elles sont terminées, il passe à « corrigé » et le QA le vérifie.",
     "Chaque release a une branche de travail (release/<version>) ; la branche principale est réservée à la release finale. Tu te synchronises avec la branche de travail par pull (fait automatiquement au démarrage d’une tâche et avant une merge request) ; quand ton travail est prêt, tu soumets une merge request (merge_request) vers cette branche ; l’agent principal la valide. Une tâche qui dépend d’une autre ne démarre que lorsque celle-ci est terminée et sa merge request fusionnée. En cas de conflit de fusion, la règle du projet décide qui le résout (l’utilisateur, l’auteur de la branche ou un agent désigné) ; si le conflit t’est confié, résous-le avec resolve_merge.",
+    "Prends l’initiative de la coordination : avant de coder ce qui dépend du travail d’un autre agent ou qui l’impacte (interface, contrat d’API, schéma de données, convention), écris-lui avec message pour convenir de l’approche ; préviens-le quand tu modifies ce qu’il utilise ; réponds toujours aux messages que tu reçois. « Travail des autres agents » et get_progress te disent qui fait quoi.",
+    "Ne t’arrête pas à la première erreur : analyse-la, corrige et continue (relis le fichier, change d’approche). Si tu es réellement bloqué, écris à l’agent qui peut t’aider ou pose la question avec ask_user ; ne laisse jamais une tâche en suspens sans le dire.",
     "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
@@ -114,7 +122,8 @@ def record_commit(u, pid, by, msg, sha):
 
 def ctx_text(p, a):
     r, mn = role(p, a), is_main(p, a)
-    talk = "tous" if mn else (", ".join(g["name"] for g in p["agents"] if g["id"] in a.get("talk", [])) or "aucun")
+    tk = a.get("talk") or []
+    talk = "tous" if (mn or not tk) else ("aucun" if "none" in tk else ", ".join(g["name"] for g in p["agents"] if g["id"] in tk))
     return "\n".join([
         "# Contexte de l’agent %s — projet %s" % (a["name"], p["name"]), "",
         "> Ce fichier fait foi : respecte-le rigoureusement et mets-le à jour (action « context »).", "",
@@ -124,6 +133,21 @@ def ctx_text(p, a):
         "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
         "\n## Droits\n%s\n- Agents joignables : %s" % (rights.rights_text(p, a, mn), talk),
         "\n## " + ACTIONS, "\n## Notes de l’agent (à tenir à jour)\n" + (a.get("notes") or "(vides)")])
+
+
+def can_talk(a, t, mn):
+    """Un agent peut écrire à tous les autres, sauf restriction explicite (liste d'agents, ou « none » = personne)."""
+    tk = a.get("talk") or []
+    return bool(mn or ("none" not in tk and (not tk or t["id"] in tk)))
+
+
+def teamwork_text(p, a):
+    oth = [t for t in p.get("tasks", []) if t.get("who") and t["who"] != a["id"] and t["status"] != "terminée" and not t.get("system")][:40]
+    if not oth:
+        return ""
+    who = lambda t: (by_id(p["agents"], t["who"]) or {}).get("name", "?")
+    dep = lambda t: (" — dépend de : " + ", ".join((by_id(p["tasks"], i) or {}).get("title", "?") for i in t["deps"])) if t.get("deps") else ""
+    return "# Travail des autres agents (pour te coordonner)\n" + "\n".join("- %s : « %s » (%s)%s" % (who(t), t["title"], t["status"], dep(t)) for t in oth)
 
 
 def repo_text(p, a):
@@ -138,7 +162,7 @@ def repo_text(p, a):
 def sys_prompt(p, a):
     mn, r = is_main(p, a), role(p, a)
     others = [x for x in p["agents"] if x["id"] != a["id"]]
-    can = lambda x: mn or x["id"] in a.get("talk", [])
+    can = lambda x: can_talk(a, x, mn)
     who = lambda t: (by_id(p["agents"], t.get("who")) or {}).get("name", "—")
     tasks = [t for t in p.get("tasks", []) if mn or t.get("who") == a["id"] or t.get("by") == a["name"]][:80]
     ts = "\n".join("%s | %s | %s | %s | parent : %s%s" % (t["id"], t["title"], t["status"], who(t), t.get("parent") or "—",
@@ -161,6 +185,7 @@ def sys_prompt(p, a):
         "# Tes droits\n" + rights.rights_text(p, a, mn),
         "# Dépôt et intégration\n" + repo_text(p, a),
         "# Équipe\n" + ("\n".join("- %s (%s%s, branche %s)%s" % (x["name"], role(p, x)["name"], ", agent principal" if is_main(p, x) else "", x["branch"], "" if can(x) else " [non joignable]") for x in others) or "(seul)"),
+        teamwork_text(p, a),
         "# Projet %s\n%s" % (p["name"], p.get("desc", "")),
         "# Modules\n" + ("\n".join("- %s : %s" % (m["name"], m.get("desc", "")) for m in p.get("modules", [])) or "(aucun)"),
         "# Tâches (id | titre | statut | agent | parent | modules)\n" + (ts or "(aucune)"),
@@ -190,17 +215,27 @@ def safe_path(path, write=False):
     return path
 
 
-def ask(u, pid, aid, text, frm, depth=0):
-    """Envoie un message à un agent et exécute ses actions jusqu'à sa réponse finale."""
+def _overflow(e):
+    m = (e.msg or "").lower()
+    return e.code in (400, 413, 502) and any(k in m for k in (
+        "too long", "context length", "maximum context", "context window", "token limit", "too many tokens", "reduce the length", "exceeds the"))
+
+
+def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None):
+    """Envoie un message à un agent et exécute ses actions jusqu'à sa réponse finale.
+    `stats` (facultatif) reçoit {actions, pending} : nombre d'actions exécutées, et retour non traité si les étapes sont épuisées."""
     p = snap(u, pid)
     a = by_id(p["agents"], aid)
     if not a:
         raise Err(404, "Agent introuvable")
-    log(u, pid, frm, a["name"], text)
+    stats = stats if stats is not None else {}
+    stats.update(actions=0, pending="")
+    if relog:
+        log(u, pid, frm, a["name"], text)
     work(u, pid, aid, 1)
     try:
-        msg, final, ctx = "[%s] %s" % (frm, text), "", {"n": 0}
-        for _ in range(MAX_STEPS):
+        msg, final, ctx, overflow = "[%s] %s" % (frm, text), "", {"n": 0}, 0
+        for _ in range(max_steps or MAX_STEPS):
             p = snap(u, pid)
             a = by_id(p["agents"], aid)
             if not a:
@@ -216,21 +251,38 @@ def ask(u, pid, aid, text, frm, depth=0):
                 check_budget(p)
             sp = sys_prompt(p, a)
             mp(u, pid, lambda pp: by_id(pp["agents"], aid).__setitem__("seen_seq", pp.get("seq", 0)))
-            out = manual_exchange(u, pid, a, s, sp, h, msg) if manual else call_ai(s, sp, h + [{"role": "user", "content": msg}])
+            try:
+                out = manual_exchange(u, pid, a, s, sp, h, msg) if manual else call_ai(s, sp, h + [{"role": "user", "content": msg}])
+            except Err as e:
+                if manual or overflow >= 2 or not _overflow(e):
+                    raise
+                overflow += 1                              # contexte trop long : on compacte l'historique et on réessaie
+
+                def compact(pp):
+                    ag = by_id(pp["agents"], aid)
+                    h2 = [{"role": m["role"], "content": m["content"][:1500]} for m in ag.get("history", [])[-4:]]
+                    while h2 and h2[0]["role"] != "user":
+                        h2.pop(0)
+                    ag["history"] = h2
+                mp(u, pid, compact)
+                log(u, pid, "Système", a["name"], "Contexte trop long : l’historique de %s est compacté, nouvel essai." % a["name"])
+                continue
             if getattr(out, "usage", None) and s:
                 record_usage(u, pid, aid, s, out.usage)
             clean, acts = parse_acts(out)
             keep = msg if len(msg) < 3000 else msg[:3000] + "\n[…tronqué]"
+            keep_out = out if len(out) < 6000 else out[:6000] + "\n[…tronqué dans l’historique]"
 
             def add(pp):
                 ag = by_id(pp["agents"], aid)
                 if ag:
-                    ag["history"] = (ag.get("history", []) + [{"role": "user", "content": keep}, {"role": "assistant", "content": out}])[-30:]
+                    ag["history"] = (ag.get("history", []) + [{"role": "user", "content": keep}, {"role": "assistant", "content": keep_out}])[-30:]
             mp(u, pid, add)
             if clean:
                 log(u, pid, a["name"], frm, clean)
                 final = clean
             fb = []
+            stats["actions"] += len(acts)
             for x in acts:
                 note, back = do_act(u, pid, aid, x, depth, ctx)
                 if note:
@@ -240,6 +292,8 @@ def ask(u, pid, aid, text, frm, depth=0):
             if not fb:
                 break
             msg = "[Application] Résultats de tes actions :\n\n" + "\n\n".join(fb)
+        else:
+            stats["pending"] = msg                         # étapes épuisées : le dernier retour n'a pas été traité
         return final
     finally:
         work(u, pid, aid, -1)
@@ -355,7 +409,9 @@ def gate(u, pid, p, a, cap, kind, data, ctx):
     if lvl == rights.APPROVE:
         d = propose(u, pid, a, kind, data)
         return ("Proposition enregistrée dans « Décisions » : %s" % title) if d else ("Proposition déjà en attente : %s" % title), None
-    return mp(u, pid, lambda pp: rights.create_from(pp, kind, data, a["name"])), None
+    msg = mp(u, pid, lambda pp: rights.create_from(pp, kind, data, a["name"]))
+    spawn(tick, u, pid)                                   # une tâche créée peut être lancée aussitôt
+    return msg, None
 
 
 def progress_text(p, who):
@@ -388,7 +444,7 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             t = byname(x.get("to"))
             if not t or t["id"] == a["id"]:
                 return refuse("Message refusé : agent « %s » inconnu." % x.get("to"))
-            if not mn and t["id"] not in a.get("talk", []):
+            if not can_talk(a, t, mn):
                 return refuse("Message refusé : %s ne peut pas écrire à %s." % (a["name"], t["name"]))
             if depth >= MAX_DEPTH:
                 return refuse("Message non délivré (profondeur maximale d’échanges atteinte).")
@@ -427,7 +483,7 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                 if st != "en attente":
                     t.pop("blocked", None)
                 if x.get("note"):
-                    t["result"] = str(x["note"])
+                    t["result"], t["result_note"] = str(x["note"]), True
                 return "Tâche « %s » : %s.%s" % (t["title"], st, " Elle sera vérifiée avant clôture." if st == "à vérifier" else "")
             r = mp(u, pid, f)
             return refuse("Changement de statut refusé.") if r is None else (r, None)
@@ -755,15 +811,23 @@ def sync_all(u, pid):
         log(u, pid, "Système", a["name"], "Synchronisation : " + provision(u, pid, a["id"]))
 
 
-def say(u, pid, aid, text):
+def say(u, pid, aid, text, attempt=0, relog=True):
     try:
-        ask(u, pid, aid, text, "Vous")
+        ask(u, pid, aid, text, "Vous", relog=relog)
         for t in snap(u, pid)["tasks"]:               # une tâche passée « à vérifier » pendant la conversation
             if t["status"] == "à vérifier" and not t.get("reviewing"):
                 spawn(review_task, u, pid, t["id"])
     except Err as e:
         a = by_id(snap(u, pid)["agents"], aid) or {"name": "?"}
-        log(u, pid, "Système", a["name"], ("Quota du service atteint : réessayez dans %s s." % (e.retry or 60)) if e.code == 429 else "Erreur : " + e.msg)
+        if classify(e) in ("quota", "temp") and attempt < 3:
+            w = backoff(attempt, e.retry)
+            log(u, pid, "Système", a["name"], "Service momentanément indisponible (%s) : nouvelle tentative automatique vers %s." % (
+                "quota atteint" if e.code == 429 else "erreur temporaire", time.strftime("%H:%M", time.localtime(time.time() + w))))
+            tm = threading.Timer(w, lambda: say(u, pid, aid, text, attempt + 1, False))
+            tm.daemon = True
+            tm.start()
+        else:
+            log(u, pid, "Système", a["name"], "Erreur : " + e.msg)
 
 
 def spawn(fn, *a, **k):
@@ -811,13 +875,30 @@ def schedule(u, pid, tid, wait):
     t.start()
 
 
+def dep_context(p, t):
+    L = []
+    for i in t.get("deps") or []:
+        d = by_id(p["tasks"], i)
+        if d:
+            g = by_id(p["agents"], d.get("who")) or {}
+            L.append("- « %s » (%s, branche %s) : %s" % (d["title"], g.get("name", "?"), g.get("branch", "?"), (d.get("result") or "pas de compte rendu")[:600]))
+    return ("\nTâches dont tu dépends (terminées ; leur travail est dans la branche de travail) :\n" + "\n".join(L)) if L else ""
+
+
+def coordination_hint(p, a):
+    if len(p["agents"]) < 2:
+        return ""
+    return ("\nCoordination : avant de commencer, consulte « Travail des autres agents » ; si ta tâche dépend du travail d’un autre agent ou l’impacte "
+            "(interface, contrat d’API, schéma de données, convention), écris-lui d’abord (message) pour convenir de l’approche, puis préviens-le quand tu modifies ce qu’il utilise.")
+
+
 def run_task(u, pid, tid, retry=False, note=""):
+    """Exécute une tâche en PLUSIEURS tours : l'agent est relancé tant qu'il n'a ni conclu, ni posé de question, ni signalé de blocage."""
     p = snap(u, pid)
     t = by_id(p["tasks"], tid)
     a = t and by_id(p["agents"], t.get("who"))
     if not a or (retry and not t.get("retry_at")) or t.get("running"):
         return
-
     unmet = deps_unmet(p, t)
     if unmet:
         mp(u, pid, lambda pp: by_id(pp["tasks"], tid).__setitem__("waiting", unmet))
@@ -827,42 +908,80 @@ def run_task(u, pid, tid, retry=False, note=""):
 
     def start(pp):
         tt = by_id(pp["tasks"], tid)
+        if tt.get("running"):                              # déjà lancée par un autre passage
+            return False
         tt.update(running=True, status="en cours", started=time.time(), touched=time.time())
-        for k in ("retry_at", "fail", "blocked", "waiting"):
+        for k in ("retry_at", "fail", "blocked", "waiting", "resume", "result_note"):
             tt.pop(k, None)
         by_id(pp["agents"], a["id"])["state"] = "actif"
-    mp(u, pid, start)
-    msg = "Exécute cette tâche (id %s) : %s%s%s%s\nRéponds avec ton livrable. Quand tu as terminé, mets le statut à « à vérifier » avec task_status et un compte rendu précis de ce qui est fait ; s’il reste du travail ou un blocage, ne dis pas que c’est terminé : décris ce qui manque ou pose la question avec ask_user." % (
-        tid, t["title"], ("\n" + t["desc"]) if t.get("desc") else "",
-        ("\nModules : " + ", ".join(mod_names(p, t.get("modules")))) if t.get("modules") else "", ("\n" + note) if note else "")
-    pull_note = ""
-    try:                                                   # pull régulier : on repart de la branche de travail à jour
-        state, pm = pull(u, pid, a["id"], origin="pull", task=tid)
-        if state == "conflict":
-            mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(running=False, status="en attente"))
-            return
-        pull_note = "\n(Pull automatique : %s)" % pm
-    except Err as e:
-        pull_note = "\n(Pull impossible : %s)" % e.msg
-    msg += pull_note + "\nQuand ton travail est prêt, soumets une merge request vers la branche de travail de la release avec l’action merge_request, puis passe la tâche à « à vérifier »."
+        return True
+    if not mp(u, pid, start):
+        return
+    exhausted = False
+    replies = []
     try:
-        r = ask(u, pid, a["id"], msg, "Application")
-
-        def ok(pp):
-            tt = by_id(pp["tasks"], tid)
-            if tt:
-                tt["result"], tt["running"], tt["touched"] = r, False, time.time()
-                tt.pop("retries", None)
-                if tt["status"] == "en cours":
-                    tt["status"] = "à vérifier"     # jamais « terminée » d'office : l'agent principal vérifie
-        mp(u, pid, ok)
-        try:
-            st, mm = submit_mr(u, pid, a["id"], "Tâche : %s" % t["title"], "", tid)
-            if st in ("submitted", "conflict"):
-                log(u, pid, "Système", a["name"], mm)
+        pull_note = ""
+        try:                                               # pull régulier : on repart de la branche de travail à jour
+            state, pm = pull(u, pid, a["id"], origin="pull", task=tid)
+            if state == "conflict":
+                mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(running=False, status="en attente"))
+                return
+            pull_note = "\n(Pull automatique : %s)" % pm
         except Err as e:
-            log(u, pid, "Système", a["name"], "Merge request non soumise : %s" % e.msg)
-        spawn(review_task, u, pid, tid)
+            pull_note = "\n(Pull impossible : %s)" % e.msg
+        p = snap(u, pid)
+        msg = "Exécute cette tâche (id %s) : %s%s%s%s%s%s%s\nRéponds avec ton livrable. Quand tu as terminé, mets le statut à « à vérifier » avec task_status et un compte rendu précis de ce qui est fait ; s’il reste du travail ou un blocage, ne dis pas que c’est terminé : décris ce qui manque ou pose la question avec ask_user." % (
+            tid, t["title"], ("\n" + t["desc"]) if t.get("desc") else "",
+            ("\nModules : " + ", ".join(mod_names(p, t.get("modules")))) if t.get("modules") else "", dep_context(p, t), coordination_hint(p, a),
+            ("\n" + note) if note else "", pull_note)
+        msg += "\nQuand ton travail est prêt, soumets une merge request vers la branche de travail de la release avec l’action merge_request, puis passe la tâche à « à vérifier »."
+        idle = 0
+        for _ in range(MAX_ROUNDS):
+            stats = {}
+            r = ask(u, pid, a["id"], msg, "Application", stats=stats, max_steps=MAX_ROUND_STEPS)
+            if r:
+                replies.append(r)
+            tt = by_id(snap(u, pid)["tasks"], tid)
+            if not tt:
+                return
+            mp(u, pid, lambda pp: (by_id(pp["tasks"], tid) or {}).__setitem__("touched", time.time()))
+            if tt["status"] != "en cours":                 # conclu (à vérifier), en attente d'une décision, etc.
+                break
+            if stats.get("pending"):                       # étapes épuisées en plein travail : on continue
+                msg, idle = stats["pending"].removeprefix("[Application] ") + "\nPoursuis ta tâche.", 0
+            elif stats.get("actions"):
+                msg, idle = NUDGE, 0
+            else:
+                idle += 1                                  # deux tours sans action ni conclusion : on considère le travail rendu
+                if idle >= 2:
+                    break
+                msg = NUDGE
+        else:
+            exhausted = True                               # l'agent travaille toujours : reprise automatique au prochain passage
+        r = replies[-1] if replies else ""
+
+        def fin(pp):
+            tt = by_id(pp["tasks"], tid)
+            if not tt:
+                return
+            tt["running"], tt["touched"] = False, time.time()
+            tt.pop("retries", None)
+            if not tt.get("result_note"):
+                tt["result"] = r
+            if tt["status"] == "en cours":
+                if exhausted:
+                    tt["status"], tt["resume"] = "à faire", True
+                else:
+                    tt["status"] = "à vérifier"            # jamais « terminée » d'office : l'agent principal vérifie
+        mp(u, pid, fin)
+        if by_id(snap(u, pid)["tasks"], tid)["status"] == "à vérifier":
+            try:
+                st, mm = submit_mr(u, pid, a["id"], "Tâche : %s" % t["title"], "", tid)
+                if st in ("submitted", "conflict"):
+                    log(u, pid, "Système", a["name"], mm)
+            except Err as e:
+                log(u, pid, "Système", a["name"], "Merge request non soumise : %s" % e.msg)
+            spawn(review_task, u, pid, tid)
     except Err as e:
         kind = classify(e)
 
@@ -872,11 +991,11 @@ def run_task(u, pid, tid, retry=False, note=""):
                 return None
             tt["running"], tt["status"], tt["touched"] = False, "à faire", time.time()
             n = tt.get("retries", 0)
-            if kind == "quota" or (kind == "temp" and n < MAX_TEMP):
+            if kind == "quota" or (kind == "temp" and n < MAX_TEMP) or (kind == "other" and n < MAX_OTHER):
                 w = backoff(n, e.retry)
                 tt["retries"], tt["retry_at"] = n + 1, time.time() + w
                 tt["result"] = "Suspendu (%s) — nouvelle tentative automatique vers %s (tentative %d)." % (
-                    "quota atteint" if kind == "quota" else "service momentanément indisponible",
+                    {"quota": "quota atteint", "temp": "service momentanément indisponible"}.get(kind, "erreur inattendue du service"),
                     time.strftime("%H:%M", time.localtime(tt["retry_at"])), n + 1)
                 by_id(pp["agents"], a["id"])["state"] = "suspendu"
                 return w
@@ -886,6 +1005,14 @@ def run_task(u, pid, tid, retry=False, note=""):
         w = mp(u, pid, ko)
         if w:
             schedule(u, pid, tid, w)
+    except Exception as e:                                 # bogue inattendue : la tâche ne doit jamais rester « en cours » pour toujours
+        def crash(pp):
+            tt = by_id(pp["tasks"], tid)
+            if tt:
+                tt.update(running=False, status="à faire", touched=time.time(), fail={"kind": "internal", "msg": "%s : %s" % (type(e).__name__, str(e)[:250]), "ts": time.time()},
+                          result="Erreur interne : %s" % str(e)[:250])
+        mp(u, pid, crash)
+        log(u, pid, "Système", a["name"], "Erreur interne pendant la tâche « %s » : %s : %s" % (t["title"], type(e).__name__, e))
 
 
 def add_escalation(pp, t, reason, review=False):
@@ -915,7 +1042,7 @@ def apply_review(u, pid, tid, by, verdict, comment):
         t["touched"] = time.time()
         if verdict == "accepted":
             t.update(status="terminée", reviewed={"by": by, "d": now(), "note": comment})
-            for k in ("review_note", "reviews", "relaunch_n", "fail", "retries", "review_fail", "review_asked", "review_err"):
+            for k in ("review_note", "reviews", "relaunch_n", "fail", "retries", "review_fail", "review_asked", "review_err", "auto_n", "auto_escalated", "resume"):
                 t.pop(k, None)
             b = rights.on_task_done(pp, t)
             return "Tâche « %s » vérifiée par %s : terminée.%s" % (t["title"], by, (" Bug « %s » corrigé : à vérifier par le QA." % b["t"]) if b else ""), False
@@ -927,6 +1054,8 @@ def apply_review(u, pid, tid, by, verdict, comment):
         t["status"] = "à faire"
         return "Tâche « %s » refusée à la vérification par %s : %s" % (t["title"], by, comment), True
     msg, again = mp(u, pid, f)
+    if verdict == "accepted":
+        spawn(tick, u, pid)                               # des tâches dépendantes peuvent maintenant démarrer
     if again:
         spawn(run_task, u, pid, tid, False, "[Vérification par %s] Travail refusé : %s\nCorrige ce qui manque, puis soumets à nouveau la tâche (task_status « à vérifier »)." % (by, comment))
     return msg
@@ -1005,8 +1134,52 @@ def review_task(u, pid, tid):
         mp(u, pid, lambda pp: (by_id(pp["tasks"], tid) or {}).pop("reviewing", None))
 
 
+def dispatch(u, pid, p, t0):
+    """Lancement automatique : les tâches prêtes (assignées, à faire, dépendances satisfaites) démarrent sans intervention, une par agent."""
+    if p.get("autopilot") == "off":
+        return 0
+    bud = num(p.get("budget"))
+    if bud and (p.get("usage") or {}).get("cost", 0) >= bud:
+        return 0
+    busy = {t["who"] for t in p["tasks"] if t["status"] == "en cours" and t.get("who")} | {a["id"] for a in p["agents"] if a.get("work")}
+    parents = {t.get("parent") for t in p["tasks"] if t.get("parent")}
+    launched = []
+    for t in p["tasks"]:
+        a = by_id(p["agents"], t.get("who"))
+        if not a or t["status"] != "à faire" or a.get("mode") == "manual" or a["id"] in busy or t.get("system") or t["id"] in parents:
+            continue
+        if t.get("fail") or t.get("retry_at") or t.get("blocked") or t.get("running") or deps_unmet(p, t) or open_conflict_for(p, a["id"]):
+            continue
+        if t.get("auto_n", 0) >= MAX_AUTO:
+            if not t.get("auto_escalated"):
+                def esc(pp, i=t["id"]):
+                    tt = by_id(pp["tasks"], i)
+                    tt["auto_escalated"] = True
+                    add_escalation(pp, tt, "elle a été relancée automatiquement %d fois sans aboutir." % MAX_AUTO)
+                mp(u, pid, esc)
+            continue
+        busy.add(a["id"])
+        launched.append(t)
+    for t in launched:
+        mp(u, pid, lambda pp, i=t["id"]: by_id(pp["tasks"], i).__setitem__("auto_n", by_id(pp["tasks"], i).get("auto_n", 0) + 1))
+        spawn(run_task, u, pid, t["id"], False, "Tu avais déjà commencé cette tâche : reprends là où tu t’es arrêté (relis ton historique et l’état de ta branche)." if t.get("resume") else "")
+    return len(launched)
+
+
 def tick(u, pid):
-    """Passage du suivi : relances après quota, vérifications en attente, tâches bloquées (agent principal, puis utilisateur)."""
+    """Passage du suivi (un seul à la fois par projet)."""
+    key = (u, pid)
+    if key in TICKING:
+        return
+    TICKING.add(key)
+    try:
+        _tick(u, pid)
+    finally:
+        TICKING.discard(key)
+
+
+def _tick(u, pid):
+    """Relances après quota, vérifications en attente, lancement des tâches prêtes, tâches bloquées (agent principal, puis utilisateur)."""
     p = snap(u, pid)
     if p.get("supervision") == "off":
         return
@@ -1018,11 +1191,19 @@ def tick(u, pid):
                 tt["touched"] = t0
     mp(u, pid, stamp)
     p = snap(u, pid)
+    ghosts = [t["id"] for t in p["tasks"] if t.get("running") and not (by_id(p["agents"], t.get("who")) or {}).get("work") and t0 - t.get("touched", t0) > STALE_RUNNING]
+    if ghosts:                                             # exécution « fantôme » : le thread s'est arrêté sans rendre la main
+        def unstick(pp):
+            for i in ghosts:
+                by_id(pp["tasks"], i).update(running=False, status="à faire", fail={"kind": "internal", "msg": "exécution interrompue sans résultat", "ts": t0})
+        mp(u, pid, unstick)
+        p = snap(u, pid)
     for t in p["tasks"]:
         if t.get("retry_at"):
             schedule(u, pid, t["id"], max(0, t["retry_at"] - t0))
         if t["status"] == "à vérifier" and not t.get("reviewing"):
             spawn(review_task, u, pid, t["id"])
+    dispatch(u, pid, p, t0)
     mg = by_id(p["agents"], p.get("mainId"))
     can_ask = bool(mg) and mg.get("mode") != "manual"
     report, esc = [], []
@@ -1036,7 +1217,7 @@ def tick(u, pid):
             kind, cause = "stall", "aucune activité depuis %d min" % ((t0 - t["touched"]) // 60)
         else:
             continue
-        if kind in ("budget", "auth", "model") or not can_ask or t.get("sup_n", 0) >= 2:
+        if kind in ("budget", "auth", "model", "internal") or not can_ask or t.get("sup_n", 0) >= 2:
             esc.append((t, cause))
         elif t0 - t.get("sup_ts", 0) >= SUP_COOLDOWN:
             report.append((t, a, cause))
@@ -1347,6 +1528,7 @@ def merge_mr(u, pid, mid):
                     c["status"] = "résolu"
             return [t["title"] for t in pp["tasks"] if t.get("deps") and t["status"] != "terminée" and not deps_unmet(pp, t)]
         ready = mp(u, pid, f)
+        spawn(tick, u, pid)
         return "Merge request #%s fusionnée dans %s.%s" % (m["n"], m["to"], (" Tâches désormais débloquées : %s." % ", ".join("« %s »" % x for x in ready)) if ready else "")
     tries = m.get("merge_tries", 0) + 1
     mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(merge_tries=tries))
@@ -1423,6 +1605,8 @@ def start(u, j):
     def run():
         try:
             jobs[t]()
+            if t in ("decide", "mr_retry", "cycle_start", "instr_add"):
+                tick(u, pid)                              # la décision peut débloquer des tâches : on les lance sans attendre
         except Exception as e:  # ne jamais perdre un échec silencieusement
             try:
                 log(u, pid, "Système", "Vous", "Erreur interne (%s) : %s" % (t, e))

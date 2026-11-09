@@ -40,12 +40,18 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 - **Conflits de fusion** : la règle se choisit dans *Git & releases* > **Conflits de fusion** : *je décide* (une question vous est posée : l'auteur de la branche, l'agent principal, ou vous), *l'auteur de la branche résout*, ou *un agent désigné résout*. Si l'agent n'y arrive pas, la question vous revient. Si vous choisissez de vous en occuper, résolvez-le sur GitHub puis cliquez sur **Réessayer** sur la merge request.
 - **Publier la release** : fusionne la branche de travail dans la branche principale, crée le tag et la release GitHub. Impossible tant qu'une merge request est ouverte.
 
+## Autonomie des agents
+- **Lancement automatique** : une tâche **assignée** à un agent démarre toute seule dès que ses dépendances sont satisfaites et que l'agent est libre (une tâche à la fois par agent). Plus besoin de cliquer sur ▶ ; les agents en **chat manuel** ne sont jamais lancés seuls. Réglage : *Vue globale* > **Lancement automatique des tâches**.
+- **Un agent ne s'arrête plus à la première erreur** : tant qu'il n'a pas conclu (« à vérifier »), posé une question ou signalé un blocage, il est relancé automatiquement (jusqu'à 6 tours). S'il travaille encore à la fin, la tâche reprend toute seule. Une erreur inattendue du service est réessayée, un contexte trop long est compacté, une exécution figée est réinitialisée.
+- **Coordination** : par défaut, **chaque agent peut contacter tous les autres** (champ « Agents qu'il peut contacter » : vide = tous, « aucun » = personne). Chaque agent voit qui travaille sur quoi, reçoit le compte rendu des tâches dont il dépend, et ses consignes lui demandent de se concerter avec les agents concernés avant de coder une interface partagée.
+- L'onglet *Équipe* affiche pour chaque agent sa tâche en cours, sa prochaine reprise automatique et sa dernière activité.
+
 ## Suivi et vérification du travail
 - **Une tâche n'est jamais « terminée » d'office** : quand un agent a fini, elle passe **« à vérifier »**. L'agent principal (ou le QA) relit le travail réellement fait dans le dépôt, avec les commits de l'agent comme preuve, puis la **clôture** ou la **refuse en listant ce qui manque** : l'agent la reprend alors avec ce motif. Après 3 refus, la question vous est posée.
 - **Manque de tokens ou service indisponible** : l'agent est relancé **automatiquement** (délai du fournisseur, puis 5, 15, 30 minutes, puis toutes les heures), sans rien vous demander.
 - **Autre problème** : l'agent principal interroge l'agent bloqué et le relance s'il peut. Si le problème persiste, ou s'il s'agit d'un plafond de budget, d'une clé invalide ou d'un modèle introuvable, **vous recevez une décision** (onglet *Décisions*) : relancer, mettre en pause ou abandonner.
 - **Réponse à une question d'un agent** : sa tâche **reprend toute seule**, sans relance de votre part.
-- Le suivi tourne toutes les 5 minutes côté serveur et se désactive par projet (*Vue globale* > **Suivi automatique**). Une validation manuelle dans l'interface (statut « terminée ») court-circuite la vérification.
+- Le suivi tourne toutes les minutes côté serveur et se désactive par projet (*Vue globale* > **Suivi automatique**). Une validation manuelle dans l'interface (statut « terminée ») court-circuite la vérification.
 
 ## Droits des agents et décisions
 - **Droits par rôle** (onglet *Rôles*) : pour chaque capacité (sous-tâches, tâches de 1er niveau, modules, bugs, évolution et vérification des bugs, liens aux modules) : ✔ libre, ✋ soumis à votre validation, ou — interdit. Réglages par défaut : sous-tâches libres sous ses propres tâches, tâches de 1er niveau et modules soumis à validation pour le chef de projet et l'architecte, bugs libres pour tous sauf le rédacteur, vérification des bugs pour le QA.
@@ -76,7 +82,7 @@ Aucun réseau ni clé nécessaires (faux GitHub local, IA simulée).
 | `APM_HOST` | `127.0.0.1` | `0.0.0.0` pour écouter sur le réseau |
 | `APM_DATA` | `./data` | dossier de données |
 | `APM_ALLOW_REGISTER` | `1` | `0` pour fermer la création de comptes |
-| `APM_SUPERVISE_SECONDS` | `300` | période du suivi automatique des tâches (`0` = désactivé) |
+| `APM_SUPERVISE_SECONDS` | `60` | période du suivi automatique des tâches (`0` = désactivé) |
 
 ## Déploiement sur serveur Linux (plus tard)
 Même commande : `APM_HOST=127.0.0.1 python3 server.py`, derrière un reverse proxy HTTPS (nginx ou Caddy), lancé par une unité systemd. Ne jamais exposer le port en HTTP clair sur Internet.

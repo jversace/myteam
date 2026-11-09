@@ -872,7 +872,9 @@ class Integration(unittest.TestCase):
 
         def fake(s, system, msgs):
             vus.append(msgs[-1]["content"])
-            return 'Fait.\n```action\n{"do":"write_file","path":"x.py","content":"1","message":"feat: x"}\n```'
+            if len(vus) == 1:
+                return 'Fait.\n```action\n{"do":"write_file","path":"x.py","content":"1","message":"feat: x"}\n```'
+            return 'Je conclus.\n```action\n{"do":"task_status","id":"t1","status":"à vérifier","note":"x.py écrit"}\n```'
         with mock.patch.object(engine, "call_ai", fake):
             engine.run_task("u", "p1", "t1")
         self.assertTrue("Pull automatique" in vus[0] and "merge_request" in vus[0])
@@ -997,6 +999,197 @@ class Integration(unittest.TestCase):
         rp.merge_with_resolution("agent/bob", "release/v1.0.0", {"a.txt": "a résolu"}, "merge")
         f = BR["agent/bob"]
         self.assertEqual((f["a.txt"], f["b.txt"], f["c.txt"], f["d.txt"]), ("a résolu", "b Bob", "c release", "d0"))
+
+    # -- autonomie : tâches persistantes, lancement automatique, reprise, coordination
+    def set_task(self, tid, **kw):
+        st = store.load("u")
+        next(x for x in st["projects"][0]["tasks"] if x["id"] == tid).update(kw)
+        store.wj(store.state_path("u"), st)
+
+    def launched(self):
+        return [s[1][2] for s in self.spawned if s[0] == "run_task"]
+
+    def notes(self):
+        return [s[1][4] for s in self.spawned if s[0] == "run_task"]
+
+    def test_l_agent_n_abandonne_pas_apres_une_erreur(self):
+        calls = []
+
+        def fake(s, system, msgs):
+            calls.append(msgs[-1]["content"])
+            if len(calls) == 1:
+                return 'Je lis.\n```action\n{"do":"read_file","path":"absent.py"}\n```'
+            if len(calls) == 2:
+                return "Je ne trouve pas le fichier, je m'arrête là."                                   # l'agent renonce après l'erreur
+            return ('Je crée le fichier.\n```action\n{"do":"write_file","path":"x.py","content":"1","message":"feat: x"}\n```\n'
+                    '```action\n{"do":"task_status","id":"t1","status":"à vérifier","note":"x.py créé"}\n```')
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.run_task("u", "p1", "t1")
+        self.assertEqual(len(calls), 3)
+        self.assertIn("Fichier introuvable", calls[1])                                                 # l'erreur est renvoyée à l'agent
+        self.assertTrue(calls[2].startswith("[Application] Tu n’as pas déclaré la tâche terminée"))   # puis il est relancé sans intervention
+        t = proj()["tasks"][0]
+        self.assertEqual((t["status"], t["result"], BR["agent/bob"]["x.py"]), ("à vérifier", "x.py créé", "1"))
+
+    def test_etapes_epuisees_le_travail_continue(self):
+        calls = []
+
+        def fake(s, system, msgs):
+            calls.append(msgs[-1]["content"])
+            if len(calls) <= engine.MAX_ROUND_STEPS:
+                return '```action\n{"do":"read_file","path":"README.md"}\n```'
+            return '```action\n{"do":"task_status","id":"t1","status":"à vérifier","note":"relu"}\n```'
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.run_task("u", "p1", "t1")
+        self.assertIn("Poursuis ta tâche", calls[engine.MAX_ROUND_STEPS])                              # le retour non traité n'est pas perdu
+        self.assertEqual(proj()["tasks"][0]["status"], "à vérifier")
+
+    def test_deux_tours_sans_action_valent_rendu(self):
+        calls = []
+        with mock.patch.object(engine, "call_ai", lambda s, sy, m: calls.append(1) or "Voici le livrable."):
+            engine.run_task("u", "p1", "t1")
+        self.assertEqual((len(calls), proj()["tasks"][0]["status"]), (2, "à vérifier"))                # une relance, puis on considère le travail rendu
+
+    def test_travail_sans_fin_reprend_automatiquement(self):
+        with mock.patch.object(engine, "call_ai", lambda *a: '```action\n{"do":"write_file","path":"x.py","content":"1"}\n```'):
+            engine.run_task("u", "p1", "t1")                                                           # l'agent agit sans jamais conclure
+        t = proj()["tasks"][0]
+        self.assertEqual((t["status"], t.get("resume"), "fail" in t, t["running"]), ("à faire", True, False, False))
+        engine.tick("u", "p1")
+        self.assertIn("reprends là où tu t’es arrêté", self.notes()[0])                             # le pilote automatique la relance
+
+    def test_pilote_automatique(self):
+        st = store.load("u")
+        pr = st["projects"][0]
+        pr["agents"][0]["mode"] = "manual"                                                             # Alice : chat manuel, jamais lancée seule
+        pr["tasks"] = [
+            {"id": "t1", "parent": "", "title": "Login", "who": "a2", "status": "à faire", "modules": [], "by": ""},
+            {"id": "t3", "parent": "", "title": "Suite", "who": "a2", "status": "à faire", "modules": [], "by": "", "deps": ["t1"]},
+            {"id": "t4", "parent": "", "title": "Tests", "who": "a3", "status": "à faire", "modules": [], "by": ""},
+            {"id": "t5", "parent": "", "title": "Cadrage", "who": "a1", "status": "à faire", "modules": [], "by": ""},
+            {"id": "t6", "parent": "", "title": "Doc", "who": "a2", "status": "à faire", "modules": [], "by": ""},
+            {"id": "t7", "parent": "", "title": "Parent", "who": "a3", "status": "à faire", "modules": [], "by": ""},
+            {"id": "t8", "parent": "t7", "title": "Enfant", "who": "a3", "status": "terminée", "modules": [], "by": ""}]
+        store.wj(store.state_path("u"), st)
+        engine.tick("u", "p1")
+        self.assertEqual(self.launched(), ["t1", "t4"])           # une tâche par agent ; ni dépendance non satisfaite, ni agent en chat manuel, ni tâche parente
+        self.assertEqual([x.get("auto_n") for x in proj()["tasks"][:3]], [1, None, 1])
+
+    def test_pilote_automatique_garde_fous(self):
+        def lances(**projet):
+            self.spawned.clear()
+            self.set(**projet)
+            engine.tick("u", "p1")
+            return [s[1][2] for s in self.spawned if s[0] == "run_task"]
+        self.set_task("t1", status="à faire")
+        self.assertEqual(lances(), ["t1"])
+        self.assertEqual(lances(autopilot="off"), [])                                                  # désactivé par l'utilisateur
+        self.assertEqual(lances(autopilot="on", budget="0.01", usage={"cost": 0.5}), [])               # plafond de budget atteint
+        self.set(budget="", usage={})
+        self.set_task("t1", fail={"kind": "other", "msg": "x", "ts": 1}, sup_ts=time.time())           # en échec : pas relancée aveuglément
+        self.assertEqual(lances(), [])
+        self.set_task("t1", fail=None, auto_n=engine.MAX_AUTO)
+        self.assertEqual(lances(), [])
+        d = proj()["decisions"]
+        self.assertTrue(len(d) == 1 and d[0]["escalation"])                                            # trop de relances automatiques : l'utilisateur décide
+        lances()
+        self.assertEqual(len(proj()["decisions"]), 1)                                                  # une seule question
+
+    def test_execution_fantome_reinitialisee(self):
+        self.set_task("t1", running=True, touched=time.time() - 5000)
+        engine.tick("u", "p1")
+        t = proj()["tasks"][0]
+        self.assertFalse(t["running"])
+        self.assertEqual(t["fail"]["kind"], "internal")
+        self.assertTrue(proj()["decisions"][0]["escalation"])                                          # et l'utilisateur est prévenu
+
+    def test_erreur_inattendue_ne_bloque_pas_la_tache(self):
+        with mock.patch.object(engine, "pull", side_effect=RuntimeError("boom")):
+            engine.run_task("u", "p1", "t1")
+        t = proj()["tasks"][0]
+        self.assertEqual((t["running"], t["status"], t["fail"]["kind"]), (False, "à faire", "internal"))
+        self.assertIn("Erreur interne", self.logs())
+
+    def test_erreur_inconnue_reessayee_puis_remontee(self):
+        def bizarre(*a):
+            raise Err(502, "Erreur du service IA (400) : requête invalide")
+        for n in range(engine.MAX_OTHER):
+            engine.TIMERS.clear()
+            with mock.patch.object(engine, "call_ai", bizarre), mock.patch.object(engine.threading, "Timer") as T:
+                engine.run_task("u", "p1", "t1")
+            t = proj()["tasks"][0]
+            self.assertEqual((t["retries"], "fail" in t, T.call_args[0][0]), (n + 1, False, engine.backoff(n)))
+            self.set_task("t1", retry_at=None)
+        with mock.patch.object(engine, "call_ai", bizarre):
+            engine.run_task("u", "p1", "t1")
+        self.assertEqual(proj()["tasks"][0]["fail"]["kind"], "other")                                  # puis l'agent principal est sollicité
+
+    def test_contexte_trop_long_compacte_l_historique(self):
+        st = store.load("u")
+        st["projects"][0]["agents"][1]["history"] = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 5000} for i in range(20)]
+        store.wj(store.state_path("u"), st)
+        appels = []
+
+        def fake(s, system, msgs):
+            appels.append(len(msgs))
+            if len(appels) == 1:
+                raise Err(502, "Erreur du service IA (400) : prompt is too long: 250000 tokens > 200000 maximum")
+            return "ok"
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.ask("u", "p1", "a2", "salut", "Vous")
+        h = proj()["agents"][1]["history"]
+        self.assertTrue(appels[0] > 20 and appels[1] <= 5)                                             # 2e appel avec un historique réduit
+        self.assertTrue(len(h) <= 6 and all(len(m["content"]) < 1700 for m in h))
+        self.assertIn("Contexte trop long", self.logs())
+
+    def test_historique_allege(self):
+        with mock.patch.object(engine, "call_ai", lambda *a: "y" * 20000):
+            engine.ask("u", "p1", "a2", "salut", "Vous")
+        self.assertLess(len(proj()["agents"][1]["history"][-1]["content"]), 6100)                       # pas de gros fichiers dans l'historique
+
+    def test_conversation_reessayee_apres_quota(self):
+        def quota(*a):
+            raise Err(429, "quota", 5)
+        with mock.patch.object(engine, "call_ai", quota), mock.patch.object(engine.threading, "Timer") as T:
+            engine.say("u", "p1", "a1", "bonjour")
+        self.assertEqual(T.call_args[0][0], 5)
+        self.assertIn("nouvelle tentative automatique", self.logs())
+        with mock.patch.object(engine, "call_ai", lambda *a: "Re-bonjour"):
+            T.call_args[0][1]()                                                                        # le minuteur se déclenche
+        msgs = [m for m in proj()["log"] if m["from"] == "Vous" and m["to"] == "Alice"]
+        self.assertEqual([m["text"] for m in msgs], ["bonjour"])                                       # le message n'est pas journalisé deux fois
+        self.assertTrue(any(m["from"] == "Alice" and m["text"] == "Re-bonjour" for m in proj()["log"]))
+
+    def test_les_agents_peuvent_se_contacter_par_defaut(self):
+        self.set_task("t3", who="a3")
+        st = store.load("u"); st["projects"][0]["tasks"].append({"id": "t4", "parent": "", "title": "Tests e2e", "who": "a3", "status": "en cours", "modules": [], "by": ""}); store.wj(store.state_path("u"), st)
+        with mock.patch.object(engine, "call_ai", lambda *a: "Reçu."):
+            note, back = engine.do_act("u", "p1", "a3", {"do": "message", "to": "Bob", "text": "quelle interface ?"}, 0)   # Carol : aucune restriction
+        self.assertEqual(back, "[Réponse de Bob] Reçu.")
+        for talk, attendu in ((["none"], "ne peut pas écrire"), (["a1"], "ne peut pas écrire")):
+            st = store.load("u"); st["projects"][0]["agents"][2]["talk"] = talk; store.wj(store.state_path("u"), st)
+            self.assertIn(attendu, engine.do_act("u", "p1", "a3", {"do": "message", "to": "Bob", "text": "x"}, 0)[1])
+        bob = proj()["agents"][1]
+        prompt = engine.sys_prompt(proj(), bob)
+        self.assertTrue("Travail des autres agents" in prompt and "Carol : « Tests e2e »" in prompt)    # il sait qui fait quoi
+        self.assertNotIn("Carol : « Login »", prompt)
+        self.assertIn("Agents joignables : tous", engine.ctx_text(proj(), proj()["agents"][0]))      # le principal
+        self.assertIn("Agents joignables : Alice", engine.ctx_text(proj(), bob))                          # restriction explicite
+
+    def test_message_de_tache_dependances_et_coordination(self):
+        self.set_task("t1", status="terminée", result="API login prête : POST /login", who="a2")
+        st = store.load("u"); st["projects"][0]["tasks"].append({"id": "t4", "parent": "", "title": "Tests e2e", "who": "a3", "status": "en cours", "modules": [], "by": ""}); store.wj(store.state_path("u"), st)
+        vus = []
+        with mock.patch.object(engine, "call_ai", lambda s, sy, m: vus.append((sy, m[-1]["content"])) or "ok"):
+            engine.run_task("u", "p1", "t3")
+        sy, msg = vus[0]
+        self.assertTrue("API login prête : POST /login" in msg and "Tâches dont tu dépends" in msg and "Coordination" in msg)   # compte rendu de la dépendance transmis
+        self.assertIn("Tests e2e", sy)
+
+    def test_creation_de_tache_declenche_le_pilote(self):
+        self.set(autonomy="auto")
+        engine.do_act("u", "p1", "a1", {"do": "task", "title": "Nouvelle", "assignee": "Carol"}, 0)
+        self.assertIn("tick", [s[0] for s in self.spawned])                                            # lancée sans attendre le prochain passage
 
     # -- release finale
     def test_publier_la_release(self):
