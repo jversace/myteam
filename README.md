@@ -40,6 +40,12 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 - **Conflits de fusion** : la règle se choisit dans *Git & releases* > **Conflits de fusion** : *je décide* (une question vous est posée : l'auteur de la branche, l'agent principal, ou vous), *l'auteur de la branche résout*, ou *un agent désigné résout*. Si l'agent n'y arrive pas, la question vous revient. Si vous choisissez de vous en occuper, résolvez-le sur GitHub puis cliquez sur **Réessayer** sur la merge request.
 - **Publier la release** : fusionne la branche de travail dans la branche principale, crée le tag et la release GitHub. Impossible tant qu'une merge request est ouverte.
 
+## Débloquer et réinitialiser
+- **Les agents n'ont pas d'« environnement » à nettoyer** : un agent, c'est une conversation, des notes, une branche GitHub et des tâches. Tout passe par l'API GitHub, il n'y a pas de `.git` local. Si un agent parle de `MERGE_HEAD` ou d'« environnement bloqué », il se trompe : cliquez sur **Diagnostic des blocages** (onglet *Équipe*) pour voir les causes réelles, relevées dans l'état du projet.
+- **Conflit de fusion resté ouvert** (cause fréquente de blocage) : il se lève tout seul si plus aucun fichier n'est en conflit (vérification toutes les 5 minutes, ou au prochain démarrage de tâche). Sinon, dans *Git & releases* > **Conflits de fusion** : **Vérifier**, **Classer résolu**, **Relancer la résolution** ou **Abandonner**.
+- **Réinitialiser un agent** (*Équipe* > **Réinitialiser…**) : efface sa conversation (et, au choix, ses notes), annule son travail en cours et ses conflits, et peut **remettre sa branche à zéro** depuis la branche de travail (⚠ ses commits non fusionnés sont perdus), puis rejoue son onboarding.
+- **Question sans objet** d'un agent : bouton **Classer sans suite** dans *Décisions*.
+
 ## Autonomie des agents
 - **Lancement automatique** : une tâche **assignée** à un agent démarre toute seule dès que ses dépendances sont satisfaites et que l'agent est libre (une tâche à la fois par agent). Plus besoin de cliquer sur ▶ ; les agents en **chat manuel** ne sont jamais lancés seuls. Réglage : *Vue globale* > **Lancement automatique des tâches**.
 - **Un agent ne s'arrête plus à la première erreur** : tant qu'il n'a pas conclu (« à vérifier »), posé une question ou signalé un blocage, il est relancé automatiquement (jusqu'à 6 tours). S'il travaille encore à la fin, la tâche reprend toute seule. Une erreur inattendue du service est réessayée, un contexte trop long est compacté, une exécution figée est réinitialisée.

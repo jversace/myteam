@@ -29,6 +29,7 @@ MAX_ROUNDS, MAX_ROUND_STEPS, MAX_AUTO = 6, 8, 8   # tours par tâche, étapes pa
 NUDGE = ("Tu n’as pas déclaré la tâche terminée. Si le travail demandé est réellement fait, conclus avec task_status « à vérifier » et un compte rendu précis. "
          "Sinon poursuis-le maintenant avec les actions ; si tu es bloqué, écris à l’agent concerné (message) ou pose la question à l’utilisateur (ask_user). "
          "Ne t’arrête pas sur une erreur : analyse-la, corrige et continue.")
+OPEN_CONFLICT, RECONCILE_EVERY = ("ouvert", "escalade", "pause"), 300   # statuts « actifs » d'un conflit ; délai entre deux vérifications (s)
 CONFLICT_OPTS = ["L’auteur de la branche résout", "L’agent principal résout", "Je m’en occupe (mettre en pause)"]
 MANUAL_TIMEOUT = 24 * 3600   # attente maximale d'une réponse manuelle
 WAIT = {}                    # échanges manuels en attente : id -> {u, ev, text}
@@ -44,6 +45,7 @@ RULES = [
     "Pour connaître l’avancement d’un autre agent, utilise d’abord get_progress (sans coût) ; n’interroge l’agent par message que pour obtenir une précision.",
     "Une tâche ou un bug peut être rattaché à un ou plusieurs modules, sans obligation (ex. le cahier des charges est global). Un bug se corrige par des sous-tâches de correction (bug_fix) ; quand elles sont terminées, il passe à « corrigé » et le QA le vérifie.",
     "Chaque release a une branche de travail (release/<version>) ; la branche principale est réservée à la release finale. Tu te synchronises avec la branche de travail par pull (fait automatiquement au démarrage d’une tâche et avant une merge request) ; quand ton travail est prêt, tu soumets une merge request (merge_request) vers cette branche ; l’agent principal la valide. Une tâche qui dépend d’une autre ne démarre que lorsque celle-ci est terminée et sa merge request fusionnée. En cas de conflit de fusion, la règle du projet décide qui le résout (l’utilisateur, l’auteur de la branche ou un agent désigné) ; si le conflit t’est confié, résous-le avec resolve_merge.",
+    "Tu n’as aucun environnement d’exécution local ni dépôt git local : tout passe par les actions de l’application et l’API GitHub. Il n’existe donc ni répertoire .git, ni état « MERGE_HEAD », ni environnement à nettoyer ou à redémarrer. Quand une action est refusée, lis le message : il donne la cause et la suite ; n’invente pas de cause absente du message et ne demande jamais à l’utilisateur de « nettoyer » un environnement. Pour connaître les vraies causes d’un blocage, appelle get_blockers avant de poser une question technique.",
     "Prends l’initiative de la coordination : avant de coder ce qui dépend du travail d’un autre agent ou qui l’impacte (interface, contrat d’API, schéma de données, convention), écris-lui avec message pour convenir de l’approche ; préviens-le quand tu modifies ce qu’il utilise ; réponds toujours aux messages que tu reçois. « Travail des autres agents » et get_progress te disent qui fait quoi.",
     "Ne t’arrête pas à la première erreur : analyse-la, corrige et continue (relis le fichier, change d’approche). Si tu es réellement bloqué, écris à l’agent qui peut t’aider ou pose la question avec ask_user ; ne laisse jamais une tâche en suspens sans le dire.",
     "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
@@ -59,6 +61,7 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"resolve_merge","conflict":"<id>","files":[{"path":"...","content":"<contenu final complet, ou null pour supprimer>"}],"message":"..."} : résoudre un conflit de fusion qui t’est confié (un élément par fichier en conflit)',
     '{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable (sa réponse te revient)',
     '{"do":"get_progress","agent":"<prénom ou all>"} : avancement d’un agent ou de toute l’équipe (sans coût)',
+    '{"do":"get_blockers"} : liste FACTUELLE des blocages du projet (conflits, dépendances, erreurs, décisions en attente) — à consulter avant toute question technique',
     '{"do":"context","text":"..."} : réécrire tes notes personnelles (fichier de contexte)',
     '{"do":"task","title":"...","desc":"...","assignee":"<prénom>","parent":"<id de la tâche parente, vide = 1er niveau>","modules":["<module>"],"depends_on":["<id d’une tâche à terminer avant>"],"why":"<justification>"} : créer une tâche (sous-tâche libre sous tes tâches ; 1er niveau selon tes droits)',
     '{"do":"task_status","id":"<id>","status":"à faire|en cours|en attente|à vérifier","note":"<compte rendu>"} : statut d’une de tes tâches (« à vérifier » = fini de ton côté ; la clôture se fait par vérification)',
@@ -454,6 +457,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return repo_act(u, pid, p, a, x, kind)
         if kind == "get_progress":
             return "", progress_text(p, x.get("agent"))
+        if kind == "get_blockers":
+            return "", blockers_text(p)
         if kind == "context":
             def f(pp):
                 by_id(pp["agents"], aid)["notes"] = str(x.get("text", ""))
@@ -657,6 +662,16 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
         raise Err(404, "Décision introuvable ou déjà traitée")
     ag = by_id(p["agents"], d["by"])
     title = d.get("question") or d["payload"].get("title") or d["payload"].get("name")
+    if decision == "dismiss":                              # question sans objet (ex. cause inventée par un agent) : on la classe
+        def dis(pp):
+            dd = by_id(pp["decisions"], did)
+            dd.update(status="ignorée", note=str(note or "Classée sans suite par l’utilisateur."), done=now(), n_done=rights.next_seq(pp))
+            t = by_id(pp["tasks"], dd.get("task"))
+            if t and t.get("blocked") == did:
+                t.pop("blocked", None)
+                t["status"], t["touched"] = "à faire", time.time()
+        mp(u, pid, dis)
+        return log(u, pid, "Vous", d["byName"], "Décision classée sans suite : %s" % title)
     if d["kind"] == "question":
         ans = str(answer or "").strip()
         if not ans:
@@ -904,7 +919,12 @@ def run_task(u, pid, tid, retry=False, note=""):
         mp(u, pid, lambda pp: by_id(pp["tasks"], tid).__setitem__("waiting", unmet))
         return log(u, pid, "Système", a["name"], "Tâche « %s » non lancée : elle attend %s." % (t["title"], ", ".join("« %s »" % x for x in unmet)))
     if open_conflict_for(p, a["id"]):
-        return log(u, pid, "Système", a["name"], "Tâche « %s » non lancée : un conflit de fusion est en cours de résolution sur la branche de %s." % (t["title"], a["name"]))
+        reconcile_conflicts(u, pid, a["id"], force=True)   # le conflit est peut-être déjà levé (résolu à la main, branche mise à jour)
+        p = snap(u, pid)
+        t = by_id(p["tasks"], tid)
+        if open_conflict_for(p, a["id"]):
+            c = next(c for c in p["conflicts"] if c["agent"] == a["id"] and c["status"] in OPEN_CONFLICT)
+            return log(u, pid, "Système", a["name"], "Tâche « %s » non lancée : %s" % (t["title"], describe_conflict(p, c)))
 
     def start(pp):
         tt = by_id(pp["tasks"], tid)
@@ -1203,6 +1223,8 @@ def _tick(u, pid):
             schedule(u, pid, t["id"], max(0, t["retry_at"] - t0))
         if t["status"] == "à vérifier" and not t.get("reviewing"):
             spawn(review_task, u, pid, t["id"])
+    if any(c["status"] in OPEN_CONFLICT for c in p.get("conflicts", [])):
+        reconcile_conflicts(u, pid)                        # un conflit levé entre-temps ne doit pas bloquer les agents
     dispatch(u, pid, p, t0)
     mg = by_id(p["agents"], p.get("mainId"))
     can_ask = bool(mg) and mg.get("mode") != "manual"
@@ -1226,7 +1248,7 @@ def _tick(u, pid):
         log(u, pid, "Système", "Vous", "Tâche « %s » bloquée (%s) : votre décision est demandée (onglet Décisions)." % (t["title"], cause))
     if report:
         msg = ("[Suivi automatique] Des tâches semblent bloquées (les simples manques de tokens sont relancés automatiquement et ne figurent pas ici) :\n%s\n"
-               "Pour chacune : interroge l’agent concerné (message) pour comprendre ; si le problème est résolu ou contournable, relance-le avec relaunch ; "
+               "Pour chacune : consulte d’abord get_blockers (faits), puis interroge l’agent concerné (message) pour comprendre ; si le problème est résolu ou contournable, relance-le avec relaunch ; "
                "sinon (décision à prendre, information manquante, erreur répétée), remonte-le à l’utilisateur avec ask_user en indiquant la tâche.") % "\n".join(
             "- %s « %s » — agent %s — %s" % (t["id"], t["title"], a["name"], cause) for t, a, cause in report)
         try:
@@ -1261,7 +1283,7 @@ def start_supervisor():
 
 
 def open_conflict_for(p, aid):
-    return any(c["agent"] == aid and c["status"] in ("ouvert", "escalade", "pause") for c in p.get("conflicts", []))
+    return any(c["agent"] == aid and c["status"] in OPEN_CONFLICT for c in p.get("conflicts", []))
 
 
 def deps_unmet(p, t):
@@ -1306,12 +1328,204 @@ def pull(u, pid, aid, origin="pull", task="", title="", body=""):
         return "skip", "Ta branche ne peut pas être la branche de base ou la branche de travail."
     rp.ensure_branch(a["branch"])
     r = rp.merge_branch(a["branch"], rp.work, "pull : %s dans %s" % (rp.work, a["branch"]))
-    if r["state"] == "uptodate":
-        return "uptodate", "Ta branche est déjà à jour avec %s." % rp.work
-    if r["state"] == "merged":
+    if r["state"] in ("uptodate", "merged"):
+        for c in p.get("conflicts", []):                    # la fusion passe : les conflits encore « ouverts » sont obsolètes
+            if c["agent"] == aid and c["status"] in OPEN_CONFLICT:
+                close_conflict(u, pid, c["id"], "résolu", "levé : le pull de la branche de travail réussit")
+        if r["state"] == "uptodate":
+            return "uptodate", "Ta branche est déjà à jour avec %s." % rp.work
         record_commit(u, pid, a["name"], "pull : %s" % rp.work, r.get("sha", ""))
         return "merged", "Pull réussi : %s est fusionnée dans ta branche." % rp.work
+    ex = next((c for c in p.get("conflicts", []) if c["agent"] == aid and c["status"] in OPEN_CONFLICT), None)
+    if ex:                                                  # pas de second enregistrement pour le même conflit
+        return "conflict", describe_conflict(p, ex)
     return "conflict", open_conflict(u, pid, aid, origin, task=task, title=title, body=body)
+
+
+def describe_conflict(p, c):
+    """Explication factuelle d'un conflit ouvert (ce qui bloque, qui doit agir) — jamais d'« environnement » à nettoyer."""
+    res = by_id(p["agents"], c.get("resolver")) or {}
+    suite = {"ouvert": ("une résolution est en cours par %s : attends sa fin" % res["name"]) if res else "il attend la décision de l’utilisateur (onglet Décisions)",
+             "escalade": "il attend la décision de l’utilisateur (onglet Décisions) ou une résolution manuelle",
+             "pause": "il est en pause : l’utilisateur le résout à la main puis le fait revérifier"}.get(c["status"], "")
+    return ("Conflit de fusion n°%s sur %s (statut : %s) : %s. Il n’existe aucun état local ni environnement à nettoyer : tout se règle via l’application ; "
+            "aucune action de ta part n’est possible tant qu’il n’est pas levé." % (c.get("n", "?"), ", ".join(c.get("files", [])) or "des fichiers non détaillés", c["status"], suite))
+
+
+def _close_in(pp, cid, status, why):
+    c = by_id(pp.get("conflicts", []), cid)
+    if not c:
+        return None
+    c.update(status=status, done=now(), note=why)
+    for d in pp.get("decisions", []):
+        if d.get("conflict") == cid and d["status"] == "attente":
+            d.update(status="répondue", answer=why, done=now(), n_done=rights.next_seq(pp))
+    t = by_id(pp["tasks"], c.get("task"))
+    if t and t["status"] == "en attente" and status != "résolu":
+        t["status"] = "à faire"
+    return c
+
+
+def close_conflict(u, pid, cid, status, why):
+    """Clôt un conflit (résolu ou abandonné) et débloque ce qui en dépendait : questions liées, tâche en attente."""
+    return mp(u, pid, lambda pp: _close_in(pp, cid, status, why))
+
+
+def reconcile_conflicts(u, pid, aid=None, force=False, only=None):
+    """Revérifie les conflits actifs : si plus aucun fichier n'est en conflit (résolu à la main, branche mise à jour), ils sont clos
+    et la suite reprend. Retourne les identifiants levés."""
+    p = snap(u, pid)
+    try:
+        rp = github.Repo(p)
+    except Err:
+        return []
+    healed = []
+    for c in p.get("conflicts", []):
+        if c["status"] not in OPEN_CONFLICT or (aid and c["agent"] != aid) or (only and c["id"] != only):
+            continue
+        if not force and time.time() - c.get("checked", 0) < RECONCILE_EVERY:
+            continue
+        mp(u, pid, lambda pp, i=c["id"]: (by_id(pp["conflicts"], i) or {}).__setitem__("checked", time.time()))
+        owner = by_id(p["agents"], c["agent"])
+        if not owner:
+            close_conflict(u, pid, c["id"], "abandonné", "agent supprimé")
+            continue
+        try:
+            if rp.conflict_info(owner["branch"], rp.work):
+                continue                                    # toujours un vrai conflit
+            r = rp.merge_branch(owner["branch"], rp.work, "pull : %s dans %s" % (rp.work, owner["branch"]))
+        except Err:
+            continue                                        # branche introuvable, réseau… : on réessaiera
+        if r["state"] == "conflict":
+            continue                                        # conflit non détaillable : on ne peut rien conclure
+        close_conflict(u, pid, c["id"], "résolu", "levé automatiquement : plus aucun fichier en conflit")
+        healed.append(c["id"])
+        after_conflict(u, pid, c["id"])
+    return healed
+
+
+def conflict_action(u, pid, cid, action):
+    """Actions de l'utilisateur sur un conflit : check (revérifier), resolved (déclarer résolu), retry (relancer la résolution), abandon."""
+    p = snap(u, pid)
+    c = by_id(p.get("conflicts", []), cid)
+    if not c:
+        raise Err(404, "Conflit introuvable")
+    if action == "check":
+        if reconcile_conflicts(u, pid, force=True, only=cid):
+            return
+        return log(u, pid, "Système", "Vous", "Le conflit n°%s est toujours présent sur %s." % (c["n"], ", ".join(c["files"]) or "des fichiers"))
+    if action == "resolved":
+        close_conflict(u, pid, cid, "résolu", "déclaré résolu par l’utilisateur")
+        return after_conflict(u, pid, cid)
+    if action == "abandon":
+        close_conflict(u, pid, cid, "abandonné", "abandonné par l’utilisateur")
+        return log(u, pid, "Système", "Vous", "Conflit n°%s abandonné : l’agent n’est plus bloqué (un nouveau conflit sera signalé au prochain pull s’il persiste)." % c["n"])
+    if action == "retry":
+        owner = by_id(p["agents"], c["agent"])
+        mgr = by_id(p["agents"], p.get("mainId"))
+        rv = pick_resolver(p, owner) or mgr or owner
+        mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).update(status="ouvert", tries=0))
+        return resolve_conflict(u, pid, cid, rv["id"])
+    raise Err(400, "Action inconnue : %s" % action)
+
+
+def agent_reset(u, pid, aid, history=True, notes=False, branch=False, onboard_after=True):
+    """Remet un agent à zéro : conversation, travail en cours, attentes manuelles, conflits, et (option) sa branche ; puis onboarding."""
+    p = snap(u, pid)
+    a = by_id(p["agents"], aid)
+    if not a:
+        raise Err(404, "Agent introuvable")
+    done = []
+    for pe in p.get("pending", []):                         # échanges manuels en attente : annulés
+        w = WAIT.get(pe["id"])
+        if pe["agent"] == aid and w and w["u"] == u:
+            w["ev"].set()
+    rp = None
+    if branch:
+        try:
+            rp = github.Repo(p)
+            if a["branch"] in (rp.base, rp.work):
+                done.append("branche non touchée (c’est la branche de base ou de travail)")
+                rp = None
+        except Err:
+            rp = None
+            done.append("dépôt non configuré : branche non touchée")
+
+    def f(pp):
+        ag = by_id(pp["agents"], aid)
+        ag["work"], ag["state"], ag["seen_seq"] = 0, "actif", 0
+        ag.pop("session", None)
+        if history:
+            ag["history"] = []
+        if notes:
+            ag["notes"] = ""
+        for t in pp["tasks"]:
+            if t.get("who") == aid and (t.get("running") or t["status"] == "en cours"):
+                t.update(running=False, status="à faire", touched=time.time())
+                for k in ("retry_at", "fail", "blocked", "waiting", "retries"):
+                    t.pop(k, None)
+        pp["pending"] = [x for x in pp.get("pending", []) if x["agent"] != aid]
+        for c in pp.get("conflicts", []):
+            if c["agent"] == aid and c["status"] in OPEN_CONFLICT:
+                _close_in(pp, c["id"], "abandonné", "agent réinitialisé")
+        if rp:
+            for m in pp.get("mrs", []):
+                if m.get("by_id") == aid and m.get("status") in ("ouverte", "conflit"):
+                    m["status"], m["note"] = "annulée", "agent réinitialisé"
+    mp(u, pid, f)
+    if rp:
+        try:
+            rp.reset_branch(a["branch"], rp.work)
+            done.append("branche %s remise sur %s" % (a["branch"], rp.work))
+        except Err as e:
+            done.append("branche non réinitialisée (%s)" % e.msg)
+    log(u, pid, "Système", a["name"], "Agent %s réinitialisé (%s)." % (a["name"], ", ".join((["conversation effacée"] if history else []) + (["notes effacées"] if notes else []) + ["travail en cours remis à faire", "attentes et conflits clos"] + done)))
+    if onboard_after:
+        onboard(u, pid, aid)
+
+
+def diagnose(p):
+    """Causes FACTUELLES de blocage, sans IA : [{who, level, text, conflict?}]. level : bloquant | attente | info."""
+    out, t0 = [], time.time()
+    name = lambda i: (by_id(p["agents"], i) or {}).get("name", "—")
+    hm = lambda ts: time.strftime("%H:%M", time.localtime(ts))
+    for c in p.get("conflicts", []):
+        if c["status"] in OPEN_CONFLICT:
+            out.append({"who": name(c["agent"]), "level": "bloquant", "conflict": c["id"], "text": describe_conflict(p, c)})
+    for m in p.get("mrs", []):
+        if m.get("id") and m.get("status") in ("ouverte", "conflit"):
+            out.append({"who": m.get("by", "?"), "level": "attente", "text": "Merge request #%s « %s » : %s." % (m.get("n", "?"), m.get("title", ""), "en attente de validation" if m["status"] == "ouverte" else "en conflit")})
+    for t in p["tasks"]:
+        who = name(t.get("who"))
+        if t.get("retry_at"):
+            out.append({"who": who, "level": "attente", "text": "« %s » : reprise automatique vers %s (tentative %s) — quota ou service momentanément indisponible." % (t["title"], hm(t["retry_at"]), t.get("retries", 1))})
+        if t.get("fail"):
+            out.append({"who": who, "level": "bloquant", "text": "« %s » : échec (%s) — %s" % (t["title"], t["fail"].get("kind", "?"), str(t["fail"].get("msg", ""))[:200])})
+        if t["status"] == "à faire" and t.get("who") and deps_unmet(p, t):
+            out.append({"who": who, "level": "attente", "text": "« %s » attend : %s." % (t["title"], ", ".join(deps_unmet(p, t)))})
+        if t["status"] == "en attente" and t.get("blocked"):
+            d = by_id(p.get("decisions", []), t["blocked"])
+            out.append({"who": who, "level": "attente", "text": "« %s » attend votre décision : %s" % (t["title"], (d or {}).get("question", "")[:200])})
+        if t["status"] == "à vérifier":
+            out.append({"who": who, "level": "attente", "text": "« %s » : %s." % (t["title"], "vérification en cours" if t.get("reviewing") else "en attente de vérification")})
+        if t.get("running") and not (by_id(p["agents"], t.get("who")) or {}).get("work") and t0 - t.get("touched", t0) > STALE_RUNNING:
+            out.append({"who": who, "level": "bloquant", "text": "« %s » : exécution figée (sera réinitialisée automatiquement)." % t["title"]})
+    pend = [d for d in p.get("decisions", []) if d["status"] == "attente"]
+    if pend:
+        out.append({"who": "Vous", "level": "attente", "text": "%d décision(s) vous attendent (onglet Décisions)." % len(pend)})
+    if p.get("pending"):
+        out.append({"who": "Vous", "level": "attente", "text": "%d réponse(s) manuelle(s) de chatbot attendue(s) (bandeau en haut du projet)." % len(p["pending"])})
+    bud = num(p.get("budget"))
+    if bud and (p.get("usage") or {}).get("cost", 0) >= bud:
+        out.append({"who": "Projet", "level": "bloquant", "text": "Plafond de budget atteint : les agents en mode API sont en pause (onglet Coût)."})
+    for key, label in (("autopilot", "lancement automatique des tâches"), ("supervision", "suivi automatique")):
+        if p.get(key) == "off":
+            out.append({"who": "Projet", "level": "info", "text": "Le %s est désactivé." % label})
+    return out or [{"who": "Projet", "level": "info", "text": "Aucun blocage détecté."}]
+
+
+def blockers_text(p):
+    return "Blocages actuels (faits) :\n" + "\n".join("- [%s] %s : %s" % (i["level"], i["who"], i["text"]) for i in diagnose(p))
 
 
 def pick_resolver(p, owner):
@@ -1423,7 +1637,10 @@ def submit_mr(u, pid, aid, title="", body="", task=""):
     if a["branch"] in (rp.base, rp.work):
         return "skip", "Ta branche ne peut pas être la branche de base ou la branche de travail."
     if open_conflict_for(p, aid):
-        return "skip", "Un conflit de fusion est déjà en cours de résolution sur ta branche."
+        reconcile_conflicts(u, pid, aid, force=True)
+        p = snap(u, pid)
+        if open_conflict_for(p, aid):
+            return "skip", describe_conflict(p, next(c for c in p["conflicts"] if c["agent"] == aid and c["status"] in OPEN_CONFLICT))
     ex = next((m for m in p.get("mrs", []) if m.get("id") and m.get("from") == a["branch"] and m.get("status") in ("ouverte", "conflit")), None)
     if ex:
         return "exists", "Une merge request est déjà ouverte (#%s) : elle sera validée." % ex["n"]
@@ -1594,6 +1811,8 @@ def start(u, j):
             "sync": lambda: sync_all(u, pid),
             "release": lambda: release(u, pid, str(j.get("version", "")), str(j.get("notes", ""))),
             "reset_usage": lambda: reset_usage(u, pid),
+            "conflict_action": lambda: conflict_action(u, pid, j.get("conflictId"), str(j.get("action", ""))),
+            "agent_reset": lambda: agent_reset(u, pid, j.get("agentId"), bool(j.get("history", True)), bool(j.get("notes", False)), bool(j.get("branch", False)), bool(j.get("onboard", True))),
             "cycle_start": lambda: cycle_start(u, pid, str(j.get("version", ""))),
             "mr_retry": lambda: mr_retry(u, pid, j.get("mrId")),
             "decide": lambda: decide(u, pid, j.get("decisionId"), str(j.get("decision", "")), str(j.get("note", "")), j.get("fields") or {}, str(j.get("answer", ""))),

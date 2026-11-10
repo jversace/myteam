@@ -984,7 +984,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(p["decisions"]), 1)
         with mock.patch.object(engine, "call_ai", lambda *a: self.fail("pas d'appel IA")):
             engine.run_task("u", "p1", "t1")                                                       # relancée à la main : toujours refusée
-        self.assertIn("conflit de fusion est en cours", self.logs())
+        self.assertIn("aucun état local", self.logs())
 
     def test_fusion_avec_resolution_conserve_les_autres_changements(self):
         self.start()
@@ -1191,6 +1191,128 @@ class Integration(unittest.TestCase):
         engine.do_act("u", "p1", "a1", {"do": "task", "title": "Nouvelle", "assignee": "Carol"}, 0)
         self.assertIn("tick", [s[0] for s in self.spawned])                                            # lancée sans attendre le prochain passage
 
+    # -- déblocage : conflits obsolètes, actions de l'utilisateur, réinitialisation d'un agent, diagnostic
+    def stuck_conflict(self):
+        self.conflict_setup()
+        engine.submit_mr("u", "p1", "a2", "Login", "", "t1")                                       # conflit réel + question à l'utilisateur
+        return proj()["conflicts"][0]
+
+    def fix_outside(self):
+        github.Repo(proj()).merge_with_resolution("agent/bob", "release/v1.0.0", {"app.py": "résolu à la main"}, "fix")
+
+    def test_conflit_obsolete_leve_automatiquement(self):
+        c = self.stuck_conflict()
+        self.assertTrue(engine.open_conflict_for(proj(), "a2"))
+        self.assertEqual(engine.reconcile_conflicts("u", "p1", force=True), [])                    # toujours un vrai conflit : on n'y touche pas
+        self.fix_outside()                                                                         # résolu à la main sur GitHub
+        self.assertEqual(engine.reconcile_conflicts("u", "p1", force=True), [c["id"]])
+        p = proj()
+        self.assertEqual((p["conflicts"][0]["status"], p["decisions"][0]["status"]), ("résolu", "répondue"))   # conflit ET question closes
+        self.assertFalse(engine.open_conflict_for(p, "a2"))
+        self.assertEqual(p["mrs"][0]["status"], "ouverte")                                         # la merge request reprend toute seule
+
+    def test_tache_debloquee_quand_le_conflit_est_leve(self):
+        self.stuck_conflict()
+        self.set_task_status("t1", "à faire")
+        self.fix_outside()
+        with mock.patch.object(engine, "call_ai", lambda *a: "Livrable."):
+            engine.run_task("u", "p1", "t1")                                                       # plus besoin d'attendre ni de relancer à la main
+        self.assertEqual((proj()["conflicts"][0]["status"], proj()["tasks"][0]["status"]), ("résolu", "à vérifier"))
+
+    def test_message_de_blocage_explicite_sans_doublon(self):
+        self.stuck_conflict()
+        st, msg = engine.submit_mr("u", "p1", "a2", "Login")
+        self.assertEqual(st, "skip")
+        for attendu in ("Conflit de fusion n°", "app.py", "onglet Décisions", "aucun état local"):
+            self.assertIn(attendu, msg)
+        self.assertEqual(engine.pull("u", "p1", "a2")[0], "conflict")
+        self.assertEqual(len(proj()["conflicts"]), 1)                                              # pas de second enregistrement
+
+    def test_utilisateur_abandonne_un_conflit(self):
+        c = self.stuck_conflict()
+        self.set_task_status("t1", "en attente")
+        engine.conflict_action("u", "p1", c["id"], "abandon")
+        p = proj()
+        self.assertEqual((p["conflicts"][0]["status"], p["decisions"][0]["status"], p["tasks"][0]["status"]), ("abandonné", "répondue", "à faire"))
+        self.assertFalse(engine.open_conflict_for(p, "a2"))                                        # l'agent n'est plus bloqué
+
+    def test_utilisateur_declare_un_conflit_resolu(self):
+        c = self.stuck_conflict()
+        engine.conflict_action("u", "p1", c["id"], "resolved")
+        self.assertEqual(proj()["conflicts"][0]["status"], "résolu")
+        self.assertEqual(proj()["conflicts"][1]["status"], "ouvert")                               # s'il persiste vraiment, il est signalé de nouveau
+
+    def test_utilisateur_revérifie_un_conflit(self):
+        c = self.stuck_conflict()
+        engine.conflict_action("u", "p1", c["id"], "check")
+        self.assertIn("toujours présent", self.logs())
+        self.assertEqual(proj()["conflicts"][0]["status"], "ouvert")
+
+    def test_utilisateur_relance_la_resolution(self):
+        self.set(conflict_policy="author")
+        self.conflict_setup()
+        engine.submit_mr("u", "p1", "a2", "Login", "", "t1")
+        c = proj()["conflicts"][0]
+        with mock.patch.object(engine, "call_ai", self.resolver("Bob")):
+            engine.conflict_action("u", "p1", c["id"], "retry")
+        self.assertEqual((proj()["conflicts"][0]["status"], BR["agent/bob"]["app.py"]), ("résolu", "version Bob + release"))
+
+    def test_reinitialiser_un_agent(self):
+        self.stuck_conflict()
+        st = store.load("u"); pr = st["projects"][0]
+        pr["agents"][1].update(history=[{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}], notes="n", work=2, state="suspendu")
+        pr["tasks"][0].update(running=True, status="en cours", retry_at=1, retries=3)
+        pr["pending"] = [{"id": "px", "agent": "a2", "name": "Bob", "service": "S", "full": "f", "short": "s", "new": True, "d": ""}]
+        pr["mrs"] = [{"id": "m9", "n": 9, "from": "agent/bob", "to": "release/v1.0.0", "by": "Bob", "by_id": "a2", "status": "ouverte", "task": "t1"}]
+        store.wj(store.state_path("u"), st)
+        ev = threading.Event()
+        engine.WAIT["px"] = {"u": "u", "ev": ev, "text": None}
+        engine.agent_reset("u", "p1", "a2", history=True, notes=True, branch=True, onboard_after=True)
+        p = proj(); bob = p["agents"][1]; t = p["tasks"][0]
+        self.assertEqual((bob["history"], bob["notes"], bob["work"], bob["state"]), ([], "", 0, "actif"))
+        self.assertEqual((t["status"], t["running"], "retry_at" in t, p["pending"], ev.is_set()), ("à faire", False, False, [], True))   # attente manuelle annulée
+        self.assertEqual(([c["status"] for c in p["conflicts"]], p["decisions"][0]["status"], p["mrs"][0]["status"]), (["abandonné"], "répondue", "annulée"))
+        self.assertEqual(set(BR["agent/bob"]) - {".agents/Bob.md"}, set(BR["release/v1.0.0"]))     # branche remise sur la branche de travail + contexte rejoué
+        self.assertEqual(BR["agent/bob"]["app.py"], "version release")                            # les commits de l'agent sont écartés
+        self.assertIn("réinitialisé", self.logs())
+
+    def test_reinitialiser_sans_toucher_a_la_branche(self):
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        st = store.load("u"); st["projects"][0]["agents"][1]["history"] = [{"role": "user", "content": "x"}]; store.wj(store.state_path("u"), st)
+        engine.agent_reset("u", "p1", "a2", history=True, notes=False, branch=False, onboard_after=False)
+        self.assertEqual(proj()["agents"][1]["history"], [])
+        self.assertEqual(BR["agent/bob"]["api.py"], "print(1)")                                    # le travail versionné est conservé
+
+    def test_diagnostic_factuel(self):
+        self.stuck_conflict()
+        texts = " ¦ ".join(i["text"] for i in engine.diagnose(proj()))
+        for attendu in ("Conflit de fusion n°", "« Suite » attend : Login", "décision(s) vous attendent"):
+            self.assertIn(attendu, texts)
+        self.assertTrue(any(i.get("conflict") for i in engine.diagnose(proj())))
+        _, back = engine.do_act("u", "p1", "a2", {"do": "get_blockers"}, 0)                      # les agents voient les mêmes faits
+        self.assertTrue("Blocages actuels" in back and "Conflit de fusion" in back)
+
+    def test_diagnostic_tolere_un_etat_incomplet(self):
+        pr = {"agents": [{"id": "a", "name": "Bob"}], "tasks": [{"id": "t", "title": "X", "who": "a", "status": "à faire", "fail": {}}], "mrs": [{"id": "m", "status": "ouverte"}],
+              "conflicts": [{"id": "c", "agent": "a", "status": "pause"}]}
+        texts = " ¦ ".join(i["text"] for i in engine.diagnose(pr))
+        self.assertTrue("Conflit de fusion n°?" in texts and "Merge request #?" in texts)               # aucun plantage, même sans numéro ni détails
+
+    def test_consigne_contre_les_causes_inventees(self):
+        regles = "\n".join(engine.RULES)
+        self.assertTrue("MERGE_HEAD" in regles and "n’invente pas de cause" in regles and "get_blockers" in regles)
+        self.assertIn("get_blockers", engine.sys_prompt(proj(), proj()["agents"][1]))
+
+    def test_classer_une_question_sans_objet(self):
+        self.set_task("t1", status="en cours")
+        engine.do_act("u", "p1", "a2", {"do": "ask_user", "question": "Peux-tu nettoyer mon environnement ?", "options": ["Oui", "Non"], "task": "t1"}, 0)
+        d = proj()["decisions"][0]
+        self.assertEqual(proj()["tasks"][0]["status"], "en attente")
+        engine.decide("u", "p1", d["id"], "dismiss", note="sans objet")
+        p = proj()
+        self.assertEqual((p["decisions"][0]["status"], p["tasks"][0]["status"], "blocked" in p["tasks"][0]), ("ignorée", "à faire", False))
+
     # -- release finale
     def test_publier_la_release(self):
         engine.release("u", "p1", "v1.0.0", "notes")
@@ -1247,6 +1369,17 @@ class Http(unittest.TestCase):
         self.assertEqual([(x["id"], x["title"]) for x in r2["state"]["projects"][0]["tasks"]], [("t1", "b"), ("t2", "agent")])
         self.assertEqual(self.call("GET", "/api/state?ser=%d" % r2["ser"], tok=t), {"same": True})
         self.assertEqual(self.call("GET", "/api/state")["_code"], 401)
+
+    def test_diagnostic_http(self):
+        self.call("POST", "/api/register", {"user": "h3", "password": "x"})
+        tk = self.call("POST", "/api/login", {"user": "h3", "password": "x"})["token"]
+        r0 = self.call("GET", "/api/state", tok=tk)
+        self.call("PUT", "/api/state", {"rev": r0["rev"], "state": {"projects": [{"id": "p", "name": "P", "agents": [{"id": "a", "name": "Bob"}], "tasks": [], "mrs": [], "decisions": [],
+                  "conflicts": [{"id": "c", "n": 1, "agent": "a", "files": ["x.py"], "status": "pause"}]}]}}, tk)
+        r = self.call("GET", "/api/diagnostic?project=p", tok=tk)
+        self.assertTrue(r["items"][0]["level"] == "bloquant" and r["items"][0]["conflict"] == "c" and "x.py" in r["items"][0]["text"])
+        self.assertEqual(self.call("GET", "/api/diagnostic?project=zzz", tok=tk)["_code"], 404)
+        self.assertEqual(self.call("GET", "/api/diagnostic?project=p")["_code"], 401)
 
     def test_test_de_cle(self):
         import server

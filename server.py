@@ -79,6 +79,13 @@ class H(BaseHTTPRequestHandler):
                 return self.out(200, {"same": True})
             rev, ser, st = store.get(u)
             return self.out(200, {"rev": rev, "ser": ser, "state": st})
+        if p == "/api/diagnostic":
+            u, _ = self.auth()
+            pid = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("project", [""])[0]
+            pr = next((x for x in store.load(u).get("projects", []) if x.get("id") == pid), None)
+            if not pr:
+                raise Err(404, "Projet introuvable")
+            return self.out(200, {"items": engine.diagnose(pr)})
         if p.startswith("/api/"):
             raise Err(404, "Route inconnue")
         f = (STATIC / ("index.html" if p == "/" else p.lstrip("/"))).resolve()

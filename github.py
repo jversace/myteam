@@ -84,6 +84,16 @@ class Repo:
         self._c("POST", "/git/refs", {"ref": "refs/heads/" + b, "sha": src})
         return True
 
+    def reset_branch(self, b, source):
+        """Remet la branche b exactement sur le commit de `source` (écrase son contenu) ; la crée si elle n'existe pas."""
+        src = self.sha(source)
+        if not src:
+            raise Err(404, "Branche source « %s » introuvable" % source)
+        if self.sha(b):
+            self._c("PATCH", "/git/refs/heads/" + q(b), {"sha": src, "force": True})
+        else:
+            self._c("POST", "/git/refs", {"ref": "refs/heads/" + b, "sha": src})
+
     # ---- fichiers
     def contents(self, b, path):
         return self._c("GET", "/contents/%s?ref=%s" % (q(path), q(b)), ok404=True)
