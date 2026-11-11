@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+from datetime import datetime
 import os
 import re
 import sys
@@ -229,6 +230,7 @@ os.environ["APM_GITHUB_API"] = "http://127.0.0.1:%d" % srv.server_port
 os.environ["APM_DATA"] = tempfile.mkdtemp()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ai, engine, github, store  # noqa: E402
+import project_rules as prules  # noqa: E402
 from ai import Reply  # noqa: E402
 from store import Err  # noqa: E402
 
@@ -1331,6 +1333,367 @@ class Integration(unittest.TestCase):
         self.assertEqual([r["tag_name"] for r in REL], ["v1.0.0"])
         self.assertTrue("cycle" not in p and p["releases"][0]["v"] == "v1.0.0" and not p["releasing"])
         self.assertEqual(p["mrs"][-1]["status"], "fusionnée")
+
+
+class Regles(unittest.TestCase):
+    """Règles du projet : communication aux agents, workflows (déclencheurs, étapes, échecs), minuteries, cohérence."""
+    def setUp(self):
+        reset()
+        st = make_state()
+        pr = st["projects"][0]
+        pr["agents"].append({"id": "a3", "name": "Carol", "service": "s1", "role": "r3", "branch": "agent/carol", "canBug": False, "talk": [], "history": [], "notes": ""})
+        pr["tasks"] = [{"id": "t1", "parent": "", "title": "Login", "desc": "", "who": "a2", "status": "en cours", "modules": [], "by": ""}]
+        store.wj(store.state_path("u"), st)
+        self.spawned = []
+        self.sp = mock.patch.object(engine, "spawn", lambda fn, *a, **k: self.spawned.append((fn.__name__, a, k)))
+        self.sp.start()
+        engine.TIMERS.clear()
+        self.n = 0
+
+    def tearDown(self):
+        self.sp.stop()
+
+    # -- aides
+    def set(self, **kw):
+        st = store.load("u"); st["projects"][0].update(kw); store.wj(store.state_path("u"), st)
+
+    def set_agent(self, idx, **kw):
+        st = store.load("u"); st["projects"][0]["agents"][idx].update(kw); store.wj(store.state_path("u"), st)
+
+    def step(self, who="principal", text="Fais-le", kind="ask", on_ko="stop", **kw):
+        self.n += 1
+        return dict({"id": "s%d" % self.n, "kind": kind, "who": who, "text": text, "on_ko": on_ko}, **kw)
+
+    def add_wf(self, name="Validation", steps=None, **kw):
+        st = store.load("u"); pr = st["projects"][0]
+        w = {"id": "w%d" % (len(pr.get("workflows", [])) + 1), "name": name, "desc": "", "enabled": True, "allow_agent": True, "schedule": {"mode": "off"}, "steps": steps or []}
+        w.update(kw)
+        pr.setdefault("workflows", []).append(w)
+        store.wj(store.state_path("u"), st)
+        return w["id"]
+
+    def logs(self):
+        return " ¦ ".join(m["text"] for m in proj()["log"])
+
+    def run_wf(self, wfid, ai, **kw):
+        """Démarre un workflow et le déroule avec une IA scriptée ; retourne le déroulement."""
+        with mock.patch.object(engine, "call_ai", ai):
+            rid = engine.workflow_start("u", "p1", wfid, "utilisateur", **kw)
+            engine.wf_continue("u", "p1", rid)
+        return next(r for r in proj()["wf_runs"] if r["id"] == rid)
+
+    @staticmethod
+    def verdicts(*outs):
+        """IA qui conclut chaque étape avec les issues données, dans l'ordre (la dernière se répète)."""
+        calls = []
+
+        def f(s, system, msgs):
+            calls.append(msgs[-1]["content"])
+            o = outs[min(len(calls) - 1, len(outs) - 1)]
+            return 'Étape traitée.\n```action\n{"do":"wf_step","outcome":"%s","comment":"commentaire %d"}\n```' % (o, len(calls))
+        f.calls = calls
+        return f
+
+    # -- communication des modifications
+    def test_modification_communiquee_aux_agents_concernes(self):
+        self.set(rules="Toujours écrire des tests.")
+        self.set_agent(1, rules="Réponds toujours en JSON.")
+        entries = engine.rules_changed("u", "p1")
+        self.assertEqual([e["scope"] for e in entries], ["global", "agent:a2"])
+        for nom in ("Alice", "Bob", "Carol"):                                                      # règle globale : tous
+            self.assertRegex(self.logs(), "Règles mises à jour : Les règles globales ont été modifiées")
+        bob_log = [m["text"] for m in proj()["log"] if m["to"] == "Bob" and "Règles mises à jour" in m["text"]][0]
+        carol_log = [m["text"] for m in proj()["log"] if m["to"] == "Carol" and "Règles mises à jour" in m["text"]][0]
+        self.assertIn("Tes règles spécifiques", bob_log)
+        self.assertNotIn("Tes règles spécifiques", carol_log)                                       # règle d'un agent : lui seul
+        bob, carol = proj()["agents"][1], proj()["agents"][2]
+        pb, pc = engine.sys_prompt(proj(), bob), engine.sys_prompt(proj(), carol)
+        self.assertTrue("Règles spécifiques à toi (Bob)" in pb and "Réponds toujours en JSON." in pb and "Toujours écrire des tests." in pb)
+        self.assertNotIn("Réponds toujours en JSON.", pc)
+        self.assertIn("Nouveautés depuis ta dernière activité", pb)
+        self.assertTrue("Tes règles spécifiques ont été modifiées" in pb and "Tes règles spécifiques" not in pc)   # nouveautés ciblées
+        self.assertIn("Les règles globales ont été modifiées", pc)
+        self.assertIn("Réponds toujours en JSON.", BR["agent/bob"][".agents/Bob.md"])               # fichier de contexte de l'agent
+        self.assertNotIn("Réponds toujours en JSON.", BR["agent/carol"][".agents/Carol.md"])
+        self.assertIn("Toujours écrire des tests.", BR["agent/carol"][".agents/Carol.md"])
+        self.assertIn("rules_analysis", [s[0] for s in self.spawned])                               # contrôle de cohérence relancé
+        with mock.patch.object(engine, "call_ai", lambda *a: "ok"):
+            engine.ask("u", "p1", "a2", "salut", "Vous")
+        self.assertNotIn("Nouveautés depuis", engine.sys_prompt(proj(), proj()["agents"][1]))      # vues : plus signalées
+
+    def test_pas_de_communication_sans_changement(self):
+        self.set(rules="R1")
+        engine.rules_changed("u", "p1")
+        n = len(proj()["log"])
+        self.spawned.clear()
+        self.assertEqual(engine.rules_changed("u", "p1"), [])
+        self.assertEqual((len(proj()["log"]), self.spawned), (n, []))
+
+    def test_workflows_communiques(self):
+        engine.rules_changed("u", "p1")
+        self.add_wf("Validation", [self.step()])
+        entries = engine.rules_changed("u", "p1")
+        self.assertEqual([e["text"] for e in entries], ["Workflow « Validation » créé."])
+        prompt = engine.sys_prompt(proj(), proj()["agents"][1])
+        self.assertTrue("« Validation »" in prompt and "run_workflow" in prompt and "Workflow « Validation » créé." in prompt)
+        st = store.load("u"); st["projects"][0]["workflows"][0]["steps"][0]["text"] = "Autre consigne"; store.wj(store.state_path("u"), st)
+        self.assertEqual([e["text"] for e in engine.rules_changed("u", "p1")], ["Workflow « Validation » modifié."])
+        st = store.load("u"); st["projects"][0]["workflows"] = []; store.wj(store.state_path("u"), st)
+        self.assertEqual([e["text"] for e in engine.rules_changed("u", "p1")], ["Workflow « Validation » supprimé."])
+        self.add_wf("Caché", [self.step()], enabled=False)
+        self.assertNotIn("Caché", engine.sys_prompt(proj(), proj()["agents"][1]))                  # un workflow désactivé n'est pas proposé
+
+    # -- exécution des workflows
+    def test_workflow_lance_par_l_utilisateur(self):
+        w = self.add_wf("Validation", [self.step("principal", "Vérifie le travail"), self.step("role:r2", "Corrige si besoin")])
+        ai = self.verdicts("ok")
+        run = self.run_wf(w, ai, task="t1", note="urgent")
+        self.assertEqual((run["status"], [r["outcome"] for r in run["results"]], run["results"][0]["comment"]), ("terminé", ["ok", "ok"], "commentaire 1"))
+        self.assertTrue("« Validation » — étape 1/2" in ai.calls[0] and "Vérifie le travail" in ai.calls[0] and "Login" in ai.calls[0] and "urgent" in ai.calls[0])
+        self.assertIn("Résultats des étapes précédentes", ai.calls[1])                              # l'étape 2 connaît le résultat de l'étape 1
+        self.assertIn("wf_step", ai.calls[1])
+        self.assertNotIn("wf_ctx", proj()["agents"][0])
+
+    def test_echec_arret(self):
+        w = self.add_wf("W", [self.step(on_ko="stop"), self.step()])
+        ai = self.verdicts("ko")
+        run = self.run_wf(w, ai)
+        self.assertEqual((run["status"], len(ai.calls)), ("arrêté", 1))
+        self.assertIn("étape 1 en échec", run["note"])
+
+    def test_echec_continue(self):
+        run = self.run_wf(self.add_wf("W", [self.step(on_ko="continue"), self.step()]), self.verdicts("ko", "ok"))
+        self.assertEqual((run["status"], [r["outcome"] for r in run["results"]]), ("terminé", ["ko", "ok"]))
+
+    def test_echec_saut_vers_une_etape(self):
+        ai = self.verdicts("ko", "ok")
+        run = self.run_wf(self.add_wf("W", [self.step(on_ko="goto", goto=3), self.step(text="ignorée"), self.step(text="finale")]), ai)
+        self.assertEqual((run["status"], [r["i"] for r in run["results"]]), ("terminé", [1, 3]))
+        self.assertFalse(any("ignorée" in c for c in ai.calls))
+
+    def test_echec_question_a_l_utilisateur(self):
+        w = self.add_wf("W", [self.step(on_ko="ask_user"), self.step(text="suite")])
+        ai = self.verdicts("ko", "ok")
+        run = self.run_wf(w, ai)
+        d = proj()["decisions"][0]
+        self.assertEqual((run["status"], run["waiting"], d["wf_run"], d["options"]), ("en cours", d["id"], run["id"], ["Continuer malgré l’échec", "Relancer cette étape", "Arrêter le workflow"]))
+        engine.wf_continue("u", "p1", run["id"])                                                    # en pause : rien ne bouge tant que l'utilisateur n'a pas répondu
+        self.assertEqual(len(ai.calls), 1)
+        with mock.patch.object(engine, "call_ai", ai):
+            engine.decide("u", "p1", d["id"], "answer", answer="Relancer cette étape")             # l'étape est rejouée (cette fois : ok), puis la suite
+        run = proj()["wf_runs"][0]
+        self.assertEqual((run["status"], len(ai.calls), [r["outcome"] for r in run["results"]]), ("terminé", 3, ["ko", "ok", "ok"]))
+
+    def test_echec_reponses_continuer_ou_arreter(self):
+        for reponse, statut, nb in (("Continuer malgré l’échec", "terminé", 2), ("Arrêter le workflow", "arrêté", 1)):
+            st = store.load("u"); st["projects"][0].update(workflows=[], wf_runs=[], decisions=[]); store.wj(store.state_path("u"), st)
+            w = self.add_wf("W" + reponse[:3], [self.step(on_ko="ask_user"), self.step(text="suite")])
+            ai = self.verdicts("ko", "ok")
+            run = self.run_wf(w, ai)
+            with mock.patch.object(engine, "call_ai", ai):
+                engine.decide("u", "p1", proj()["decisions"][-1]["id"], "answer", answer=reponse)
+            self.assertEqual((proj()["wf_runs"][-1]["status"], len(ai.calls)), (statut, nb))
+
+    def test_etape_question_a_l_utilisateur(self):
+        w = self.add_wf("Contrôle", [self.step(kind="ask_user", text="Valides-tu le périmètre ?"), self.step(text="suite")])
+        ai = self.verdicts("ok")
+        run = self.run_wf(w, ai)
+        d = proj()["decisions"][0]
+        self.assertTrue("Valides-tu le périmètre ?" in d["question"] and d["options"] == ["Continuer", "Arrêter le workflow"] and len(ai.calls) == 0)
+        with mock.patch.object(engine, "call_ai", ai):
+            engine.decide("u", "p1", d["id"], "answer", answer="Oui, avec la réserve X")           # une réponse libre vaut « continuer »
+        run = proj()["wf_runs"][0]
+        self.assertEqual((run["status"], run["results"][0]["comment"], len(ai.calls)), ("terminé", "Oui, avec la réserve X", 1))
+
+    def test_etape_sans_verdict_reclamee_puis_acceptee(self):
+        calls = []
+
+        def muet(s, system, msgs):
+            calls.append(msgs[-1]["content"])
+            return "Fait, rien d'autre."
+        run = self.run_wf(self.add_wf("W", [self.step()]), muet)
+        self.assertEqual((len(calls), run["status"], run["results"][0]["comment"]), (2, "terminé", "sans verdict explicite de l’agent"))
+        self.assertIn("Conclus l’étape avec l’action wf_step", calls[1])
+
+    def test_etape_demarrer_les_taches(self):
+        self.set(autopilot="off")
+        self.set_task_status = None
+        st = store.load("u"); st["projects"][0]["tasks"][0]["status"] = "à faire"; store.wj(store.state_path("u"), st)
+        run = self.run_wf(self.add_wf("Matin", [self.step(kind="start_tasks")]), lambda *a: self.fail("aucun appel IA pour cette étape"))
+        self.assertEqual((run["status"], run["results"][0]["comment"]), ("terminé", "1 tâche(s) démarrée(s)"))
+        self.assertIn("run_task", [s[0] for s in self.spawned])                                    # démarrage forcé, même avec le lancement automatique désactivé
+
+    def test_etape_sans_agent_ou_sans_tache(self):
+        run = self.run_wf(self.add_wf("W1", [self.step(who="assignee")]), self.verdicts("ok"))     # « agent assigné » sans tâche cible
+        self.assertEqual((run["status"], run["results"][0]["outcome"]), ("arrêté", "ko"))
+        self.assertIn("aucune tâche cible", run["results"][0]["comment"])
+        run = self.run_wf(self.add_wf("W2", [self.step(who="agent:zzz")]), self.verdicts("ok"))
+        self.assertIn("agent introuvable", run["results"][0]["comment"])
+
+    def test_workflow_declenche_par_un_agent(self):
+        w = self.add_wf("Validation", [self.step()])
+        do = lambda aid, **x: engine.do_act("u", "p1", aid, x, 0)
+        note, back = do("a2", do="run_workflow", workflow="validation", task="t1", note="fini")    # insensible à la casse
+        self.assertIn("déclenché", note)
+        self.assertEqual(self.spawned[-1][0], "wf_continue")
+        run = proj()["wf_runs"][0]
+        self.assertEqual((run["trigger"], run["requester"], run["task"], run["note"]), ("agent Bob", "a2", "t1", "fini"))
+        self.assertIn("déjà en cours", do("a2", do="run_workflow", workflow="Validation", task="t1")[1])   # pas de doublon sur la même tâche
+        self.assertIn("introuvable", do("a2", do="run_workflow", workflow="Inconnu")[1])
+        st = store.load("u"); st["projects"][0]["workflows"][0]["allow_agent"] = False; store.wj(store.state_path("u"), st)
+        self.assertIn("ne peut pas être déclenché par un agent", do("a3", do="run_workflow", workflow="Validation")[1])
+
+    def test_limite_de_declenchements_par_heure(self):
+        w = self.add_wf("W", [self.step()])
+        for _ in range(prules.WF_MAX_PER_HOUR):
+            engine._wf_end("u", "p1", engine.workflow_start("u", "p1", w, "utilisateur"), "terminé", "")
+        with self.assertRaises(Err) as c:
+            engine.workflow_start("u", "p1", w, "utilisateur")
+        self.assertEqual(c.exception.code, 429)
+
+    def test_workflow_supprime_pendant_l_execution_et_reprise(self):
+        w = self.add_wf("W", [self.step(), self.step(text="suite")])
+
+        def quota(*a):
+            raise Err(429, "quota", 5)
+        run = self.run_wf(w, quota)
+        self.assertEqual((run["status"], run["step"]), ("échoué", 0))
+        self.assertIn("étape 1", run["note"])
+        with mock.patch.object(engine, "call_ai", self.verdicts("ok")):
+            engine.wf_resume("u", "p1", run["id"])                                                  # « Reprendre » : repart de l'étape en échec
+        self.assertEqual(proj()["wf_runs"][0]["status"], "terminé")
+        st = store.load("u"); st["projects"][0]["workflows"] = []; store.wj(store.state_path("u"), st)
+        rid = proj()["wf_runs"][0]["id"]
+        self.assertIsNone(engine.wf_resume("u", "p1", rid))                                         # un déroulement terminé ne se reprend pas
+
+    def test_arret_par_l_utilisateur(self):
+        w = self.add_wf("W", [self.step(kind="ask_user", text="Continuer ?")])
+        self.run_wf(w, self.verdicts("ok"))
+        rid = proj()["wf_runs"][0]["id"]
+        engine._wf_end("u", "p1", rid, "arrêté", "arrêté par l’utilisateur")
+        self.assertEqual(proj()["wf_runs"][0]["status"], "arrêté")
+
+    def test_boucle_limitee(self):
+        w = self.add_wf("Boucle", [self.step(on_ko="goto", goto=1)])
+        run = self.run_wf(w, self.verdicts("ko"))
+        self.assertEqual(run["status"], "arrêté")
+        self.assertIn("limite de %d étapes" % prules.WF_MAX_STEPS, run["note"])
+
+    # -- minuteries
+    def test_minuterie_quotidienne(self):
+        w = {"enabled": True, "schedule": {"mode": "daily", "time": "08:00"}}
+        lun = lambda h, m: datetime(2026, 11, 9, h, m)                                              # un lundi
+        self.assertEqual(prules.due(w, {}, lun(7, 59)), (False, None))                             # pas encore
+        self.assertEqual(prules.due(w, {}, lun(8, 1))[0], True)
+        self.assertEqual(prules.due(w, {"last_day": "2026-11-09"}, lun(9, 0)), (False, None))     # déjà fait aujourd'hui
+        self.assertEqual(prules.due(w, {}, lun(15, 0)), (False, {"last_day": "2026-11-09"}))       # serveur arrêté : trop tard, on saute
+        self.assertEqual(prules.due(dict(w, schedule={"mode": "daily", "time": "08:00", "days": [1, 2]}), {}, lun(8, 1)), (False, None))   # lundi exclu
+        self.assertEqual(prules.due(dict(w, enabled=False), {}, lun(8, 1)), (False, None))
+
+    def test_minuterie_par_intervalle(self):
+        w = {"enabled": True, "schedule": {"mode": "interval", "every": 30}}
+        t0 = datetime(2026, 11, 9, 10, 0)
+        due, st = prules.due(w, {}, t0)
+        self.assertEqual(due, False)                                                                # 1re observation : le compte à rebours démarre
+        self.assertEqual(prules.due(w, st, datetime(2026, 11, 9, 10, 29))[0], False)
+        self.assertEqual(prules.due(w, st, datetime(2026, 11, 9, 10, 30))[0], True)
+
+    def test_minuterie_declenche_le_workflow_une_fois_par_jour(self):
+        self.add_wf("Matin", [self.step(kind="start_tasks")], schedule={"mode": "daily", "time": "08:00"})
+
+        class Horloge:
+            @staticmethod
+            def now():
+                return datetime(2026, 11, 9, 8, 5)
+        with mock.patch.object(engine, "datetime", Horloge):
+            engine.wf_timers("u", "p1")
+            engine.wf_timers("u", "p1")                                                             # 2e passage du suivi : pas de doublon
+        runs = proj()["wf_runs"]
+        self.assertEqual((len(runs), runs[0]["trigger"]), (1, "minuterie"))
+        self.assertEqual(proj()["wf_state"]["w1"]["last_day"], "2026-11-09")
+        self.assertEqual([s[0] for s in self.spawned if s[0] == "wf_continue"], ["wf_continue"])
+
+    def test_minuteries_independantes_du_suivi(self):
+        self.set(supervision="off")
+        self.add_wf("Matin", [self.step(kind="start_tasks")], schedule={"mode": "daily", "time": "00:00"})
+
+        class Horloge:
+            @staticmethod
+            def now():
+                return datetime(2026, 11, 9, 0, 30)
+        with mock.patch.object(engine, "datetime", Horloge):
+            engine.tick("u", "p1")
+        self.assertEqual(len(proj()["wf_runs"]), 1)                                                 # le suivi est désactivé, la minuterie fonctionne
+
+    # -- cohérence
+    def test_controle_de_coherence(self):
+        p = {"mainId": "", "autopilot": "on", "rules": "",
+             "agents": [{"id": "a", "name": "Bob", "role": "r", "mode": "manual"}], "roles": [{"id": "r", "name": "Dev"}], "tasks": [],
+             "conflict_policy": "agent:zzz",
+             "workflows": [
+                 {"id": "1", "name": "", "steps": []},
+                 {"id": "2", "name": "Doublon", "steps": [{"id": "x", "kind": "ask", "who": "principal", "text": "a"}]},
+                 {"id": "3", "name": "doublon", "schedule": {"mode": "daily", "time": "25:99"}, "steps": [
+                     {"id": "y", "kind": "ask", "who": "assignee", "text": ""},
+                     {"id": "z", "kind": "ask", "who": "agent:a", "text": "t", "on_ko": "goto", "goto": 9},
+                     {"id": "w", "kind": "ask", "who": "role:inconnu", "text": "t", "on_ko": "goto", "goto": 1},
+                     {"id": "v", "kind": "start_tasks"}]},
+                 {"id": "4", "name": "Court", "enabled": False, "schedule": {"mode": "interval", "every": 2}, "steps": [{"id": "u", "kind": "ask_user", "text": "ok ?", "on_ko": "ask_user"}]}]}
+        out = prules.lint(p)
+        texts = " ¦ ".join("%s|%s|%s" % (i["level"], i["where"], i["text"]) for i in out)
+        for attendu in ("n’a pas de nom", "Aucune étape définie", "même nom", "Heure de déclenchement invalide", "Instruction vide", "aucun agent principal n’est défini",
+                        "minuterie, qui ne fournit aucune tâche", "Saut vers une étape inexistante", "Aucun agent n’a le rôle désigné", "Retour vers l’étape 1 : boucle possible",
+                        "Intervalle très court", "désactivé : elle ne se déclenchera pas", "La règle désigne un agent qui n’existe plus", "Aucun agent principal", "Aucune règle globale",
+                        "est en chat manuel", "déjà actif"):
+            self.assertIn(attendu, texts)
+        self.assertEqual({i["level"] for i in out}, {"erreur", "avertissement", "info"})
+
+    def test_workflow_coherent_sans_erreur(self):
+        self.add_wf("Valide", [self.step("principal", "Vérifie"), self.step("role:r3", "Teste")], schedule={"mode": "daily", "time": "08:00", "days": [0, 1, 2, 3, 4]})
+        self.set(rules="Règle claire.")
+        self.assertEqual([i for i in prules.lint(proj()) if i["level"] == "erreur"], [])
+
+    def test_analyse_de_coherence_par_un_agent(self):
+        self.set(rules="Les agents ne doivent jamais fusionner dans la branche principale.")
+        self.set_agent(1, rules="Tu peux fusionner directement dans main quand tu as fini.")
+        self.add_wf("Validation", [self.step("principal", "Vérifie")])
+        vus = []
+
+        def analyste(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return ('Voici mon analyse.\n```action\n' + json.dumps({"do": "rules_report", "issues": [
+                {"severity": "erreur", "where": "Règles de Bob", "text": "Contredit la règle globale sur la branche principale.", "suggestion": "Retirer la phrase."},
+                {"severity": "n'importe quoi", "where": "Workflow", "text": "Étape imprécise.", "suggestion": ""}, {"severity": "info", "text": ""}]}) + '\n```')
+        with mock.patch.object(engine, "call_ai", analyste):
+            engine.rules_analysis("u", "p1")
+        rr = proj()["rules_report"]
+        self.assertEqual([(i["level"], i["where"]) for i in rr["ai"]], [("erreur", "Règles de Bob"), ("info", "Workflow")])   # niveau invalide ramené à info, point vide ignoré
+        self.assertEqual((rr["analyzing"], rr["ai_note"]), ("", ""))
+        for attendu in ("Règles intégrées", "Les agents ne doivent jamais fusionner", "Tu peux fusionner directement", "« Validation »", "Autonomie des agents"):
+            self.assertIn(attendu, vus[0])                                                          # l'agent reçoit toutes les règles et les réglages
+        self.assertIn("refusée" if False else "Aucune analyse", engine.do_act("u", "p1", "a2", {"do": "rules_report", "issues": []}, 0)[1])   # personne d'autre ne peut écrire le rapport
+
+    def test_analyse_reponse_non_structuree_ou_impossible(self):
+        self.set(rules="R")
+        with mock.patch.object(engine, "call_ai", lambda *a: "Tout me semble cohérent."):
+            engine.rules_analysis("u", "p1")
+        rr = proj()["rules_report"]
+        self.assertTrue(rr["ai"][0]["text"] == "Tout me semble cohérent." and "non structurée" in rr["ai_note"] and rr["analyzing"] == "")
+        for ag in range(3):
+            self.set_agent(ag, mode="manual")
+        engine.rules_analysis("u", "p1")
+        self.assertIn("aucun agent en mode API", proj()["rules_report"]["ai_note"])
+        self.set(rules="")
+        engine.rules_analysis("u", "p1")
+        self.assertEqual(proj()["rules_report"]["ai_note"], "Aucune règle à analyser.")
+
+    def test_verification_a_la_demande(self):
+        self.add_wf("Vide", [])
+        with mock.patch.object(engine, "call_ai", lambda *a: "RAS"):
+            engine.rules_check("u", "p1")
+        rr = proj()["rules_report"]
+        self.assertTrue(any("Aucune étape définie" in i["text"] for i in rr["static"]) and rr["ai"])
+        self.assertEqual(proj().get("rules_log", []), [])                                           # un simple contrôle ne notifie personne
 
 
 class Http(unittest.TestCase):

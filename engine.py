@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 
 import github
+import project_rules as prules
 import rights
 from ai import call_ai
 from rights import by_id, mod_ids, now, uid
@@ -46,6 +47,7 @@ RULES = [
     "Une tâche ou un bug peut être rattaché à un ou plusieurs modules, sans obligation (ex. le cahier des charges est global). Un bug se corrige par des sous-tâches de correction (bug_fix) ; quand elles sont terminées, il passe à « corrigé » et le QA le vérifie.",
     "Chaque release a une branche de travail (release/<version>) ; la branche principale est réservée à la release finale. Tu te synchronises avec la branche de travail par pull (fait automatiquement au démarrage d’une tâche et avant une merge request) ; quand ton travail est prêt, tu soumets une merge request (merge_request) vers cette branche ; l’agent principal la valide. Une tâche qui dépend d’une autre ne démarre que lorsque celle-ci est terminée et sa merge request fusionnée. En cas de conflit de fusion, la règle du projet décide qui le résout (l’utilisateur, l’auteur de la branche ou un agent désigné) ; si le conflit t’est confié, résous-le avec resolve_merge.",
     "Tu n’as aucun environnement d’exécution local ni dépôt git local : tout passe par les actions de l’application et l’API GitHub. Il n’existe donc ni répertoire .git, ni état « MERGE_HEAD », ni environnement à nettoyer ou à redémarrer. Quand une action est refusée, lis le message : il donne la cause et la suite ; n’invente pas de cause absente du message et ne demande jamais à l’utilisateur de « nettoyer » un environnement. Pour connaître les vraies causes d’un blocage, appelle get_blockers avant de poser une question technique.",
+    "Les règles globales, tes règles spécifiques et les workflows du projet sont écrits par l’utilisateur et priment sur ta propre initiative. Un workflow est un enchaînement d’étapes à respecter : déclenche-le avec run_workflow quand une règle te le demande ; quand une étape te est confiée, réalise-la puis conclus-la avec wf_step (ok ou ko). Si deux règles te semblent se contredire, applique la plus spécifique et signale la contradiction à l’agent principal.",
     "Prends l’initiative de la coordination : avant de coder ce qui dépend du travail d’un autre agent ou qui l’impacte (interface, contrat d’API, schéma de données, convention), écris-lui avec message pour convenir de l’approche ; préviens-le quand tu modifies ce qu’il utilise ; réponds toujours aux messages que tu reçois. « Travail des autres agents » et get_progress te disent qui fait quoi.",
     "Ne t’arrête pas à la première erreur : analyse-la, corrige et continue (relis le fichier, change d’approche). Si tu es réellement bloqué, écris à l’agent qui peut t’aider ou pose la question avec ask_user ; ne laisse jamais une tâche en suspens sans le dire.",
     "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
@@ -61,6 +63,8 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"resolve_merge","conflict":"<id>","files":[{"path":"...","content":"<contenu final complet, ou null pour supprimer>"}],"message":"..."} : résoudre un conflit de fusion qui t’est confié (un élément par fichier en conflit)',
     '{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable (sa réponse te revient)',
     '{"do":"get_progress","agent":"<prénom ou all>"} : avancement d’un agent ou de toute l’équipe (sans coût)',
+    '{"do":"run_workflow","workflow":"<nom du workflow>","task":"<id de la tâche cible, facultatif>","note":"..."} : déclencher un workflow du projet (s’il autorise le déclenchement par un agent)',
+    '{"do":"wf_step","outcome":"ok|ko","comment":"..."} : conclure l’étape de workflow qui t’est confiée (ok = réalisée)',
     '{"do":"get_blockers"} : liste FACTUELLE des blocages du projet (conflits, dépendances, erreurs, décisions en attente) — à consulter avant toute question technique',
     '{"do":"context","text":"..."} : réécrire tes notes personnelles (fichier de contexte)',
     '{"do":"task","title":"...","desc":"...","assignee":"<prénom>","parent":"<id de la tâche parente, vide = 1er niveau>","modules":["<module>"],"depends_on":["<id d’une tâche à terminer avant>"],"why":"<justification>"} : créer une tâche (sous-tâche libre sous tes tâches ; 1er niveau selon tes droits)',
@@ -132,6 +136,7 @@ def ctx_text(p, a):
         "> Ce fichier fait foi : respecte-le rigoureusement et mets-le à jour (action « context »).", "",
         "## Règles de l’équipe", "\n".join("- " + x for x in RULES),
         ("\n## Règles du projet\n" + p["rules"]) if p.get("rules") else "",
+        ("\n" + prules.agent_rules_text(p, a, "##")) if (a.get("rules") or "").strip() else "", ("\n" + prules.workflows_text(p, a, "##")) if prules.workflows_text(p, a) else "",
         "\n## Mon rôle\n%s — %s" % (r["name"], r["desc"]),
         "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
         "\n## Droits\n%s\n- Agents joignables : %s" % (rights.rights_text(p, a, mn), talk),
@@ -174,12 +179,14 @@ def sys_prompt(p, a):
                    for b in p.get("bugs", []) if b["status"] not in rights.BUG_CLOSED)[:3000]
     pend = [d for d in p.get("decisions", []) if d["status"] == "attente"]
     ins, news = rights.instruction_lines(p, a), rights.instruction_lines(p, a, only_new=True)
+    news += prules.news_lines(p, a)
     if p.get("spec_n", 0) > a.get("seen_seq", 0):
         news.append("- Les spécifications ont été mises à jour.")
     repo = p.get("repo") or {}
     parts = [
         "# Règles de l’équipe\n" + "\n".join(RULES),
         ("# Règles du projet\n" + p["rules"]) if p.get("rules") else "",
+        prules.agent_rules_text(p, a), prules.workflows_text(p, a),
         ("# Instructions de l’utilisateur (à respecter)\n" + "\n".join(ins)) if ins else "",
         ("# Nouveautés depuis ta dernière activité\n" + "\n".join(news)) if news else "",
         "# Toi\nPrénom : %s\nRôle : %s — %s\nBranche git : %s (branche de base : %s)\n%s" % (
@@ -623,6 +630,33 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             mp(u, pid, lambda pp: by_id(pp["conflicts"], c["id"]).update(status="résolu", resolved_by=a["name"], done=now()))
             spawn(after_conflict, u, pid, c["id"])
             return "Conflit résolu : fusion commitée sur %s." % owner["branch"], None
+        if kind == "run_workflow":
+            wf = prules.find_workflow(p, str(x.get("workflow", "")))
+            if not wf:
+                return refuse("Workflow introuvable : %s." % x.get("workflow"))
+            if not wf.get("enabled", True) or not wf.get("allow_agent", True):
+                return refuse("Le workflow « %s » ne peut pas être déclenché par un agent." % wf["name"])
+            tid = x.get("task") if by_id(p["tasks"], x.get("task")) else ""
+            workflow_start(u, pid, wf["id"], "agent %s" % a["name"], requester=aid, task=tid, note=str(x.get("note", ""))[:500])
+            return "Workflow « %s » déclenché." % wf["name"], None
+        if kind == "wf_step":
+            wc = a.get("wf_ctx")
+            if not wc:
+                return refuse("Aucune étape de workflow ne t’est confiée en ce moment.")
+            if x.get("outcome") not in ("ok", "ko"):
+                return refuse("outcome doit valoir ok ou ko.")
+            mp(u, pid, lambda pp: (by_id(pp.get("wf_runs", []), wc["run"]) or {}).__setitem__("cur", {"i": wc["step"], "outcome": x["outcome"], "comment": str(x.get("comment", ""))[:500]}))
+            return "Étape de workflow conclue : %s." % x["outcome"], None
+        if kind == "rules_report":
+            if (p.get("rules_report") or {}).get("analyzing") != aid:
+                return refuse("Aucune analyse des règles ne t’est demandée.")
+            issues = []
+            for it in (x.get("issues") or [])[:20]:
+                if isinstance(it, dict) and str(it.get("text", "")).strip():
+                    issues.append({"level": it.get("severity") if it.get("severity") in ("erreur", "avertissement", "info") else "info", "where": str(it.get("where", ""))[:120],
+                                   "text": str(it["text"])[:500], "suggestion": str(it.get("suggestion", ""))[:400]})
+            mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(ai=issues, ai_ts=now(), ai_note="", analyzing=""))
+            return "Analyse des règles enregistrée : %d point(s) relevé(s)." % len(issues), None
         if kind == "instruction":
             if not mn:
                 return refuse("Enregistrement d’instruction refusé : réservé à l’agent principal (écris-lui un message).")
@@ -697,6 +731,26 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                 log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "accepted", "Validée par l’utilisateur"))
             else:
                 log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "rejected", ans if ans != opts[1] else "Refusée par l’utilisateur"))
+        elif d.get("wf_run"):                                 # suite d'un workflow mis en pause
+            rid, i = d["wf_run"], d.get("wf_step", 0)
+
+            def g(pp):
+                run = by_id(pp.get("wf_runs", []), rid)
+                if not run or run["status"] != "en cours":
+                    return None
+                run.pop("waiting", None)
+                if ans == "Arrêter le workflow":
+                    run.update(status="arrêté", note="arrêté par l’utilisateur", ended=now())
+                    return "stop"
+                if d.get("wf_after") == "ko" and ans == "Relancer cette étape":
+                    run["step"] = i
+                    return "next"
+                if d.get("wf_after") != "ko":
+                    run.setdefault("results", []).append({"i": i + 1, "outcome": "ok", "comment": ans[:300], "d": now()})
+                run["step"] = i + 1
+                return "next"
+            if mp(u, pid, g) == "next":
+                wf_continue(u, pid, rid)
         elif d.get("conflict"):                               # qui résout le conflit de fusion
             cid = d["conflict"]
             if by_id(snap(u, pid).get("conflicts", []), cid):
@@ -1154,9 +1208,239 @@ def review_task(u, pid, tid):
         mp(u, pid, lambda pp: (by_id(pp["tasks"], tid) or {}).pop("reviewing", None))
 
 
-def dispatch(u, pid, p, t0):
+# ---------------------------------------------------------------- règles du projet, communication, workflows
+def rules_changed(u, pid):
+    """Les règles ont été modifiées : elles sont communiquées aux agents concernés (message, nouveautés du prompt, fichier de contexte),
+    puis le contrôle de cohérence est relancé."""
+    p = snap(u, pid)
+    new = prules.snapshot(p)
+    entries = prules.diff(p.get("rules_snap"), new)
+    lint = prules.lint(p)
+
+    def f(pp):
+        for e in entries:
+            pp.setdefault("rules_log", []).append({"n": rights.next_seq(pp), "d": now(), "scope": e["scope"], "text": e["text"]})
+        if "rules_log" in pp:
+            del pp["rules_log"][:-60]
+        pp["rules_snap"] = new
+        pp.setdefault("rules_report", {}).update(static=lint, ts=now())
+    mp(u, pid, f)
+    for a in p["agents"]:
+        mine = [e["text"] for e in entries if prules.concerned(e["scope"], a)]
+        if mine:
+            res = provision(u, pid, a["id"])
+            log(u, pid, "Système", a["name"], "Règles mises à jour : %s%s" % (" ".join(mine), "" if res.startswith("Dépôt GitHub/token non configuré") else " (" + res + ")"))
+    if entries:
+        spawn(rules_analysis, u, pid)
+    return entries
+
+
+def rules_check(u, pid):
+    """Contrôle de cohérence à la demande (sans communication aux agents)."""
+    lint = prules.lint(snap(u, pid))
+    mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(static=lint, ts=now()))
+    rules_analysis(u, pid)
+
+
+def rules_analysis(u, pid):
+    """Un agent (le principal, sinon un agent en mode API) analyse la cohérence des règles ; résultat dans p.rules_report.ai."""
+    p = snap(u, pid)
+    nothing = not (p.get("rules") or "").strip() and not p.get("workflows") and not any((a.get("rules") or "").strip() for a in p["agents"])
+    an = next((g for g in [by_id(p["agents"], p.get("mainId"))] + p["agents"] if g and g.get("mode") != "manual"), None)
+    if nothing or not an:
+        return mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(ai=[], ai_ts=now(), analyzing="", ai_note="Aucune règle à analyser." if nothing else "Analyse automatique impossible : aucun agent en mode API."))
+    mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(analyzing=an["id"], ai_note="Analyse en cours…"))
+    log(u, pid, "Système", an["name"], "Analyse de cohérence des règles demandée à %s." % an["name"])
+    msg = ("[Analyse des règles] Analyse la COHÉRENCE des règles ci-dessous : contradictions entre elles (y compris avec les règles intégrées), règles incomplètes ou ambiguës, "
+           "workflows irréalisables, dépendances manquantes. Réponds par UNE action rules_report "
+           "{\"issues\":[{\"severity\":\"erreur|avertissement|info\",\"where\":\"...\",\"text\":\"...\",\"suggestion\":\"...\"}]} (liste vide si tout est cohérent). "
+           "Ne signale que ce qui découle du texte ci-dessous, sans rien inventer.\n\n" + prules.dump(p, RULES))
+    try:
+        reply = ask(u, pid, an["id"], msg, "Analyse des règles", relog=False)
+    except Err as e:
+        return mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(analyzing="", ai_note="Analyse impossible : %s" % e.msg))
+
+    def fin(pp):
+        rr = pp.setdefault("rules_report", {})
+        if rr.get("analyzing"):                            # pas de rapport structuré
+            rr.update(analyzing="", ai=[{"level": "info", "where": "Analyse", "text": (reply or "(aucune réponse)")[:600], "suggestion": ""}], ai_ts=now(), ai_note="Réponse non structurée de l’agent.")
+    mp(u, pid, fin)
+
+
+def _wf_end(u, pid, rid, status, why):
+    run = by_id(snap(u, pid).get("wf_runs", []), rid)
+    if not run or run["status"] != "en cours":
+        return
+    mp(u, pid, lambda pp: (by_id(pp.get("wf_runs", []), rid) or {}).update(status=status, note=why, ended=now()))
+    log(u, pid, "Système", "Vous", "Workflow « %s » : %s%s." % (run["name"], status, (" — " + why) if why else ""))
+
+
+def workflow_start(u, pid, wfid, trigger, requester="", task="", note=""):
+    """Crée un déroulement de workflow et le lance en arrière-plan. Retourne son identifiant."""
+    p = snap(u, pid)
+    wf = by_id(p.get("workflows", []), wfid)
+    if not wf:
+        raise Err(404, "Workflow introuvable")
+    if not wf.get("steps"):
+        raise Err(400, "Le workflow « %s » n’a aucune étape." % wf.get("name"))
+    task = task if by_id(p["tasks"], task) else ""
+    runs = p.get("wf_runs", [])
+    if any(r["wf"] == wfid and r["status"] == "en cours" and r.get("task", "") == task for r in runs):
+        raise Err(409, "Le workflow « %s » est déjà en cours%s." % (wf["name"], " sur cette tâche" if task else ""))
+    if sum(1 for r in runs if r["wf"] == wfid and time.time() - r.get("ts", 0) < 3600) >= prules.WF_MAX_PER_HOUR:
+        raise Err(429, "Trop de déclenchements du workflow « %s » dans l’heure (maximum %d)." % (wf["name"], prules.WF_MAX_PER_HOUR))
+    rid = uid()
+    run = {"id": rid, "wf": wfid, "name": wf["name"], "trigger": trigger, "requester": requester, "task": task, "note": note, "ts": time.time(),
+           "started": now(), "status": "en cours", "step": 0, "results": [], "count": 0}
+
+    def f(pp):
+        pp.setdefault("wf_runs", []).append(run)
+        del pp["wf_runs"][:-40]
+    mp(u, pid, f)
+    t = by_id(p["tasks"], task)
+    log(u, pid, "Système", "Vous", "Workflow « %s » démarré (%s)%s." % (wf["name"], trigger, (" sur la tâche « %s »" % t["title"]) if t else ""))
+    spawn(wf_continue, u, pid, rid)
+    return rid
+
+
+def wf_user_run(u, pid, wfid, task, note):
+    try:
+        workflow_start(u, pid, wfid, "utilisateur", task=task, note=note)
+    except Err as e:
+        log(u, pid, "Système", "Vous", "Workflow non lancé : %s" % e.msg)
+
+
+def wf_resume(u, pid, rid):
+    """Reprend un déroulement échoué ou arrêté à l'étape où il s'est interrompu."""
+    run = by_id(snap(u, pid).get("wf_runs", []), rid)
+    if not run or run["status"] == "en cours" or run["status"] == "terminé":
+        return
+    mp(u, pid, lambda pp: (by_id(pp["wf_runs"], rid) or {}).update(status="en cours", note=""))
+    wf_continue(u, pid, rid)
+
+
+def wf_after(u, pid, rid, i, st, outcome, comment):
+    """Enregistre le résultat d'une étape et décide de la suite : next (étape suivante ou saut), stop, ou wait (question à l'utilisateur)."""
+    ko, policy = outcome != "ok", st.get("on_ko") or "stop"
+
+    def f(pp):
+        run = by_id(pp["wf_runs"], rid)
+        run["results"].append({"i": i + 1, "outcome": outcome, "comment": str(comment)[:300], "d": now()})
+        run.pop("cur", None)
+        if not ko or policy == "continue":
+            run["step"] = i + 1
+            return "next"
+        if policy == "goto":
+            try:
+                g = int(st.get("goto")) - 1
+            except (TypeError, ValueError):
+                g = -1
+            if g >= 0:
+                run["step"] = g
+                return "next"
+        if policy == "ask_user":
+            d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": "", "byName": "Workflow", "d": now(), "status": "attente", "task": "", "structural": False,
+                 "question": "Le workflow « %s » a échoué à l’étape %d (%s). Que faire ?" % (run["name"], i + 1, str(comment)[:200] or "sans détail"),
+                 "options": ["Continuer malgré l’échec", "Relancer cette étape", "Arrêter le workflow"], "recommendation": "Relancer cette étape", "impact": "",
+                 "wf_run": rid, "wf_step": i, "wf_after": "ko"}
+            pp.setdefault("decisions", []).append(d)
+            run["waiting"] = d["id"]
+            return "wait"
+        run.update(status="arrêté", note="étape %d en échec : %s" % (i + 1, str(comment)[:200]), ended=now())
+        return "stop"
+    r = mp(u, pid, f)
+    if r == "stop":
+        run = by_id(snap(u, pid)["wf_runs"], rid)
+        log(u, pid, "Système", "Vous", "Workflow « %s » arrêté : %s." % (run["name"], run["note"]))
+    return r
+
+
+def wf_do_step(u, pid, p, wf, run, i, st):
+    """Exécute une étape. Retourne (issue ok|ko, commentaire, attente)."""
+    kind = st.get("kind", "ask")
+    if kind == "start_tasks":
+        n = dispatch(u, pid, snap(u, pid), time.time(), force=True)
+        return "ok", "%d tâche(s) démarrée(s)" % n, False
+    if kind == "ask_user":
+        def gate(pp):
+            r = by_id(pp["wf_runs"], run["id"])
+            d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": "", "byName": "Workflow", "d": now(), "status": "attente", "task": "", "structural": False,
+                 "question": "Workflow « %s », étape %d : %s" % (wf["name"], i + 1, st.get("text", "")), "options": ["Continuer", "Arrêter le workflow"], "recommendation": "", "impact": "",
+                 "wf_run": run["id"], "wf_step": i, "wf_after": "gate"}
+            pp.setdefault("decisions", []).append(d)
+            r["waiting"] = d["id"]
+        mp(u, pid, gate)
+        return "ok", "", True
+    a = prules.resolve_actor(p, st, run)
+    t = by_id(p["tasks"], run.get("task"))
+    if st.get("who") == "assignee" and not t:
+        return "ko", "aucune tâche cible pour cette étape (indiquez-la au déclenchement)", False
+    if not a:
+        return "ko", "agent introuvable pour cette étape (%s)" % (st.get("who") or "principal"), False
+    prev = "\n".join("  %d. %s%s" % (r["i"], r["outcome"], (" — " + r["comment"]) if r.get("comment") else "") for r in run.get("results", []))
+    tinfo = ("\nTâche concernée : « %s » (id %s, statut %s, agent %s)%s" % (t["title"], t["id"], t["status"], (by_id(p["agents"], t.get("who")) or {}).get("name", "—"),
+             (" ; compte rendu : " + t["result"][:600]) if t.get("result") else "")) if t else ""
+    msg = ("« %s » — étape %d/%d (déclenché par %s)%s%s\nInstruction : %s\n%sConclus cette étape avec l’action wf_step {\"outcome\":\"ok|ko\",\"comment\":\"...\"} "
+           "(ok si l’étape est réalisée, ko sinon). Utilise les autres actions (task_review, task_status, message, relaunch…) pour faire ce qui est demandé.") % (
+        wf["name"], i + 1, len(wf["steps"]), run["trigger"], ("\nNote du demandeur : " + run["note"]) if run.get("note") else "", tinfo, st.get("text", ""),
+        ("Résultats des étapes précédentes :\n" + prev + "\n") if prev else "")
+    mp(u, pid, lambda pp: by_id(pp["agents"], a["id"]).__setitem__("wf_ctx", {"run": run["id"], "step": i}))
+    try:
+        for _ in range(2):
+            ask(u, pid, a["id"], msg, "Workflow")
+            cur = (by_id(snap(u, pid).get("wf_runs", []), run["id"]) or {}).get("cur")
+            if cur and cur.get("i") == i:
+                return cur["outcome"], cur.get("comment", ""), False
+            msg = "Conclus l’étape avec l’action wf_step {\"outcome\":\"ok|ko\",\"comment\":\"...\"}."
+        return "ok", "sans verdict explicite de l’agent", False
+    finally:
+        mp(u, pid, lambda pp: (by_id(pp["agents"], a["id"]) or {}).pop("wf_ctx", None))
+
+
+def wf_continue(u, pid, rid):
+    """Exécute les étapes d'un déroulement jusqu'à sa fin, un arrêt, ou une question posée à l'utilisateur."""
+    for _ in range(prules.WF_MAX_STEPS + 2):
+        p = snap(u, pid)
+        run = by_id(p.get("wf_runs", []), rid)
+        if not run or run["status"] != "en cours" or run.get("waiting"):
+            return
+        wf = by_id(p.get("workflows", []), run["wf"])
+        if not wf:
+            return _wf_end(u, pid, rid, "échoué", "le workflow a été supprimé")
+        i = run["step"]
+        if i >= len(wf.get("steps", [])):
+            return _wf_end(u, pid, rid, "terminé", "")
+        if run.get("count", 0) >= prules.WF_MAX_STEPS:
+            return _wf_end(u, pid, rid, "arrêté", "limite de %d étapes exécutées atteinte (boucle ?)" % prules.WF_MAX_STEPS)
+        mp(u, pid, lambda pp: by_id(pp["wf_runs"], rid).__setitem__("count", run.get("count", 0) + 1))
+        try:
+            outcome, comment, wait = wf_do_step(u, pid, p, wf, run, i, wf["steps"][i])
+        except Err as e:
+            return _wf_end(u, pid, rid, "échoué", "étape %d : %s" % (i + 1, e.msg))
+        if wait:
+            return
+        if wf_after(u, pid, rid, i, wf["steps"][i], outcome, comment) != "next":
+            return
+
+
+def wf_timers(u, pid):
+    """Déclenche les workflows dont la minuterie est échue (heure locale du serveur)."""
+    p = snap(u, pid)
+    nowdt = datetime.now()
+    for w in p.get("workflows", []):
+        due, new = prules.due(w, (p.get("wf_state") or {}).get(w["id"], {}), nowdt)
+        if new is not None:
+            mp(u, pid, lambda pp, i=w["id"], n=new: pp.setdefault("wf_state", {}).setdefault(i, {}).update(n))
+        if due:
+            try:
+                workflow_start(u, pid, w["id"], "minuterie")
+            except Err as e:
+                log(u, pid, "Système", "Vous", "Workflow « %s » : déclenchement par minuterie impossible (%s)." % (w.get("name"), e.msg))
+
+
+def dispatch(u, pid, p, t0, force=False):
     """Lancement automatique : les tâches prêtes (assignées, à faire, dépendances satisfaites) démarrent sans intervention, une par agent."""
-    if p.get("autopilot") == "off":
+    if p.get("autopilot") == "off" and not force:
         return 0
     bud = num(p.get("budget"))
     if bud and (p.get("usage") or {}).get("cost", 0) >= bud:
@@ -1194,6 +1478,7 @@ def tick(u, pid):
     TICKING.add(key)
     try:
         _tick(u, pid)
+        wf_timers(u, pid)                                  # minuteries des workflows (indépendantes du suivi)
     finally:
         TICKING.discard(key)
 
@@ -1811,6 +2096,11 @@ def start(u, j):
             "sync": lambda: sync_all(u, pid),
             "release": lambda: release(u, pid, str(j.get("version", "")), str(j.get("notes", ""))),
             "reset_usage": lambda: reset_usage(u, pid),
+            "rules_changed": lambda: rules_changed(u, pid),
+            "rules_check": lambda: rules_check(u, pid),
+            "workflow_run": lambda: wf_user_run(u, pid, j.get("wfId"), j.get("task") or "", str(j.get("note", ""))),
+            "wf_resume": lambda: wf_resume(u, pid, j.get("runId")),
+            "wf_stop": lambda: _wf_end(u, pid, j.get("runId"), "arrêté", "arrêté par l’utilisateur"),
             "conflict_action": lambda: conflict_action(u, pid, j.get("conflictId"), str(j.get("action", ""))),
             "agent_reset": lambda: agent_reset(u, pid, j.get("agentId"), bool(j.get("history", True)), bool(j.get("notes", False)), bool(j.get("branch", False)), bool(j.get("onboard", True))),
             "cycle_start": lambda: cycle_start(u, pid, str(j.get("version", ""))),
