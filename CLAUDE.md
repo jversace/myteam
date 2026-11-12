@@ -11,7 +11,7 @@ Application de gestion de projets de développement par une **équipe d'agents I
 - Front : `static/index.html`, SPA **fichier unique** (HTML + CSS + JS, sans framework ni build), servie par le backend.
 - Persistance : fichiers JSON dans `data/` (ignoré par git) : `users.json` (hash PBKDF2), `sessions.json`, `users/<user>.json` (**état complet** d'un utilisateur). Pas de base de données pour l'instant.
 - Git/GitHub : **API REST GitHub** via `urllib` (pas de git local). Dépôt + token au niveau projet.
-- Variables : `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`, `APM_GITHUB_API` (tests), `APM_SUPERVISE_SECONDS` (passage du suivi, 60 ; 0 = désactivé). Windows : `start.bat`.
+- Variables : `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`, `APM_GITHUB_API` (tests), `APM_SUPERVISE_SECONDS` (passage du suivi, 60 ; 0 = désactivé). Windows : `start.bat` ; macOS : `start.command`.
 
 ## Fichiers
 | Fichier | Rôle |

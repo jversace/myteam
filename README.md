@@ -22,6 +22,14 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
    Laissez la fenêtre ouverte. Pour arrêter : Ctrl+C.
 5. **Ouvrir** http://127.0.0.1:8000 dans le navigateur et créer un compte (« Créer le compte »).
 
+## Installation sur macOS
+
+1. **Installer Python 3.10 ou plus** : `brew install python` (ou depuis https://www.python.org/downloads/macos/), puis vérifiez : `python3 --version`.
+2. **Récupérer le projet** : `git clone https://github.com/jversace/myteam.git && cd myteam`
+3. **Lancer** : double-cliquez sur `start.command` dans le Finder, ou dans le Terminal : `./start.command` (ou `python3 server.py`).
+   Au premier double-clic, macOS peut bloquer le fichier : clic droit > Ouvrir, ou `chmod +x start.command` si le droit d'exécution manque.
+4. **Ouvrir** http://127.0.0.1:8000 et créer un compte.
+
 ## Premier usage
 1. **Services IA** : cliquez sur **Configurer la clé** : un lien ouvre la console du fournisseur, vous y créez une clé API et la collez dans l'application, qui la **teste** aussitôt (bouton **Tester**). Le modèle se règle via **Modifier**. L'assistant se rouvre automatiquement si vous recrutez un agent ou lui écrivez alors que son service n'a pas de clé.
 2. **Projets** : créez un projet, puis dans *Git & releases* > *Configurer* : URL du dépôt GitHub, branche de base, **token** (le dépôt et le token sont propres au projet).
