@@ -153,6 +153,10 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/manual/cancel":
             engine.manual_cancel(u, str(d.get("id")))
             return self.out(200, {"ok": True})
+        if p == "/api/sync":
+            pid = str(d.get("projectId", ""))
+            engine.snap(u, pid)                            # 404 si le projet n'existe pas
+            return self.out(200, {"items": engine.sync_all(u, pid)})
         if p == "/api/job":
             engine.start(u, d)
             return self.out(200, {"ok": True})

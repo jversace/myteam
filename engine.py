@@ -879,8 +879,14 @@ def onboard(u, pid, aid):
 
 
 def sync_all(u, pid):
+    """Pour chaque agent : crée sa branche si besoin et pousse son fichier de contexte (règles à jour).
+    Renvoie un compte rendu [{agent, ok, text}] affiché dans l'onglet Équipe ; chaque ligne est aussi tracée dans l'historique."""
+    out = []
     for a in snap(u, pid)["agents"]:
-        log(u, pid, "Système", a["name"], "Synchronisation : " + provision(u, pid, a["id"]))
+        r = provision(u, pid, a["id"])
+        log(u, pid, "Système", a["name"], "Synchronisation : " + r)
+        out.append({"agent": a["name"], "branch": a.get("branch", ""), "ok": r.startswith("Branche "), "text": r})
+    return out
 
 
 def say(u, pid, aid, text, attempt=0, relog=True):
