@@ -208,13 +208,19 @@ class GH(BaseHTTPRequestHandler):
             return self.send(201, {"number": len(PRS)})
         if rest == "/pulls" and m == "GET":
             return self.send(200, [{"number": k} for k, x in PRS.items() if x["open"] and x["head"] == (q.get("head") or [":"])[0].split(":", 1)[1] and x["base"] == q["base"][0]])
+        mg = re.fullmatch(r"/pulls/(\d+)", rest)
+        if mg and m == "GET":
+            pr = PRS.get(int(mg.group(1)))
+            if not pr:
+                return self.send(404, {"message": "Not Found"})
+            return self.send(200, {"number": int(mg.group(1)), "state": "open" if pr["open"] else "closed", "merged": bool(pr.get("merged"))})
         mm = re.match(r"/pulls/(\d+)/merge", rest)
         if mm:
             pr = PRS[int(mm.group(1))]
             r = git_merge(pr["base"], BRANCHES[pr["head"]])
             if r == "conflict":
                 return self.send(405, {"message": "Pull Request is not mergeable"})
-            pr["open"] = False
+            pr["open"], pr["merged"] = False, True
             return self.send(200, {"merged": True})
         if rest == "/releases":
             REL.append(body)
@@ -1334,6 +1340,94 @@ class Integration(unittest.TestCase):
         self.assertTrue("cycle" not in p and p["releases"][0]["v"] == "v1.0.0" and not p["releasing"])
         self.assertEqual(p["mrs"][-1]["status"], "fusionnée")
 
+    # -- « blockers fantômes » : MR closes sur GitHub mais encore ouvertes dans l'application
+    def open_mr(self):
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        engine.submit_mr("u", "p1", "a2", "Login", "corps", "t1")
+        return proj()["mrs"][0]
+
+    def blockers(self):
+        return engine.blockers_text(proj())
+
+    def test_mr_fusionnee_sur_github_retiree_des_blocages(self):
+        m = self.open_mr()
+        self.set_task_status("t1", "terminée")
+        self.assertIn("Merge request #%s" % m["n"], self.blockers())
+        self.assertEqual(engine.deps_unmet(proj(), proj()["tasks"][1]), ["Login"])                 # t1 terminée, mais sa MR est encore « ouverte » dans l'application
+        PRS[m["n"]].update(open=False, merged=True)                                                 # fusionnée à la main sur GitHub
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [(m["n"], "fusionnée")])
+        p = proj()
+        self.assertEqual(p["mrs"][0]["status"], "fusionnée")
+        self.assertNotIn("Merge request #", self.blockers())
+        self.assertEqual(engine.deps_unmet(p, p["tasks"][1]), [])                                  # la tâche dépendante n'attend plus
+        self.assertIn("débloquées", self.logs())
+
+    def test_mr_fermee_sans_fusion_est_annulee(self):
+        m = self.open_mr()
+        PRS[m["n"]]["open"] = False                                                                # abandonnée sur GitHub
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [(m["n"], "annulée")])
+        self.assertEqual(proj()["mrs"][0]["status"], "annulée")
+        self.assertNotIn("Merge request #", self.blockers())
+
+    def test_mr_toujours_ouverte_n_est_pas_touchee_et_verification_espacee(self):
+        m = self.open_mr()
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [])
+        self.assertEqual(proj()["mrs"][0]["status"], "ouverte")
+        PRS[m["n"]].update(open=False, merged=True)
+        self.assertEqual(engine.sync_mrs("u", "p1"), [])                                           # vérifiée il y a moins de MR_SYNC_EVERY s : pas d'appel GitHub
+        self.assertEqual(proj()["mrs"][0]["status"], "ouverte")
+        self.assertEqual(len(engine.sync_mrs("u", "p1", force=True)), 1)
+
+    def test_mr_introuvable_ou_github_en_panne_ne_conclut_rien(self):
+        m = self.open_mr()
+        PRS.pop(m["n"])                                                                            # 404 : accès ou numéro
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [])
+        self.assertEqual(proj()["mrs"][0]["status"], "ouverte")
+        self.set(repo={"url": "", "branch": "main", "token": ""})                                 # dépôt non configuré
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [])
+
+    def test_le_suivi_retire_les_mr_closes_meme_sans_suivi_actif(self):
+        m = self.open_mr()
+        self.set(supervision="off")
+        PRS[m["n"]].update(open=False, merged=True)
+        engine.tick("u", "p1")
+        self.assertEqual(proj()["mrs"][0]["status"], "fusionnée")
+
+    def test_get_blockers_donne_un_etat_frais(self):
+        m = self.open_mr()
+        PRS[m["n"]].update(open=False, merged=True)
+        r = engine.do_act("u", "p1", "a2", {"do": "get_blockers"}, 0)
+        self.assertNotIn("Merge request #", r[1])                                                  # plus de blocage fantôme dans la réponse de l'outil
+        self.assertEqual(proj()["mrs"][0]["status"], "fusionnée")
+
+    def test_bouton_marquer_terminee_libere_tout(self):
+        m = self.open_mr()
+        self.set_task_status("t1", "terminée")
+        st = store.load("u")                                                                       # MR en conflit + question de validation en attente
+        pr = st["projects"][0]
+        pr["mrs"][0]["status"] = "conflit"
+        pr["conflicts"] = [{"id": "c1", "n": 1, "agent": "a2", "branch": "agent/bob", "target": "release/v1.0.0", "files": ["x"], "origin": "mr", "mr": m["id"], "task": "t1", "status": "ouvert", "d": "x"}]
+        pr["decisions"] = [{"id": "d1", "n": 2, "kind": "question", "status": "attente", "mr_review": m["id"], "question": "?", "options": ["Oui", "Non"], "task": ""}]
+        store.wj(store.state_path("u"), st)
+        self.assertIn("Merge request #", self.blockers())
+        engine.mr_done("u", "p1", m["id"])                                                         # GitHub n'est pas consulté : le bouton est le secours
+        p = proj()
+        self.assertEqual((p["mrs"][0]["status"], p["mrs"][0]["note"]), ("terminée", "Marquée terminée par l’utilisateur."))
+        self.assertEqual((p["conflicts"][0]["status"], p["decisions"][0]["status"]), ("résolu", "répondue"))
+        self.assertNotIn("Merge request #", self.blockers())
+        self.assertEqual(engine.deps_unmet(p, p["tasks"][1]), [])
+        engine.mr_done("u", "p1", m["id"])                                                         # deuxième clic : sans effet
+        self.assertIn("déjà close", self.logs())
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [])                               # le mécanisme automatique ne la rouvre pas
+
+    def test_la_release_n_est_plus_bloquee_par_une_mr_close(self):
+        m = self.open_mr()
+        PRS[m["n"]].update(open=False, merged=True)
+        engine.release("u", "p1", "v1.0.0", "notes")
+        self.assertNotIn("encore ouverte", self.logs())
+        self.assertEqual(proj()["mrs"][0]["status"], "fusionnée")
+
 
 class Regles(unittest.TestCase):
     """Règles du projet : communication aux agents, workflows (déclencheurs, étapes, échecs), minuteries, cohérence."""
@@ -1755,6 +1849,7 @@ class Http(unittest.TestCase):
         self.assertIn("Configurer la clé", r["error"])
         with mock.patch.object(server, "call_ai", lambda s, sy, m: "OK"):
             self.assertEqual(self.call("POST", "/api/service/test", {"serviceId": "s1"}, t)["sample"], "OK")
+
 
 
 if __name__ == "__main__":

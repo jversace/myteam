@@ -85,6 +85,8 @@ class H(BaseHTTPRequestHandler):
             pr = next((x for x in store.load(u).get("projects", []) if x.get("id") == pid), None)
             if not pr:
                 raise Err(404, "Projet introuvable")
+            engine.sync_mrs(u, pid, force=True)               # état frais : pas de blocage fantôme dans le diagnostic
+            pr = next((x for x in store.load(u).get("projects", []) if x.get("id") == pid), pr)
             return self.out(200, {"items": engine.diagnose(pr)})
         if p.startswith("/api/"):
             raise Err(404, "Route inconnue")

@@ -32,6 +32,7 @@ NUDGE = ("Tu n’as pas déclaré la tâche terminée. Si le travail demandé es
          "Ne t’arrête pas sur une erreur : analyse-la, corrige et continue.")
 OPEN_CONFLICT, RECONCILE_EVERY = ("ouvert", "escalade", "pause"), 300   # statuts « actifs » d'un conflit ; délai entre deux vérifications (s)
 CONFLICT_OPTS = ["L’auteur de la branche résout", "L’agent principal résout", "Je m’en occupe (mettre en pause)"]
+MR_ACTIVE, MR_SYNC_EVERY = ("ouverte", "conflit"), 120   # statuts d'une MR qui bloque ; délai entre deux vérifications GitHub d'une même MR (s)
 MANUAL_TIMEOUT = 24 * 3600   # attente maximale d'une réponse manuelle
 WAIT = {}                    # échanges manuels en attente : id -> {u, ev, text}
 F = "`" * 3
@@ -465,7 +466,9 @@ def do_act(u, pid, aid, x, depth, ctx=None):
         if kind == "get_progress":
             return "", progress_text(p, x.get("agent"))
         if kind == "get_blockers":
-            return "", blockers_text(p)
+            if sync_mrs(u, pid, force=True):               # jamais de « blocage fantôme » : les MR closes sur GitHub sont retirées avant la réponse
+                spawn(tick, u, pid)
+            return "", blockers_text(snap(u, pid))
         if kind == "context":
             def f(pp):
                 by_id(pp["agents"], aid)["notes"] = str(x.get("text", ""))
@@ -969,6 +972,10 @@ def run_task(u, pid, tid, retry=False, note=""):
     if not a or (retry and not t.get("retry_at")) or t.get("running"):
         return
     unmet = deps_unmet(p, t)
+    if unmet and sync_mrs(u, pid, force=True):             # une MR déjà close sur GitHub ne doit pas retenir la tâche
+        p = snap(u, pid)
+        t = by_id(p["tasks"], tid)
+        unmet = deps_unmet(p, t)
     if unmet:
         mp(u, pid, lambda pp: by_id(pp["tasks"], tid).__setitem__("waiting", unmet))
         return log(u, pid, "Système", a["name"], "Tâche « %s » non lancée : elle attend %s." % (t["title"], ", ".join("« %s »" % x for x in unmet)))
@@ -1477,6 +1484,10 @@ def tick(u, pid):
         return
     TICKING.add(key)
     try:
+        try:
+            sync_mrs(u, pid)                               # MR closes sur GitHub retirées des blocages (sans IA, même si le suivi est désactivé)
+        except Exception as ex:
+            print("Erreur de synchronisation des merge requests (%s/%s) : %s" % (u, pid, ex), flush=True)
         _tick(u, pid)
         wf_timers(u, pid)                                  # minuteries des workflows (indépendantes du suivi)
     finally:
@@ -1926,7 +1937,10 @@ def submit_mr(u, pid, aid, title="", body="", task=""):
         p = snap(u, pid)
         if open_conflict_for(p, aid):
             return "skip", describe_conflict(p, next(c for c in p["conflicts"] if c["agent"] == aid and c["status"] in OPEN_CONFLICT))
-    ex = next((m for m in p.get("mrs", []) if m.get("id") and m.get("from") == a["branch"] and m.get("status") in ("ouverte", "conflit")), None)
+    ex = next((m for m in p.get("mrs", []) if m.get("id") and m.get("from") == a["branch"] and m.get("status") in MR_ACTIVE), None)
+    if ex and sync_mrs(u, pid, force=True, only=ex["id"]):  # elle est peut-être déjà close sur GitHub
+        p = snap(u, pid)
+        ex = next((m for m in p.get("mrs", []) if m.get("id") and m.get("from") == a["branch"] and m.get("status") in MR_ACTIVE), None)
     if ex:
         return "exists", "Une merge request est déjà ouverte (#%s) : elle sera validée." % ex["n"]
     state, msg = pull(u, pid, aid, origin="mr", task=task, title=title, body=body)
@@ -2040,6 +2054,83 @@ def merge_mr(u, pid, mid):
     return open_conflict(u, pid, m["by_id"], "mr", mr_id=mid, task=m.get("task", ""))
 
 
+def _close_mr_in(pp, mid, status, why):
+    """Clôt une MR dans l'état (sans GitHub, sans IA) et libère ce qui l'attendait : conflit lié, question de validation, tâche en attente.
+    Retourne les titres des tâches désormais débloquées."""
+    m = by_id(pp.get("mrs", []), mid)
+    m.update(status=status, done=now(), note=why)
+    m.pop("reviewing", None)
+    for c in pp.get("conflicts", []):
+        if c.get("mr") == mid and c["status"] in OPEN_CONFLICT:
+            _close_in(pp, c["id"], "abandonné" if status == "annulée" else "résolu", why)
+    for d in pp.get("decisions", []):
+        if d.get("mr_review") == mid and d["status"] == "attente":
+            d.update(status="répondue", answer=why, done=now(), n_done=rights.next_seq(pp))
+    return [t["title"] for t in pp["tasks"] if t.get("deps") and t["status"] != "terminée" and not deps_unmet(pp, t)]
+
+
+def sync_mrs(u, pid, force=False, only=None):
+    """Aligne les merge requests de l'application sur GitHub, SANS IA : une MR « ouverte » ou « en conflit » ici mais fusionnée ou fermée
+    dans le dépôt central est retirée des blocages (fusionnée, ou annulée si abandonnée). Retourne [(n, nouveau statut)].
+    Prudent : une erreur réseau ou une MR introuvable (accès, numéro) ne conclut rien ; le bouton « Marquer terminée » reste le secours."""
+    p = snap(u, pid)
+    todo = [m for m in p.get("mrs", []) if m.get("id") and m.get("n") and m.get("status") in MR_ACTIVE and (not only or m["id"] == only)]
+    if not todo:
+        return []
+    try:
+        rp = github.Repo(p)
+    except Err:
+        return []
+    out = []
+    for m in todo:
+        if not force and time.time() - m.get("checked", 0) < MR_SYNC_EVERY:
+            continue
+        mp(u, pid, lambda pp, i=m["id"]: (by_id(pp["mrs"], i) or {}).__setitem__("checked", time.time()))
+        try:
+            st = rp.pr_state(int(m["n"]))
+        except (Err, ValueError):
+            continue
+        if st in ("open", "missing"):
+            continue
+        status, why = (("fusionnée", "Fusionnée sur GitHub (détectée automatiquement).") if st == "merged"
+                       else ("annulée", "Fermée sur GitHub sans fusion (détectée automatiquement)."))
+
+        def f(pp, i=m["id"], status=status, why=why):
+            cur = by_id(pp["mrs"], i)
+            if not cur or cur["status"] not in MR_ACTIVE:     # déjà traitée entre-temps (validation, bouton…)
+                return None
+            return _close_mr_in(pp, i, status, why)
+        ready = mp(u, pid, f)
+        if ready is None:
+            continue
+        out.append((m["n"], status))
+        log(u, pid, "Système", "Vous", "Merge request #%s « %s » : %s sur GitHub. Elle ne bloque plus les agents.%s" % (
+            m["n"], m.get("title", ""), "fusionnée" if status == "fusionnée" else "fermée sans fusion",
+            (" Tâches désormais débloquées : %s." % ", ".join("« %s »" % x for x in ready)) if ready else ""))
+    return out
+
+
+def mr_sync(u, pid):
+    """Bouton « Vérifier sur GitHub » : revérifie tout de suite les MR en attente."""
+    if not sync_mrs(u, pid, force=True):
+        log(u, pid, "Système", "Vous", "Vérification GitHub : aucune merge request à retirer (celles qui restent y sont bien encore ouvertes, ou GitHub n’a pas pu être interrogé).")
+
+
+def mr_done(u, pid, mid):
+    """Bouton « Marquer terminée » (secours si la vérification automatique échoue) : la MR ne bloque plus ni les agents ni la release."""
+    def f(pp):
+        m = by_id(pp.get("mrs", []), mid)
+        if not m or m.get("status") not in MR_ACTIVE:
+            return None
+        return _close_mr_in(pp, mid, "terminée", "Marquée terminée par l’utilisateur.")
+    ready = mp(u, pid, f)
+    m = by_id(snap(u, pid).get("mrs", []), mid) or {}
+    if ready is None:
+        return log(u, pid, "Système", "Vous", "Merge request introuvable ou déjà close : rien à faire.")
+    log(u, pid, "Système", "Vous", "Merge request #%s « %s » marquée terminée : elle ne bloque plus les agents ni la release.%s" % (
+        m.get("n", "?"), m.get("title", ""), (" Tâches désormais débloquées : %s." % ", ".join("« %s »" % x for x in ready)) if ready else ""))
+
+
 def mr_retry(u, pid, mid):
     mp(u, pid, lambda pp: (by_id(pp.get("mrs", []), mid) or {}).pop("merge_tries", None))
     log(u, pid, "Système", "Vous", merge_mr(u, pid, mid))
@@ -2058,7 +2149,9 @@ def release(u, pid, version, notes):
         return log(u, pid, "Système", who, "Release %s enregistrée localement : dépôt/token non configuré, ni fusion ni tag." % version)
     if not cy:
         return log(u, pid, "Système", "Vous", "Aucune release en cours : démarrez-en une (« Démarrer une release ») avant de la publier.")
-    opn = [m for m in p.get("mrs", []) if m.get("status") in ("ouverte", "conflit")]
+    sync_mrs(u, pid, force=True)                       # une MR déjà close sur GitHub ne doit pas empêcher la publication
+    p = snap(u, pid)
+    opn = [m for m in p.get("mrs", []) if m.get("status") in MR_ACTIVE]
     if opn:
         return log(u, pid, "Système", "Vous", "Publication impossible : %d merge request(s) encore ouverte(s) (%s). Validez-les ou refusez-les d’abord." % (len(opn), ", ".join("#%s" % m["n"] for m in opn)))
     mp(u, pid, lambda pp: pp.__setitem__("releasing", True))
@@ -2105,6 +2198,8 @@ def start(u, j):
             "agent_reset": lambda: agent_reset(u, pid, j.get("agentId"), bool(j.get("history", True)), bool(j.get("notes", False)), bool(j.get("branch", False)), bool(j.get("onboard", True))),
             "cycle_start": lambda: cycle_start(u, pid, str(j.get("version", ""))),
             "mr_retry": lambda: mr_retry(u, pid, j.get("mrId")),
+            "mr_done": lambda: mr_done(u, pid, j.get("mrId")),
+            "mr_sync": lambda: mr_sync(u, pid),
             "decide": lambda: decide(u, pid, j.get("decisionId"), str(j.get("decision", "")), str(j.get("note", "")), j.get("fields") or {}, str(j.get("answer", ""))),
             "instr_add": lambda: instr_add(u, pid, str(j.get("scope", "global")), str(j.get("text", ""))),
             "instr_del": lambda: mp(u, pid, lambda pp: pp.__setitem__("instructions", [i for i in pp.get("instructions", []) if i["id"] != j.get("instrId")]))}
@@ -2114,7 +2209,7 @@ def start(u, j):
     def run():
         try:
             jobs[t]()
-            if t in ("decide", "mr_retry", "cycle_start", "instr_add"):
+            if t in ("decide", "mr_retry", "mr_done", "mr_sync", "cycle_start", "instr_add"):
                 tick(u, pid)                              # la décision peut débloquer des tâches : on les lance sans attendre
         except Exception as e:  # ne jamais perdre un échec silencieusement
             try:

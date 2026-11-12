@@ -217,6 +217,15 @@ class Repo:
             pr = lst[0]
         return {"number": pr["number"]}
 
+    def pr_state(self, number):
+        """État d'une MR sur GitHub : 'open', 'merged' (fusionnée), 'closed' (fermée sans fusion) ou 'missing' (introuvable : accès ou numéro)."""
+        pr = self._c("GET", "/pulls/%d" % number, ok404=True)
+        if pr is None:
+            return "missing"
+        if pr.get("merged") or pr.get("merged_at"):
+            return "merged"
+        return "open" if pr.get("state") == "open" else "closed"
+
     def pr_merge_number(self, number):
         """Fusionne une MR ouverte : 'merged' ou 'conflict' (non fusionnable)."""
         st, d = self._s("PUT", "/pulls/%d/merge" % number, {"merge_method": "merge"})
