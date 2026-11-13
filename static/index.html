@@ -1,7 +1,8 @@
 <!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Atelier d’agents IA</title>
+<title>myTeam</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
 :root{color-scheme:light;--bg:#f6f7f9;--sf:#fff;--tx:#1b1f24;--mu:#667085;--bd:#d9dde3;--ac:#3b5bdb;--ac2:#e7ecff;--ok:#2b8a3e;--wa:#e8590c;--er:#c92a2a;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#14171c;--sf:#1d2128;--tx:#e8eaed;--mu:#9aa3b0;--bd:#323944;--ac:#7c93ff;--ac2:#273055;--ok:#69db7c;--wa:#ffa94d;--er:#ff8787}}
@@ -10,7 +11,7 @@ html{scroll-padding-top:env(safe-area-inset-top,0px)}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
 #app{display:flex;min-height:100vh}
 nav{width:210px;background:var(--sf);border-right:1px solid var(--bd);padding:14px 10px;display:flex;flex-direction:column;gap:4px;flex-shrink:0}
-nav h1{font-size:15px;margin:0 6px 10px}nav .sec{font-size:11px;color:var(--mu);text-transform:uppercase;margin:12px 8px 2px}
+nav h1{font-size:15px;margin:0 6px 10px;display:flex;flex-direction:column;align-items:center;gap:6px}nav h1 .logo{width:150px;max-width:100%;height:auto}nav .sec{font-size:11px;color:var(--mu);text-transform:uppercase;margin:12px 8px 2px}
 nav button{text-align:left;border:0;background:none;color:var(--tx);padding:8px 10px;border-radius:6px;cursor:pointer;font:inherit}
 nav button:hover{background:var(--bg)}nav button.on{background:var(--ac2);color:var(--ac);font-weight:600}
 main{flex:1;padding:20px;min-width:0;overflow-x:auto}
@@ -85,7 +86,7 @@ function modal(title,fields,cb,okLabel){
   $("#mo").onclick=()=>{const o={};document.querySelectorAll("#mb [data-k]").forEach(e=>o[e.dataset.k]=e.multiple?[...e.selectedOptions].map(x=>x.value):e.value);$("#mod").style.display="none";cb(o);save();render()};
 }
 function login(){
-  $("#root").innerHTML=`<div id="login"><div class="card"><h2 style="margin:0">Atelier d’agents IA</h2><span class="mu">Connectez-vous ou créez un compte (les données restent sur cet appareil).</span><input id="u" placeholder="Identifiant" autocomplete="username"><input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password"><div style="color:var(--er)">${esc(err)}</div><button class="b" id="in">Connexion</button><button class="g" id="cr">Créer le compte</button></div></div>`;
+  $("#root").innerHTML=`<div id="login"><div class="card"><img class="logo" src="/logo-myteam.png" alt="myTeam logo" style="align-self:center;width:150px"><h2 style="margin:0;text-align:center">myTeam</h2><span class="mu">Connectez-vous ou créez un compte (les données restent sur cet appareil).</span><input id="u" placeholder="Identifiant" autocomplete="username"><input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password"><div style="color:var(--er)">${esc(err)}</div><button class="b" id="in">Connexion</button><button class="g" id="cr">Créer le compte</button></div></div>`;
   const go=async mk=>{const u=$("#u").value.trim(),p=$("#p").value;if(!u||!p){err="Identifiant et mot de passe requis.";return login()}
     try{const r=await api("POST",mk?"/api/register":"/api/login",{user:u,password:p});TOK=r.token;U=u;try{localStorage.setItem("apm_tok",TOK);localStorage.setItem("apm_user",U)}catch(e){}D=await loadState();if(mk)save();err="";render()}catch(e){err=e.message;login()}};
   $("#in").onclick=()=>go(false);$("#cr").onclick=()=>go(true);
@@ -94,7 +95,7 @@ function logout(){clearTimeout(st);api("POST","/api/logout").catch(()=>{});TOK=U
 function render(){
   if(!U)return login();
   const open=D.projects.filter(p=>p.open);
-  let nav=`<nav><h1>Atelier d’agents IA</h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}${pendN(p)+(p.pending||[]).length?` <span class="tag wa">${pendN(p)+(p.pending||[]).length}</span>`:""}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
+  let nav=`<nav><h1><img class="logo" src="/logo-myteam.png" alt="myTeam logo"><span>myTeam</span></h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}${pendN(p)+(p.pending||[]).length?` <span class="tag wa">${pendN(p)+(p.pending||[]).length}</span>`:""}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
   let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():projView();
   const keep={},ae=document.activeElement,fid=ae&&ae.id,fs=ae&&ae.selectionStart;document.querySelectorAll("[data-keep]").forEach(e=>{keep[e.id]=e.value});const sc={};document.querySelectorAll("[data-scroll]").forEach(e=>{sc[e.id]={t:e.scrollTop,b:e.scrollHeight-e.scrollTop-e.clientHeight<40}});
   $("#root").innerHTML=`<div id="app">${nav}<main>${body}</main></div>`;

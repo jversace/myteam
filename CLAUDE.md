@@ -25,6 +25,7 @@ Application de gestion de projets de développement par une **équipe d'agents I
 | `github.py` | classe `Repo` : branches, fichiers, **fusions (`/merges`), comparaisons, détection et résolution de conflits (commit de fusion à 2 parents via l'API Git Data)**, PR, release |
 | `ai.py` | `call_ai` : API Anthropic ou compatible OpenAI |
 | `static/index.html` | toute l'IHM (aucune logique d'agent : elle envoie des travaux au serveur) |
+| `static/logo-myteam.png`, `static/favicon.png` | logo (barre de menu et écran de connexion, au-dessus du titre « myTeam ») et icône d'onglet ; servis par `server.py` avec leur type MIME (charset ajouté seulement aux types texte) |
 | `tests/test_locks.py` | tests des verrous et du répertoire local |
 | `tests/test_engine.py` | tests (faux GitHub local + IA scriptée) : `python -m unittest discover -s tests` |
 

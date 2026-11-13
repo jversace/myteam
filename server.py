@@ -95,7 +95,8 @@ class H(BaseHTTPRequestHandler):
             raise Err(404, "Introuvable")
         b = f.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", (mimetypes.guess_type(f.name)[0] or "text/plain") + "; charset=utf-8")
+        ct = mimetypes.guess_type(f.name)[0] or "text/plain"
+        self.send_header("Content-Type", ct + ("; charset=utf-8" if ct.startswith("text/") or ct.endswith(("json", "javascript")) else ""))
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
