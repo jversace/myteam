@@ -77,7 +77,7 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"bug","title":"...","desc":"...","sev":"mineur|majeur|critique","modules":["<module>"]} : déclarer un bug (selon tes droits)',
     '{"do":"bug_fix","bug":"<id>","title":"...","desc":"...","assignee":"<prénom>"} : créer une sous-tâche de correction d’un bug',
     '{"do":"bug_status","id":"<id>","status":"en correction|corrigé|vérifié|rouvert"} : faire évoluer un bug (vérifié/rouvert : droit de vérification)',
-    '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>"} : poser une question à l’utilisateur (ambiguïté, décision structurante)',
+    '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>","replaces":[<n° des décisions en attente auxquelles cette question répond aussi>]} : poser une question à l’utilisateur (ambiguïté, décision structurante) ; si elle répond aussi à une question déjà en attente, indique son numéro dans replaces : l’ancienne est annulée et remplacée',
     '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur',
     '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications'])
 
@@ -393,6 +393,61 @@ def check_budget(p):
         raise Err(402, "Plafond de budget atteint (%.2f $) : les agents en mode API sont en pause. Relevez le plafond dans l’onglet Coût." % bud)
 
 
+def _dec_key(d):
+    """Clé « sujet » d'une décision : deux décisions en attente de même clé portent sur la même chose."""
+    for k in ("conflict", "mr_review", "wf_run", "review"):
+        if d.get(k):
+            return (k, d[k])
+    if d.get("escalation") and d.get("task"):
+        return ("escalation", d["task"])
+    if d.get("kind") != "question":
+        p = d.get("payload") or {}
+        return (d["kind"], rights.norm(p.get("title") or p.get("name")))
+    return None
+
+
+def _dec_words(s):
+    return set(re.findall(r"\w{4,}", str(s or "").lower()))
+
+
+def _supersedes(new, old, replaces):
+    """Vrai si la décision `new` (la plus récente) remplace la décision en attente `old`."""
+    if old["id"] == new["id"] or old["status"] != "attente":
+        return False
+    if old.get("n") in replaces:
+        return True
+    kn, ko = _dec_key(new), _dec_key(old)
+    if kn or ko:
+        return kn is not None and kn == ko
+    a, b = _dec_words(new.get("question")), _dec_words(old.get("question"))
+    if not a or not b:
+        return False
+    sim = len(a & b) / len(a | b)
+    same_task = bool(new.get("task")) and new.get("task") == old.get("task")
+    return sim >= (0.3 if same_task else 0.5)
+
+
+def add_decision(pp, d, replaces=()):
+    """Ajoute une décision en attente ; celles, plus anciennes, auxquelles elle répond aussi sont annulées et remplacées
+    (même sujet : conflit, merge request, workflow, validation, proposition identique ; question très proche ;
+    ou numéros indiqués explicitement par l'agent dans `replaces`). Retourne la liste des numéros remplacés."""
+    reps = set()
+    for r in replaces or ():
+        m = re.search(r"\d+", str(r))
+        if m:
+            reps.add(int(m.group()))
+    olds = [x for x in pp.get("decisions", []) if _supersedes(d, x, reps)]
+    pp.setdefault("decisions", []).append(d)
+    for x in olds:
+        x.update(status="remplacée", note="Remplacée par la décision n° %s." % d.get("n", "?"), replaced_by=d["id"],
+                 done=now(), n_done=rights.next_seq(pp))
+        t = by_id(pp.get("tasks", []), x.get("task"))
+        if t and t.get("blocked") == x["id"]:
+            t.pop("blocked", None)
+            t["status"], t["touched"] = "à faire", time.time()
+    return [x.get("n") for x in olds]
+
+
 def propose(u, pid, a, kind, data):
     """Enregistre une proposition dans la boîte « Décisions » (None si une proposition identique attend déjà)."""
     def f(pp):
@@ -402,7 +457,7 @@ def propose(u, pid, a, kind, data):
             return None
         d = {"id": uid(), "n": rights.next_seq(pp), "kind": kind, "by": a["id"], "byName": a["name"], "d": now(),
              "status": "attente", "payload": data, "why": data.get("why", "")}
-        pp.setdefault("decisions", []).append(d)
+        add_decision(pp, d)
         return d
     return mp(u, pid, f)
 
@@ -590,7 +645,7 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                 d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": aid, "byName": a["name"], "d": now(), "status": "attente",
                      "question": q, "options": [str(o) for o in (x.get("options") or [])][:4], "recommendation": str(x.get("recommendation", "")),
                      "impact": str(x.get("impact", "")), "structural": bool(x.get("structural")), "task": tid}
-                pp.setdefault("decisions", []).append(d)
+                add_decision(pp, d, x.get("replaces") if isinstance(x.get("replaces"), list) else ())
                 t = by_id(pp["tasks"], tid)
                 if t:
                     t["status"], t["blocked"] = "en attente", d["id"]
@@ -714,13 +769,15 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
         if not ans:
             raise Err(400, "Réponse vide")
         opts, tid = d.get("options") or [], d.get("task") or ""
+        nt = str(note or "").strip() if ans in opts else ""       # précision saisie avec le clic sur une option
+        full = ans + (" — précision de l’utilisateur : " + nt if nt else "")
 
         def f(pp):
             dd = by_id(pp["decisions"], did)
-            dd.update(status="répondue", answer=ans, done=now(), n_done=rights.next_seq(pp))
+            dd.update(status="répondue", answer=full, done=now(), n_done=rights.next_seq(pp))
             if dd.get("structural"):
                 pp.setdefault("instructions", []).append({"id": uid(), "n": rights.next_seq(pp), "d": now(), "by": "Décision", "scope": "global",
-                                                          "active": True, "text": "Décision (%s) : %s → %s" % (dd["byName"], dd["question"], ans)})
+                                                          "active": True, "text": "Décision (%s) : %s → %s" % (dd["byName"], dd["question"], full)})
             t = by_id(pp["tasks"], tid)
             if t and t.get("blocked") == did:
                 t.pop("blocked", None)
@@ -728,12 +785,12 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                 if not dd.get("escalation"):
                     t["status"] = "en cours"
         mp(u, pid, f)
-        log(u, pid, "Vous", ag["name"] if ag else "Suivi", "Réponse à la question « %s » : %s" % (title, ans))
+        log(u, pid, "Vous", ag["name"] if ag else "Suivi", "Réponse à la question « %s » : %s" % (title, full))
         if d.get("review"):                                   # validation de fin de tâche par l'utilisateur
             if ans == opts[0]:
-                log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "accepted", "Validée par l’utilisateur"))
+                log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "accepted", "Validée par l’utilisateur" + (" — " + nt if nt else "")))
             else:
-                log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "rejected", ans if ans != opts[1] else "Refusée par l’utilisateur"))
+                log(u, pid, "Système", "Vous", apply_review(u, pid, tid, "Vous", "rejected", (nt or "Refusée par l’utilisateur") if ans == opts[1] else ans))
         elif d.get("wf_run"):                                 # suite d'un workflow mis en pause
             rid, i = d["wf_run"], d.get("wf_step", 0)
 
@@ -749,7 +806,7 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                     run["step"] = i
                     return "next"
                 if d.get("wf_after") != "ko":
-                    run.setdefault("results", []).append({"i": i + 1, "outcome": "ok", "comment": ans[:300], "d": now()})
+                    run.setdefault("results", []).append({"i": i + 1, "outcome": "ok", "comment": full[:300], "d": now()})
                 run["step"] = i + 1
                 return "next"
             if mp(u, pid, g) == "next":
@@ -765,19 +822,19 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                     c = by_id(snap(u, pid)["conflicts"], cid)
                     resolve_conflict(u, pid, cid, mgr["id"] if (ans == opts[1] and mgr) else c["agent"])
         elif d.get("mr_review"):                              # validation de merge request par l'utilisateur
-            log(u, pid, "Système", "Vous", apply_mr_review(u, pid, d["mr_review"], "Vous", "approved" if ans == opts[0] else "rejected", "" if ans == opts[0] else "Refusée par l’utilisateur"))
+            log(u, pid, "Système", "Vous", apply_mr_review(u, pid, d["mr_review"], "Vous", "approved" if ans == opts[0] else "rejected", nt if ans == opts[0] else (nt or "Refusée par l’utilisateur")))
         elif d.get("escalation"):                             # décision sur une tâche bloquée
             if len(opts) > 2 and ans == opts[1]:
                 mp(u, pid, lambda pp: by_id(pp["tasks"], tid).__setitem__("status", "en attente"))
             elif len(opts) > 2 and ans == opts[2]:
-                mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(status="terminée", abandoned=True, result="Abandonnée sur décision de l’utilisateur."))
+                mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(status="terminée", abandoned=True, result="Abandonnée sur décision de l’utilisateur." + (" " + nt if nt else "")))
             else:
                 mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(relaunch_n=0, sup_n=0))
-                run_task(u, pid, tid, note="[Décision de l’utilisateur] " + ("Reprends la tâche." if ans == opts[0] else ans))
+                run_task(u, pid, tid, note="[Décision de l’utilisateur] " + (("Reprends la tâche." + (" Précision : " + nt if nt else "")) if ans == opts[0] else full))
         elif tid and ag:                                      # l'agent reprend lui-même sa tâche, sans nouvelle demande
-            run_task(u, pid, tid, note="[Décision de l’utilisateur] Réponse à ta question « %s » : %s\nReprends la tâche en tenant compte de cette décision." % (title, ans))
+            run_task(u, pid, tid, note="[Décision de l’utilisateur] Réponse à ta question « %s » : %s\nReprends la tâche en tenant compte de cette décision." % (title, full))
         elif ag:
-            ask(u, pid, ag["id"], "Réponse de l’utilisateur à ta question « %s » : %s" % (title, ans), "Vous")
+            ask(u, pid, ag["id"], "Réponse de l’utilisateur à ta question « %s » : %s" % (title, full), "Vous")
         return
     if decision == "accept":
         pay = dict(d["payload"])
@@ -1116,7 +1173,7 @@ def add_escalation(pp, t, reason, review=False):
         d["recommendation"] = "Relancer la tâche"
         t["blocked"], t["status"] = d["id"], "en attente"
     t["touched"] = time.time()
-    pp.setdefault("decisions", []).append(d)
+    add_decision(pp, d)
     return d
 
 
@@ -1356,7 +1413,7 @@ def wf_after(u, pid, rid, i, st, outcome, comment):
                  "question": "Le workflow « %s » a échoué à l’étape %d (%s). Que faire ?" % (run["name"], i + 1, str(comment)[:200] or "sans détail"),
                  "options": ["Continuer malgré l’échec", "Relancer cette étape", "Arrêter le workflow"], "recommendation": "Relancer cette étape", "impact": "",
                  "wf_run": rid, "wf_step": i, "wf_after": "ko"}
-            pp.setdefault("decisions", []).append(d)
+            add_decision(pp, d)
             run["waiting"] = d["id"]
             return "wait"
         run.update(status="arrêté", note="étape %d en échec : %s" % (i + 1, str(comment)[:200]), ended=now())
@@ -1380,7 +1437,7 @@ def wf_do_step(u, pid, p, wf, run, i, st):
             d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": "", "byName": "Workflow", "d": now(), "status": "attente", "task": "", "structural": False,
                  "question": "Workflow « %s », étape %d : %s" % (wf["name"], i + 1, st.get("text", "")), "options": ["Continuer", "Arrêter le workflow"], "recommendation": "", "impact": "",
                  "wf_run": run["id"], "wf_step": i, "wf_after": "gate"}
-            pp.setdefault("decisions", []).append(d)
+            add_decision(pp, d)
             r["waiting"] = d["id"]
         mp(u, pid, gate)
         return "ok", "", True
@@ -1844,7 +1901,7 @@ def conflict_decision(pp, c, reason=""):
              c["branch"], owner["name"], c.get("target", ""), ", ".join(c["files"]) or "(fichiers non identifiés)", (reason + " ") if reason else ""),
          "options": list(CONFLICT_OPTS), "recommendation": CONFLICT_OPTS[0], "structural": False, "task": "", "conflict": c["id"],
          "impact": "La fusion et les tâches qui en dépendent restent bloquées tant que le conflit n’est pas résolu."}
-    pp.setdefault("decisions", []).append(d)
+    add_decision(pp, d)
     return d
 
 
@@ -1966,7 +2023,7 @@ def submit_mr(u, pid, aid, title="", body="", task=""):
 
 
 def add_mr_decision(pp, m):
-    pp.setdefault("decisions", []).append({
+    add_decision(pp, {
         "id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": m.get("by_id", ""), "byName": "Fusion", "d": now(), "status": "attente", "task": "",
         "question": "La merge request #%s « %s » (%s → %s) attend une validation et aucun agent ne peut la faire. La fusionner ?" % (m["n"], m.get("title", ""), m["from"], m["to"]),
         "options": ["Oui, fusionner", "Non, la refuser"], "recommendation": "Oui, fusionner", "impact": "", "structural": False, "mr_review": m["id"]})

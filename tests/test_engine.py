@@ -466,6 +466,34 @@ class Droits(unittest.TestCase):
         self.assertIn("REST", vus[0][1])                                                                  # l'agent reçoit la réponse
         self.assertTrue(any("REST ou GraphQL" in i["text"] for i in p["instructions"]))                   # décision structurante -> instructions
 
+    def test_precision_saisie_avec_une_option(self):
+        self.act("a2", do="ask_user", question="Le module est-il prêt ?", options=["A — Oui", "B — Pas encore, il manque quelque chose (précise)"], task="t1")
+        d = proj()["decisions"][0]
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return "Compris."
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.decide("u", "p1", d["id"], "answer", answer="B — Pas encore, il manque quelque chose (précise)", note="la validation des mots de passe")
+        d = proj()["decisions"][0]
+        self.assertIn("la validation des mots de passe", d["answer"])             # la précision est conservée dans le journal
+        self.assertTrue(d["answer"].startswith("B — Pas encore"))
+        self.assertIn("la validation des mots de passe", vus[0])                  # et transmise à l'agent
+
+    def test_decision_recente_remplace_les_anciennes(self):
+        self.act("a2", do="ask_user", question="Faut-il utiliser REST ou GraphQL pour l’API des projets ?", options=["REST", "GraphQL"], task="t1")
+        self.act("a1", do="ask_user", question="Quelle technologie utiliser pour l’API des projets : REST ou GraphQL ?", options=["REST", "GraphQL"], task="t1")
+        self.act("a1", do="ask_user", question="Quelle couleur pour le bouton principal ?", options=["Bleu", "Vert"])
+        dec = proj()["decisions"]
+        self.assertEqual([x["status"] for x in dec], ["remplacée", "attente", "attente"])   # la plus ancienne est remplacée par la plus récente
+        self.assertEqual(dec[0]["replaced_by"], dec[1]["id"])
+        self.assertEqual(proj()["tasks"][0]["blocked"], dec[1]["id"])                       # la tâche attend désormais la nouvelle décision
+        self.act("a1", do="ask_user", question="Choix final, sans rapport de mots", options=["X", "Y"], replaces=[dec[2]["n"]])
+        self.assertEqual([x["status"] for x in proj()["decisions"]], ["remplacée", "attente", "remplacée", "attente"])   # remplacement explicite
+        with self.assertRaises(engine.Err):
+            engine.decide("u", "p1", dec[0]["id"], "answer", answer="REST")                  # une décision remplacée n'est plus traitable
+
     def test_refus_renvoye_a_l_agent(self):
         self.act("a1", do="module", name="X", why="y")
         vus = []
