@@ -11,7 +11,7 @@ Application de gestion de projets de développement par une **équipe d'agents I
 - Front : `static/index.html`, SPA **fichier unique** (HTML + CSS + JS, sans framework ni build), servie par le backend.
 - Persistance : fichiers JSON dans `data/` (ignoré par git) : `users.json` (hash PBKDF2), `sessions.json`, `users/<user>.json` (**état complet** d'un utilisateur). Pas de base de données pour l'instant.
 - Git/GitHub : **API REST GitHub** via `urllib` (pas de git local). Dépôt + token au niveau projet.
-- Variables : `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`, `APM_GITHUB_API` (tests), `APM_SUPERVISE_SECONDS` (passage du suivi, 60 ; 0 = désactivé). Windows : `start.bat` ; macOS : `start.command`.
+- Variables : `APM_PORT` (8000), `APM_HOST` (127.0.0.1), `APM_DATA`, `APM_ALLOW_REGISTER`, `APM_GITHUB_API` (tests), `APM_SUPERVISE_SECONDS` (passage du suivi, 60 ; 0 = désactivé), `APM_LOCK_TTL` (900 s : expiration d'un verrou sans activité de son détenteur), `APM_LOCK_ORPHAN` (120 s : verrou d'un agent sans travail en cours), `APM_LOCK_WAIT` (90 s : attente maximale d'un verrou dans une action). Windows : `start.bat` ; macOS : `start.command`.
 
 ## Fichiers
 | Fichier | Rôle |
@@ -21,9 +21,11 @@ Application de gestion de projets de développement par une **équipe d'agents I
 | `project_rules.py` | **règles du projet** (fonctions pures) : règles par agent, workflows, planification (`due`), contrôle de cohérence (`lint`), différences (`diff`), texte des prompts |
 | `rights.py` | **droits des agents** : capacités par rôle, autonomie du projet, création de tâches/modules/bugs, cycle de vie des bugs, instructions |
 | `engine.py` | **moteur d'agents serveur** : dialogues, actions, tâches, onboarding, releases, reprise après quota |
+| `locks.py` | **répertoire local et verrous de fichiers** : accès borné au répertoire, verrous exclusifs avec attente, détection de verrou circulaire, expiration, arrêt/annulation d'un agent |
 | `github.py` | classe `Repo` : branches, fichiers, **fusions (`/merges`), comparaisons, détection et résolution de conflits (commit de fusion à 2 parents via l'API Git Data)**, PR, release |
 | `ai.py` | `call_ai` : API Anthropic ou compatible OpenAI |
 | `static/index.html` | toute l'IHM (aucune logique d'agent : elle envoie des travaux au serveur) |
+| `tests/test_locks.py` | tests des verrous et du répertoire local |
 | `tests/test_engine.py` | tests (faux GitHub local + IA scriptée) : `python -m unittest discover -s tests` |
 
 ## API (JSON, `Authorization: Bearer <token>`)
@@ -37,7 +39,7 @@ Application de gestion de projets de développement par une **équipe d'agents I
 ## Concurrence navigateur / serveur (important)
 Le navigateur et le moteur modifient le même état. `store.put` fait une fusion **à trois voies** : base = dernier instantané reçu par le navigateur (`rev`, 8 gardés + celui servant de base), theirs = état disque, mine = état envoyé. Les listes d'objets avec `id` sont fusionnées par id (suppressions locales respectées, créations serveur conservées) ; en cas de vrai conflit sur une valeur, **le navigateur gagne**. Conséquences :
 - Tout nouvel élément de liste doit avoir un `id`. Les listes sans `id` (`log`, `commits`, `history`…) sont écrites **uniquement par le serveur**.
-- Champs écrits par le serveur : `log, commits, mrs, releases, cycle, conflicts, spec, releasing`, `agent.{history,notes,work,state}`, `task.{running,result,retry_at}`, tâches/bugs créés par les agents. Le navigateur ne doit pas les modifier (`ensure()` ne doit que **compléter** les champs manquants).
+- Champs écrits par le serveur : `log, commits, mrs, releases, cycle, conflicts, spec, releasing`, `agent.{history,notes,work,state}`, `task.{running,result,retry_at,stopped}`, `locks`, `lock_wait`, tâches/bugs créés par les agents. Le navigateur ne doit pas les modifier (`ensure()` ne doit que **compléter** les champs manquants).
 - Le front adopte l'état serveur (sondage ou réponse du PUT) sauf s'il a des modifications en attente ou une fenêtre modale ouverte.
 
 ## Modèle de données (état utilisateur)
@@ -118,6 +120,13 @@ Cause des « agents qui s'arrêtent » corrigée ici : avant, rien ne lançait l
 - `api` (défaut) : `ai.call_ai` avec la clé du service. `manual` : **chat manuel**, sans API : `engine.manual_exchange` publie un prompt dans `p.pending` (`{id,agent,name,service,full,short,new,d}`), le thread **attend** (`WAIT`, 24 h) que l'utilisateur colle la réponse du chatbot (`/api/manual/answer`) ; les actions de la réponse sont ensuite exécutées comme d'habitude (les retours de lecture arrivent dans un nouveau prompt). `full` = instructions complètes (nouvelle conversation), `short` = suite (`agent.session` mémorise qu'une conversation existe).
 - **Décision : on n'automatise pas les sites de chat** (claude.ai, chatgpt.com…) : pas d'API publique pour les abonnements grand public, conditions d'utilisation contraires (Anthropic l'applique techniquement), fragile. Alternatives gratuites sans automatisation de site : API à offre gratuite (ex. Gemini via AI Studio, avec limites) ou modèle local compatible OpenAI (ex. Ollama : service `kind:"openai"`, URL `http://localhost:11434/v1`, clé factice).
 - `p.pending` est écrit par le serveur uniquement ; `recover()` le vide au démarrage.
+
+## Répertoire local et verrous de fichiers (`locks.py` + `engine.py`)
+- **Projet** : `p.localdir` (chemin absolu sur la machine du serveur, onglet Git & releases, bouton « Répertoire local » ; le job `localdir_check` vérifie l'accès). **Agent** : `a.source` = `github` (défaut : sa branche, pull, merge requests) ou `local` (répertoire local partagé : ni branche, ni pull, ni merge request ; son fichier de contexte est écrit dans `<localdir>/.agents/<Prénom>.md`). `local_agent(p, a)`.
+- `repo_act` aiguille vers `local_act` si l'agent est `local` (ou s'il lit les fichiers d'un agent `local` via `agent:`). Lecture/liste libres (avertissement si le fichier est verrouillé par un autre) ; **écriture/suppression : verrou exigé**. Sans verrou explicite, le verrou est pris le temps de l'écriture (« éphémère »). Chemins bornés au répertoire (`locks.resolve`, liens symboliques compris) ; écriture interdite dans `.git/`, `.github/`, `.agents/` ; écriture atomique (fichier temporaire + `os.replace`). Chaque écriture est tracée dans `p.commits` (sha `local`).
+- **Verrous** (`p.locks`, `p.lock_wait`, écrits par le serveur seulement) : exclusifs, par fichier. Actions `lock_file {paths}` (tout ou rien, jusqu'à 10 fichiers, **attend** que les autres agents aient libéré, `APM_LOCK_WAIT`), `unlock_file`, `get_locks`. File d'attente équitable (premier arrivé, premier servi ; attentes périmées ignorées après 15 s). Le verrou garde une sauvegarde du fichier d'origine (`data/lockbak/<projet>/`, ≤ 2 Mo) pour l'annulation.
+- **Secours** : (1) verrou circulaire détecté à la demande (graphe d'attente, `locks.cycle`) → la demande qui boucle la chaîne est refusée aussitôt, avec la chaîne dans le message ; (2) expiration après `APM_LOCK_TTL` sans activité du détenteur, et libération des verrous « orphelins » (détenteur sans travail en cours depuis `APM_LOCK_ORPHAN`) par `tick` (même si le suivi est désactivé) ; (3) `recover()` libère tout au démarrage ; (4) fin de tâche (`finally` de `run_task`) libère tout ; (5) `stop_agent {agent, cancel, reason}` (agent principal) ou job `agent_stop` (utilisateur) : l'agent est interrompu (`locks.STOP` + `check_stop` dans `ask`/`do_act`/attente de verrou : un appel IA déjà parti n'est pas coupé, mais ses actions ne sont pas exécutées), ses verrous sont libérés, sa tâche passe `en attente` (`task.stopped`) ; avec `cancel`, les fichiers qu'il avait verrouillés sont remis dans leur état d'avant (fichiers créés supprimés) ; (6) `force_unlock {path}` (agent principal, refusé si le détenteur travaille encore) et jobs `lock_release` / `locks_clear` (utilisateur). Le diagnostic liste verrous, attentes et verrous circulaires. Panneau « Verrous de fichiers » dans l'onglet Équipe.
+- Limites : verrous exclusifs (pas de verrou partagé en lecture) ; pas de commit git du répertoire local (c'est à l'utilisateur de le faire) ; un fichier modifié à la main pendant qu'un agent le verrouille n'est pas protégé.
 
 ## Conventions de travail
 - Modifier `static/index.html` par remplacements ciblés ; vérifier la syntaxe JS (extraire le `<script>` et `node --check`).

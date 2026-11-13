@@ -6,11 +6,13 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
 from datetime import datetime
 
 import github
+import locks
 import project_rules as prules
 import rights
 from ai import call_ai
@@ -47,17 +49,23 @@ RULES = [
     "Pour connaître l’avancement d’un autre agent, utilise d’abord get_progress (sans coût) ; n’interroge l’agent par message que pour obtenir une précision.",
     "Une tâche ou un bug peut être rattaché à un ou plusieurs modules, sans obligation (ex. le cahier des charges est global). Un bug se corrige par des sous-tâches de correction (bug_fix) ; quand elles sont terminées, il passe à « corrigé » et le QA le vérifie.",
     "Chaque release a une branche de travail (release/<version>) ; la branche principale est réservée à la release finale. Tu te synchronises avec la branche de travail par pull (fait automatiquement au démarrage d’une tâche et avant une merge request) ; quand ton travail est prêt, tu soumets une merge request (merge_request) vers cette branche ; l’agent principal la valide. Une tâche qui dépend d’une autre ne démarre que lorsque celle-ci est terminée et sa merge request fusionnée. En cas de conflit de fusion, la règle du projet décide qui le résout (l’utilisateur, l’auteur de la branche ou un agent désigné) ; si le conflit t’est confié, résous-le avec resolve_merge.",
-    "Tu n’as aucun environnement d’exécution local ni dépôt git local : tout passe par les actions de l’application et l’API GitHub. Il n’existe donc ni répertoire .git, ni état « MERGE_HEAD », ni environnement à nettoyer ou à redémarrer. Quand une action est refusée, lis le message : il donne la cause et la suite ; n’invente pas de cause absente du message et ne demande jamais à l’utilisateur de « nettoyer » un environnement. Pour connaître les vraies causes d’un blocage, appelle get_blockers avant de poser une question technique.",
+    "Tu n’as aucun environnement d’exécution local ni dépôt git local : tout passe par les actions de l’application et l’API GitHub (ou, si tu travailles sur le répertoire local du projet, par ces mêmes actions : tu n’as pas de terminal). Il n’existe donc ni répertoire .git, ni état « MERGE_HEAD », ni environnement à nettoyer ou à redémarrer. Quand une action est refusée, lis le message : il donne la cause et la suite ; n’invente pas de cause absente du message et ne demande jamais à l’utilisateur de « nettoyer » un environnement. Pour connaître les vraies causes d’un blocage, appelle get_blockers avant de poser une question technique.",
     "Les règles globales, tes règles spécifiques et les workflows du projet sont écrits par l’utilisateur et priment sur ta propre initiative. Un workflow est un enchaînement d’étapes à respecter : déclenche-le avec run_workflow quand une règle te le demande ; quand une étape te est confiée, réalise-la puis conclus-la avec wf_step (ok ou ko). Si deux règles te semblent se contredire, applique la plus spécifique et signale la contradiction à l’agent principal.",
     "Prends l’initiative de la coordination : avant de coder ce qui dépend du travail d’un autre agent ou qui l’impacte (interface, contrat d’API, schéma de données, convention), écris-lui avec message pour convenir de l’approche ; préviens-le quand tu modifies ce qu’il utilise ; réponds toujours aux messages que tu reçois. « Travail des autres agents » et get_progress te disent qui fait quoi.",
     "Ne t’arrête pas à la première erreur : analyse-la, corrige et continue (relis le fichier, change d’approche). Si tu es réellement bloqué, écris à l’agent qui peut t’aider ou pose la question avec ask_user ; ne laisse jamais une tâche en suspens sans le dire.",
     "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
+    "Si tu travailles sur le RÉPERTOIRE LOCAL du projet (section « Dépôt et intégration »), il est partagé avec d’autres agents : verrouille chaque fichier AVANT de le lire pour le modifier (lock_file), modifie-le, puis libère-le dès que tu as fini (unlock_file). Si un fichier est verrouillé par un autre agent, la demande attend qu’il le libère ; ne le contourne jamais. Ne garde pas de verrou plus longtemps que nécessaire, et ne verrouille pas dans un ordre qui peut croiser celui d’un autre agent : demande tous tes fichiers d’un coup (lock_file accepte une liste). Il n’y a ni pull ni merge request sur le répertoire local.",
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
     '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>"} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
     '{"do":"write_file","path":"...","content":"<contenu complet>","message":"<message de commit>"} : créer ou remplacer un fichier sur ta branche',
     '{"do":"delete_file","path":"...","message":"..."} : supprimer un fichier sur ta branche',
+    '{"do":"lock_file","paths":["<fichier>"],"note":"<pourquoi, facultatif>"} : (répertoire local) verrouiller des fichiers avant de les modifier ; attend que les autres agents les libèrent (jusqu’à 90 s), tout ou rien',
+    '{"do":"unlock_file","paths":["<fichier>"]} : (répertoire local) libérer des fichiers verrouillés (sans « paths » : tous les tiens)',
+    '{"do":"get_locks"} : (répertoire local) fichiers verrouillés, par qui, et agents en attente (sans coût)',
+    '{"do":"stop_agent","agent":"<prénom>","cancel":false,"reason":"..."} : (agent principal) arrêter le travail d’un agent et libérer tous ses verrous ; cancel=true annule aussi ses modifications sur les fichiers qu’il avait verrouillés (retour à l’état d’avant)',
+    '{"do":"force_unlock","path":"<fichier>","reason":"..."} : (agent principal) libérer de force le verrou d’un fichier (détenteur inactif ou plantage) ; si le détenteur travaille encore, utilise stop_agent',
     '{"do":"pull"} : récupérer dans ta branche les changements de la branche de travail de la release (fusion ; en cas de conflit, la règle du projet s’applique)',
     '{"do":"merge_request","title":"...","body":"...","task":"<id de la tâche, facultatif>"} : soumettre ta branche à la branche de travail de la release (l’agent principal la valide)',
     '{"do":"mr_review","id":"<id de la MR>","verdict":"approved|rejected","comment":"..."} : (agent principal / QA) valider (fusion) ou refuser une merge request',
@@ -80,6 +88,11 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>","replaces":[<n° des décisions en attente auxquelles cette question répond aussi>]} : poser une question à l’utilisateur (ambiguïté, décision structurante) ; si elle répond aussi à une question déjà en attente, indique son numéro dans replaces : l’ancienne est annulée et remplacée',
     '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur',
     '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications'])
+
+
+def local_agent(p, a):
+    """Vrai si l'agent travaille sur le répertoire local du projet plutôt que sur sa branche GitHub."""
+    return a.get("source") == "local"
 
 
 def is_main(p, a):
@@ -139,7 +152,7 @@ def ctx_text(p, a):
         ("\n## Règles du projet\n" + p["rules"]) if p.get("rules") else "",
         ("\n" + prules.agent_rules_text(p, a, "##")) if (a.get("rules") or "").strip() else "", ("\n" + prules.workflows_text(p, a, "##")) if prules.workflows_text(p, a) else "",
         "\n## Mon rôle\n%s — %s" % (r["name"], r["desc"]),
-        "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
+        ("\n## Mon espace de travail\nRépertoire local du projet : %s (partagé : verrouille les fichiers avant de les modifier). Pas de branche, pas de pull ni de merge request." % (p.get("localdir") or "non défini")) if local_agent(p, a) else "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
         "\n## Droits\n%s\n- Agents joignables : %s" % (rights.rights_text(p, a, mn), talk),
         "\n## " + ACTIONS, "\n## Notes de l’agent (à tenir à jour)\n" + (a.get("notes") or "(vides)")])
 
@@ -160,6 +173,11 @@ def teamwork_text(p, a):
 
 
 def repo_text(p, a):
+    if local_agent(p, a):
+        return ("Tu travailles sur le RÉPERTOIRE LOCAL du projet : %s (pas de branche, pas de pull ni de merge request).\n"
+                "Ce répertoire est partagé avec d’autres agents : verrouille un fichier (lock_file) avant de le modifier et libère-le (unlock_file) dès que tu as fini. "
+                "Un fichier verrouillé par un autre agent est inaccessible en écriture tant qu’il ne l’a pas libéré (ta demande attend).\n"
+                "Fichiers verrouillés actuellement :\n%s") % (p.get("localdir") or "non défini", locks.text(p, a["id"]))
     rp, cy, pol = p.get("repo") or {}, p.get("cycle"), p.get("conflict_policy") or "ask"
     ptxt = {"ask": "l’utilisateur décide", "author": "l’auteur de la branche résout"}.get(pol) or "l’agent %s résout" % (by_id(p["agents"], pol[6:]) or {}).get("name", "?")
     return "Branche principale : %s (réservée à la release finale).\n%s\nTa branche : %s.\nConflits de fusion : %s." % (
@@ -190,8 +208,9 @@ def sys_prompt(p, a):
         prules.agent_rules_text(p, a), prules.workflows_text(p, a),
         ("# Instructions de l’utilisateur (à respecter)\n" + "\n".join(ins)) if ins else "",
         ("# Nouveautés depuis ta dernière activité\n" + "\n".join(news)) if news else "",
-        "# Toi\nPrénom : %s\nRôle : %s — %s\nBranche git : %s (branche de base : %s)\n%s" % (
-            a["name"], r["name"], r["desc"], a["branch"], repo.get("branch", "main"),
+        "# Toi\nPrénom : %s\nRôle : %s — %s\n%s\n%s" % (
+            a["name"], r["name"], r["desc"],
+            "Espace de travail : répertoire local du projet" if local_agent(p, a) else "Branche git : %s (branche de base : %s)" % (a["branch"], repo.get("branch", "main")),
             "Tu es l’AGENT PRINCIPAL : tu peux écrire à tous les agents et tu tiens les spécifications à jour. Quand l’utilisateur te donne un élément durable (consigne, contrainte, décision), enregistre-le avec l’action instruction et mets les spécifications à jour si besoin. Tu assures aussi le suivi : tu vérifies chaque tâche « à vérifier » (task_review : accepted seulement si le travail demandé est réellement fait — lis les fichiers de l’agent avec read_file et \"agent\" —, sinon rejected avec ce qui manque), tu interroges et relances (relaunch) les agents qui semblent bloqués, et tu remontes à l’utilisateur (ask_user) tout problème autre qu’un simple manque de tokens (ceux-là sont relancés automatiquement)." if mn else ""),
         "# Tes droits\n" + rights.rights_text(p, a, mn),
         "# Dépôt et intégration\n" + repo_text(p, a),
@@ -245,7 +264,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None)
         log(u, pid, frm, a["name"], text)
     work(u, pid, aid, 1)
     try:
-        msg, final, ctx, overflow = "[%s] %s" % (frm, text), "", {"n": 0}, 0
+        msg, final, ctx, overflow = "[%s] %s" % (frm, text), "", {"n": 0, "t0": time.time()}, 0
         for _ in range(max_steps or MAX_STEPS):
             p = snap(u, pid)
             a = by_id(p["agents"], aid)
@@ -258,6 +277,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None)
             h = list(a.get("history", []))[-30:]
             while h and h[0]["role"] != "user":
                 h.pop(0)
+            locks.check_stop(u, pid, aid, ctx["t0"])           # arrêté par l'agent principal / l'utilisateur : on ne fait plus rien
             if not manual:
                 check_budget(p)
             sp = sys_prompt(p, a)
@@ -280,6 +300,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None)
                 continue
             if getattr(out, "usage", None) and s:
                 record_usage(u, pid, aid, s, out.usage)
+            locks.check_stop(u, pid, aid, ctx["t0"])           # arrêté pendant l'appel IA : les actions de cette réponse ne sont pas exécutées
             clean, acts = parse_acts(out)
             keep = msg if len(msg) < 3000 else msg[:3000] + "\n[…tronqué]"
             keep_out = out if len(out) < 6000 else out[:6000] + "\n[…tronqué dans l’historique]"
@@ -498,7 +519,8 @@ def progress_text(p, who):
 
 def do_act(u, pid, aid, x, depth, ctx=None):
     """Exécute une action d'agent. Retourne (note pour l'historique, retour pour l'agent ou None)."""
-    ctx = ctx if ctx is not None else {"n": 0}
+    ctx = ctx if ctx is not None else {"n": 0, "t0": time.time()}
+    locks.check_stop(u, pid, aid, ctx.get("t0", 0))
     p = snap(u, pid)
     a = by_id(p["agents"], aid)
     mn, kind = is_main(p, a), x.get("do")
@@ -517,7 +539,9 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             r = ask(u, pid, t["id"], str(x.get("text", "")), a["name"], depth + 1)
             return "", "[Réponse de %s] %s" % (t["name"], r or "(pas de réponse écrite)")
         if kind in ("list_files", "read_file", "write_file", "delete_file"):
-            return repo_act(u, pid, p, a, x, kind)
+            return repo_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
+        if kind in ("lock_file", "unlock_file", "get_locks", "stop_agent", "force_unlock"):
+            return lock_act(u, pid, p, a, x, kind, mn, ctx.get("t0", 0))
         if kind == "get_progress":
             return "", progress_text(p, x.get("agent"))
         if kind == "get_blockers":
@@ -651,6 +675,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                     t["status"], t["blocked"] = "en attente", d["id"]
             mp(u, pid, f)
             return "Question transmise à l’utilisateur : %s%s" % (q, " (tâche en attente de décision)" if tid else ""), None
+        if kind in ("pull", "merge_request") and local_agent(p, a):
+            return refuse("Tu travailles sur le répertoire local du projet : il n’y a ni pull ni merge request (partage par verrous de fichiers).")
         if kind == "pull":
             st, msg = pull(u, pid, aid)
             return msg, msg
@@ -862,7 +888,59 @@ def instr_add(u, pid, scope, text):
     log(u, pid, "Système", "Vous", "Instruction enregistrée (%s) : %s" % (sc, text))
 
 
-def repo_act(u, pid, p, a, x, kind):
+def local_act(u, pid, p, a, x, kind, t0=0):
+    """Fichiers du RÉPERTOIRE LOCAL du projet. Toute écriture exige le verrou du fichier : s'il est libre il est pris le temps de l'écriture,
+    s'il est tenu par un autre agent la demande attend qu'il soit libéré (voir locks.acquire)."""
+    path = safe_path(x.get("path"), write=kind in ("write_file", "delete_file"))
+    refuse = lambda m: (m, m)
+    if kind == "list_files":
+        items = locks.list_dir(p, path)
+        if items is None:
+            return refuse("Dossier introuvable : /%s" % path)
+        lines = "\n".join("- %s%s" % (i["name"], "/" if i["type"] == "dir" else " (%s o)" % i["size"]) for i in items)
+        return "Liste de /%s (%d éléments, répertoire local)" % (path, len(items)), "Contenu de /%s dans le répertoire local :\n%s" % (path, lines or "(vide)")
+    if kind == "read_file":
+        t = locks.read_text(p, path)
+        if t is None:
+            return refuse("Fichier introuvable : %s" % path)
+        l = locks.holder_of(p, path)
+        warn = ("\n⚠ Ce fichier est verrouillé par %s (modifications en cours) : son contenu peut changer." % l["name"]) if l and l["by"] != a["id"] else ""
+        cut = len(t) > 12000
+        return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s (répertoire local) :\n%s\n%s\n%s%s%s" % (path, F, t[:12000], F, "\n[…tronqué à 12000 caractères]" if cut else "", warn)
+    content = None
+    if kind == "write_file":
+        content = str(x.get("content", ""))
+        if len(content) > 200000:
+            raise Err(413, "Fichier trop volumineux (200 000 caractères maximum)")
+    held = locks.held_by(p, path, a["id"])
+    if not held:
+        ok, m = locks.acquire(u, pid, a["id"], [path], note="écriture", since=t0, log=lambda m: log(u, pid, "Système", "Vous", m))
+        if not ok:
+            return refuse("Écriture refusée : " + m)
+    try:
+        with locks.IO:                                     # jamais en même temps qu'une restauration (annulation du travail de l'agent)
+            locks.check_stop(u, pid, a["id"], t0)
+            if not locks.held_by(snap(u, pid), path, a["id"]):
+                return refuse("Écriture refusée : ton verrou sur %s a été libéré (expiré ou libéré par l’agent principal). Redemande-le avec lock_file puis recommence." % path)
+            msg = str(x.get("message") or "") or ("update %s" % path if kind == "write_file" else "delete %s" % path)
+            if kind == "write_file":
+                locks.write_text(p, path, content)
+            elif not locks.delete(p, path):
+                return refuse("Fichier introuvable : %s" % path)
+    finally:
+        if not held:
+            locks.release(u, pid, a["id"], [path])         # verrou « éphémère » : pris pour cette écriture seulement
+    if held:
+        locks.touch(u, pid, a["id"])
+    record_commit(u, pid, a["name"], msg, "local")
+    return "Fichier %s dans le répertoire local : %s%s" % ("écrit" if kind == "write_file" else "supprimé", path, " (verrou conservé)" if held else ""), None
+
+
+def repo_act(u, pid, p, a, x, kind, t0=0):
+    tgt0 = str(x.get("agent") or "").strip()
+    other = next((g for g in p["agents"] if g["name"].lower() == tgt0.lower()), None) if tgt0 and kind in ("list_files", "read_file") else None
+    if (local_agent(p, a) and not (tgt0 and kind in ("list_files", "read_file"))) or (other and local_agent(p, other)):
+        return local_act(u, pid, p, a, x, kind, t0)
     rp, b = github.Repo(p), a["branch"]
     path = safe_path(x.get("path"), write=kind in ("write_file", "delete_file"))
     if kind in ("write_file", "delete_file") and b in (rp.base, rp.work):
@@ -909,9 +987,112 @@ def repo_act(u, pid, p, a, x, kind):
     return "Fichier supprimé sur %s : %s (%s)" % (b, path, sha[:7]), None
 
 
+def lock_report(p):
+    items = [i for i in locks.diag(p)]
+    return "Verrous de fichiers (répertoire local) :\n" + ("\n".join("- [%s] %s %s" % (i["level"], i["who"], i["text"]) for i in items) if items else "(aucun verrou, personne en attente)")
+
+
+def lock_act(u, pid, p, a, x, kind, mn, t0=0):
+    refuse = lambda m: (m, m)
+    byname = lambda n: next((g for g in p["agents"] if g["name"].lower() == str(n or "").lower()), None)
+    sysl = lambda m: log(u, pid, "Système", "Vous", m)
+    if kind == "get_locks":
+        return "", lock_report(p)
+    if kind in ("lock_file", "unlock_file"):
+        if not local_agent(p, a):
+            return refuse("Les verrous ne concernent que le répertoire local du projet ; tu travailles sur ta branche GitHub (pas de verrou nécessaire).")
+        paths = x.get("paths") if isinstance(x.get("paths"), list) else ([x["path"]] if x.get("path") else [])
+        if kind == "lock_file":
+            paths = [safe_path(i, write=True) for i in paths if isinstance(i, str)]
+            ok, m = locks.acquire(u, pid, a["id"], paths, note=str(x.get("note", "")), since=t0, log=sysl)
+            return (m, None) if ok else refuse(m)
+        freed = locks.release(u, pid, a["id"], [safe_path(i) for i in paths if isinstance(i, str)])
+        return ("Verrou(s) libéré(s) : %s." % ", ".join(freed)) if freed else "Aucun verrou à libérer.", None
+    if not mn:
+        return refuse("Action réservée à l’agent principal.")
+    if kind == "stop_agent":
+        t = byname(x.get("agent"))
+        if not t or t["id"] == a["id"]:
+            return refuse("Agent inconnu (ou toi-même) : %s." % x.get("agent"))
+        m = stop_agent(u, pid, t["id"], bool(x.get("cancel")), a["name"], str(x.get("reason", ""))[:300])
+        return m, m
+    path = safe_path(x.get("path"))
+    l = locks.holder_of(p, path)
+    if not l:
+        return refuse("Aucun verrou sur %s." % path)
+    h = by_id(p["agents"], l["by"]) or {}
+    if (h.get("work") or 0) > 0 or any(t.get("who") == l["by"] and t.get("running") for t in p["tasks"]):
+        return refuse("%s travaille encore : arrête-le d’abord avec stop_agent (ou attends) plutôt que de lui retirer son verrou en cours de route." % l["name"])
+    locks.force_release(u, pid, l["id"])
+    m = "Verrou sur « %s » (détenu par %s) libéré de force par %s%s." % (path, l["name"], a["name"], (" — " + str(x.get("reason"))[:200]) if x.get("reason") else "")
+    return m, m
+
+
+def stop_agent(u, pid, aid, cancel=False, by="Vous", reason=""):
+    """Arrête le travail d'un agent : ses actions suivantes sont refusées, ses verrous sont libérés ; avec `cancel`, les fichiers qu'il avait
+    verrouillés sont remis dans leur état d'avant. Sa tâche passe « en attente » (à relancer). Un appel IA déjà parti n'est pas interrompu,
+    mais ses actions ne sont pas exécutées."""
+    p = snap(u, pid)
+    a = by_id(p["agents"], aid)
+    if not a:
+        raise Err(404, "Agent introuvable")
+    reason = reason or "décision de %s" % by
+    locks.request_stop(u, pid, aid, cancel, by, reason)
+    for pe in p.get("pending", []):                         # échange manuel en attente : annulé
+        w = WAIT.get(pe["id"])
+        if pe["agent"] == aid and w and w["u"] == u:
+            w["ev"].set()
+    freed, restored, lost = locks.release_agent(u, pid, aid, restore=cancel)
+
+    def f(pp):
+        ag = by_id(pp["agents"], aid)
+        live = (ag.get("work") or 0) > 0
+        for t in pp["tasks"]:
+            if t.get("who") == aid and (t.get("running") or t["status"] == "en cours"):
+                t["status"], t["touched"] = "en attente", time.time()
+                t["stopped"] = {"by": by, "reason": reason, "cancel": bool(cancel), "d": now()}
+                for k in ("retry_at", "fail"):
+                    t.pop(k, None)
+                if not live:
+                    t["running"] = False
+        pp["pending"] = [x for x in pp.get("pending", []) if x["agent"] != aid]
+    mp(u, pid, f)
+    txt = "%s %s par %s (%s). Verrous libérés : %s.%s%s" % (
+        a["name"], "annulé (travail défait)" if cancel else "arrêté", by, reason, ", ".join(freed) or "aucun",
+        (" Fichiers remis dans leur état d’avant : %s." % ", ".join(restored)) if restored else "",
+        (" Non restaurables (pas de sauvegarde) : %s." % ", ".join(lost)) if lost else "")
+    log(u, pid, "Système", "Vous", txt + " Sa tâche est « en attente » : relancez-la quand vous voulez.")
+    log(u, pid, "Système", a["name"], "Tu as été %s : %s. Tes verrous ont été libérés ; attends une nouvelle consigne." % ("arrêté, ton travail est annulé" if cancel else "arrêté", reason))
+    return txt
+
+
+def lock_release(u, pid, lid):
+    l = locks.force_release(u, pid, lid)
+    log(u, pid, "Système", "Vous", ("Verrou sur « %s » (détenu par %s) libéré à votre demande ; l’agent n’est pas arrêté." % (l["path"], l["name"])) if l else "Verrou introuvable (déjà libéré).")
+
+
+def locks_clear(u, pid):
+    log(u, pid, "Système", "Vous", "%d verrou(x) libéré(s) à votre demande." % locks.clear_all(u, pid))
+
+
+def localdir_check(u, pid):
+    try:
+        m = locks.check_dir(snap(u, pid))
+    except Err as e:
+        m = "Répertoire local inutilisable : " + e.msg
+    log(u, pid, "Système", "Vous", m)
+
+
 def provision(u, pid, aid):
     p = snap(u, pid)
     a = by_id(p["agents"], aid)
+    if local_agent(p, a):                                  # répertoire local : pas de branche ; le fichier de contexte est écrit dans .agents/
+        try:
+            with locks.IO:
+                locks.write_text(p, ".agents/%s.md" % a["name"], ctx_text(p, a), internal=True)
+            return "Répertoire local : fichier .agents/%s.md écrit." % a["name"]
+        except Err as e:
+            return "Répertoire local inutilisable : %s" % e.msg
     try:
         rp = github.Repo(p)
     except Err:
@@ -942,7 +1123,7 @@ def sync_all(u, pid):
     for a in snap(u, pid)["agents"]:
         r = provision(u, pid, a["id"])
         log(u, pid, "Système", a["name"], "Synchronisation : " + r)
-        out.append({"agent": a["name"], "branch": a.get("branch", ""), "ok": r.startswith("Branche "), "text": r})
+        out.append({"agent": a["name"], "branch": a.get("branch", ""), "ok": r.startswith(("Branche ", "Répertoire local :")), "text": r})
     return out
 
 
@@ -1055,7 +1236,7 @@ def run_task(u, pid, tid, retry=False, note=""):
         if tt.get("running"):                              # déjà lancée par un autre passage
             return False
         tt.update(running=True, status="en cours", started=time.time(), touched=time.time())
-        for k in ("retry_at", "fail", "blocked", "waiting", "resume", "result_note"):
+        for k in ("retry_at", "fail", "blocked", "waiting", "resume", "result_note", "stopped"):
             tt.pop(k, None)
         by_id(pp["agents"], a["id"])["state"] = "actif"
         return True
@@ -1065,20 +1246,24 @@ def run_task(u, pid, tid, retry=False, note=""):
     replies = []
     try:
         pull_note = ""
-        try:                                               # pull régulier : on repart de la branche de travail à jour
-            state, pm = pull(u, pid, a["id"], origin="pull", task=tid)
-            if state == "conflict":
-                mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(running=False, status="en attente"))
-                return
-            pull_note = "\n(Pull automatique : %s)" % pm
-        except Err as e:
-            pull_note = "\n(Pull impossible : %s)" % e.msg
+        if local_agent(p, a):                              # répertoire local partagé : ni pull, ni branche
+            pull_note = "\n(Répertoire local partagé : verrouille chaque fichier avant de le modifier, libère-le dès que tu as fini.)"
+        else:
+            try:                                           # pull régulier : on repart de la branche de travail à jour
+                state, pm = pull(u, pid, a["id"], origin="pull", task=tid)
+                if state == "conflict":
+                    mp(u, pid, lambda pp: by_id(pp["tasks"], tid).update(running=False, status="en attente"))
+                    return
+                pull_note = "\n(Pull automatique : %s)" % pm
+            except Err as e:
+                pull_note = "\n(Pull impossible : %s)" % e.msg
         p = snap(u, pid)
         msg = "Exécute cette tâche (id %s) : %s%s%s%s%s%s%s\nRéponds avec ton livrable. Quand tu as terminé, mets le statut à « à vérifier » avec task_status et un compte rendu précis de ce qui est fait ; s’il reste du travail ou un blocage, ne dis pas que c’est terminé : décris ce qui manque ou pose la question avec ask_user." % (
             tid, t["title"], ("\n" + t["desc"]) if t.get("desc") else "",
             ("\nModules : " + ", ".join(mod_names(p, t.get("modules")))) if t.get("modules") else "", dep_context(p, t), coordination_hint(p, a),
             ("\n" + note) if note else "", pull_note)
-        msg += "\nQuand ton travail est prêt, soumets une merge request vers la branche de travail de la release avec l’action merge_request, puis passe la tâche à « à vérifier »."
+        msg += ("\nQuand ton travail est prêt, libère tes verrous (unlock_file) puis passe la tâche à « à vérifier »." if local_agent(p, a)
+                else "\nQuand ton travail est prêt, soumets une merge request vers la branche de travail de la release avec l’action merge_request, puis passe la tâche à « à vérifier ».")
         idle = 0
         for _ in range(MAX_ROUNDS):
             stats = {}
@@ -1120,12 +1305,25 @@ def run_task(u, pid, tid, retry=False, note=""):
         mp(u, pid, fin)
         if by_id(snap(u, pid)["tasks"], tid)["status"] == "à vérifier":
             try:
+                if local_agent(snap(u, pid), a):
+                    raise Err(0, "")                       # répertoire local : pas de merge request
                 st, mm = submit_mr(u, pid, a["id"], "Tâche : %s" % t["title"], "", tid)
                 if st in ("submitted", "conflict"):
                     log(u, pid, "Système", a["name"], mm)
             except Err as e:
-                log(u, pid, "Système", a["name"], "Merge request non soumise : %s" % e.msg)
+                if e.msg:
+                    log(u, pid, "Système", a["name"], "Merge request non soumise : %s" % e.msg)
             spawn(review_task, u, pid, tid)
+    except locks.Stopped as e:                             # arrêté / annulé par l'agent principal ou l'utilisateur : ni nouvelle tentative, ni échec
+        def stp(pp):
+            tt = by_id(pp["tasks"], tid)
+            if tt:
+                tt["running"], tt["touched"] = False, time.time()
+                if tt["status"] == "en cours":
+                    tt["status"] = "en attente"
+                tt.setdefault("stopped", {"by": "?", "reason": e.msg, "cancel": False, "d": now()})
+                tt["result"] = "Arrêtée : " + e.msg
+        mp(u, pid, stp)
     except Err as e:
         kind = classify(e)
 
@@ -1157,6 +1355,13 @@ def run_task(u, pid, tid, retry=False, note=""):
                           result="Erreur interne : %s" % str(e)[:250])
         mp(u, pid, crash)
         log(u, pid, "Système", a["name"], "Erreur interne pendant la tâche « %s » : %s : %s" % (t["title"], type(e).__name__, e))
+    finally:                                               # un verrou ne survit jamais à la tâche (réussie, échouée, arrêtée ou plantée)
+        try:
+            freed = locks.release(u, pid, a["id"])
+            if freed:
+                log(u, pid, "Système", a["name"], "Fin de tâche : verrou(x) libéré(s) : %s." % ", ".join(freed))
+        except Exception:
+            pass
 
 
 def add_escalation(pp, t, reason, review=False):
@@ -1551,6 +1756,14 @@ def tick(u, pid):
             sync_mrs(u, pid)                               # MR closes sur GitHub retirées des blocages (sans IA, même si le suivi est désactivé)
         except Exception as ex:
             print("Erreur de synchronisation des merge requests (%s/%s) : %s" % (u, pid, ex), flush=True)
+        try:                                               # verrous expirés ou orphelins libérés (même si le suivi est désactivé)
+            pl = snap(u, pid)
+            if pl.get("locks") or pl.get("lock_wait"):
+                busy = {a["id"] for a in pl["agents"] if a.get("work")} | {t["who"] for t in pl["tasks"] if t.get("running") and t.get("who")}
+                for n in locks.maintain(u, pid, busy):
+                    log(u, pid, "Système", "Vous", n)
+        except Exception as ex:
+            print("Erreur de maintenance des verrous (%s/%s) : %s" % (u, pid, ex), flush=True)
         _tick(u, pid)
         wf_timers(u, pid)                                  # minuteries des workflows (indépendantes du suivi)
     finally:
@@ -1608,7 +1821,8 @@ def _tick(u, pid):
     if report:
         msg = ("[Suivi automatique] Des tâches semblent bloquées (les simples manques de tokens sont relancés automatiquement et ne figurent pas ici) :\n%s\n"
                "Pour chacune : consulte d’abord get_blockers (faits), puis interroge l’agent concerné (message) pour comprendre ; si le problème est résolu ou contournable, relance-le avec relaunch ; "
-               "sinon (décision à prendre, information manquante, erreur répétée), remonte-le à l’utilisateur avec ask_user en indiquant la tâche.") % "\n".join(
+               "sinon (décision à prendre, information manquante, erreur répétée), remonte-le à l’utilisateur avec ask_user en indiquant la tâche. "
+               "Si un verrou de fichier est en cause (get_locks), libère-le avec force_unlock ou arrête l’agent avec stop_agent.") % "\n".join(
             "- %s « %s » — agent %s — %s" % (t["id"], t["title"], a["name"], cause) for t, a, cause in report)
         try:
             ask(u, pid, mg["id"], msg, "Suivi automatique")
@@ -1800,7 +2014,9 @@ def agent_reset(u, pid, aid, history=True, notes=False, branch=False, onboard_af
         if pe["agent"] == aid and w and w["u"] == u:
             w["ev"].set()
     rp = None
-    if branch:
+    if branch and local_agent(p, a):
+        done.append("agent sur le répertoire local : pas de branche à réinitialiser")
+    elif branch:
         try:
             rp = github.Repo(p)
             if a["branch"] in (rp.base, rp.work):
@@ -1832,6 +2048,9 @@ def agent_reset(u, pid, aid, history=True, notes=False, branch=False, onboard_af
                 if m.get("by_id") == aid and m.get("status") in ("ouverte", "conflit"):
                     m["status"], m["note"] = "annulée", "agent réinitialisé"
     mp(u, pid, f)
+    freed = locks.release(u, pid, aid)
+    if freed:
+        done.append("verrous libérés : %s" % ", ".join(freed))
     if rp:
         try:
             rp.reset_branch(a["branch"], rp.work)
@@ -1869,6 +2088,10 @@ def diagnose(p):
             out.append({"who": who, "level": "attente", "text": "« %s » : %s." % (t["title"], "vérification en cours" if t.get("reviewing") else "en attente de vérification")})
         if t.get("running") and not (by_id(p["agents"], t.get("who")) or {}).get("work") and t0 - t.get("touched", t0) > STALE_RUNNING:
             out.append({"who": who, "level": "bloquant", "text": "« %s » : exécution figée (sera réinitialisée automatiquement)." % t["title"]})
+    for t in p["tasks"]:
+        if t.get("stopped") and t["status"] == "en attente":
+            out.append({"who": name(t.get("who")), "level": "attente", "text": "« %s » arrêtée par %s (%s) : à relancer." % (t["title"], t["stopped"].get("by", "?"), t["stopped"].get("reason", ""))})
+    out += locks.diag(p)
     pend = [d for d in p.get("decisions", []) if d["status"] == "attente"]
     if pend:
         out.append({"who": "Vous", "level": "attente", "text": "%d décision(s) vous attendent (onglet Décisions)." % len(pend)})
@@ -2260,6 +2483,10 @@ def start(u, j):
             "conflict_action": lambda: conflict_action(u, pid, j.get("conflictId"), str(j.get("action", ""))),
             "agent_reset": lambda: agent_reset(u, pid, j.get("agentId"), bool(j.get("history", True)), bool(j.get("notes", False)), bool(j.get("branch", False)), bool(j.get("onboard", True))),
             "cycle_start": lambda: cycle_start(u, pid, str(j.get("version", ""))),
+            "lock_release": lambda: lock_release(u, pid, j.get("lockId")),
+            "locks_clear": lambda: locks_clear(u, pid),
+            "agent_stop": lambda: stop_agent(u, pid, j.get("agentId"), bool(j.get("cancel")), "Vous", str(j.get("reason", ""))[:300]),
+            "localdir_check": lambda: localdir_check(u, pid),
             "mr_retry": lambda: mr_retry(u, pid, j.get("mrId")),
             "mr_done": lambda: mr_done(u, pid, j.get("mrId")),
             "mr_sync": lambda: mr_sync(u, pid),
@@ -2272,7 +2499,7 @@ def start(u, j):
     def run():
         try:
             jobs[t]()
-            if t in ("decide", "mr_retry", "mr_done", "mr_sync", "cycle_start", "instr_add"):
+            if t in ("decide", "lock_release", "locks_clear", "agent_stop", "mr_retry", "mr_done", "mr_sync", "cycle_start", "instr_add"):
                 tick(u, pid)                              # la décision peut débloquer des tâches : on les lance sans attendre
         except Exception as e:  # ne jamais perdre un échec silencieusement
             try:
@@ -2291,6 +2518,10 @@ def recover():
             for p in st.get("projects", []):
                 p["releasing"] = False
                 p["pending"] = []
+                n = len(p.get("locks", []))                    # plus aucun agent ne travaille : aucun verrou ne doit survivre au redémarrage
+                p["locks"], p["lock_wait"] = [], []
+                if n:
+                    p.setdefault("log", []).append({"d": now(), "from": "Système", "to": "Vous", "text": "Redémarrage du serveur : %d verrou(x) de fichiers libéré(s)." % n})
                 for c in p.get("conflicts", []):
                     if c.get("status") == "ouvert":
                         c["status"] = "pause"
@@ -2305,5 +2536,7 @@ def recover():
                         t["running"], t["status"], t["result"] = False, "à faire", "Interrompu par un redémarrage du serveur."
                     t.pop("reviewing", None)
         mutate(u, fix)
+        locks.STOP.clear()
+        shutil.rmtree(DATA / "lockbak", ignore_errors=True)
         for pid, tid, w in retries:
             schedule(u, pid, tid, w)

@@ -88,6 +88,14 @@ Token GitHub : permissions *Contents* et *Pull requests* en lecture/écriture su
 
 Chaque agent garde son historique (20 derniers messages) et le renvoie au service IA à chaque tâche. Si le service répond « quota atteint » (HTTP 429), l'agent passe en **suspendu** puis relance la tâche automatiquement après le délai indiqué.
 
+## Répertoire local et verrous de fichiers
+
+En plus du dépôt GitHub, un projet peut avoir un **répertoire local** (onglet Git & releases → « Répertoire local ») : un dossier de la machine où tourne le serveur. Dans le formulaire de chaque agent, **Source de travail** choisit s'il travaille sur sa branche GitHub (comme avant) ou sur ce répertoire local (sans branche ni merge request).
+
+Pour que deux agents ne s'écrasent pas, tout fichier du répertoire local est **verrouillé** avant d'être modifié : si un autre agent le tient, la demande attend qu'il le libère (90 s au plus, puis l'agent est prévenu et réessaie).
+
+Si un verrou reste bloqué, plusieurs secours existent : un verrou circulaire est refusé tout de suite ; un verrou expire après 15 min sans activité du détenteur (2 min s'il ne travaille plus) ; tout est libéré au redémarrage de l'application et à la fin d'une tâche. L'agent principal (actions `stop_agent`, `force_unlock`) ou vous (panneau « Verrous de fichiers » de l'onglet Équipe : **Libérer**, **Arrêter l'agent**, **Annuler son travail**, **Tout libérer**) pouvez arrêter un agent ou annuler son travail : les fichiers qu'il avait verrouillés sont alors remis dans leur état d'avant.
+
 ## Tests
 ```
 python -m unittest discover -s tests
@@ -106,6 +114,7 @@ Aucun réseau ni clé nécessaires (faux GitHub local, IA simulée).
 | `APM_DATA` | `./data` | dossier de données |
 | `APM_ALLOW_REGISTER` | `1` | `0` pour fermer la création de comptes |
 | `APM_SUPERVISE_SECONDS` | `60` | période du suivi automatique des tâches (`0` = désactivé) |
+| `APM_LOCK_TTL` / `APM_LOCK_ORPHAN` / `APM_LOCK_WAIT` | `900` / `120` / `90` | secondes : expiration d'un verrou inactif / verrou d'un agent sans travail / attente maximale d'un verrou |
 
 ## Déploiement sur serveur Linux (plus tard)
 Même commande : `APM_HOST=127.0.0.1 python3 server.py`, derrière un reverse proxy HTTPS (nginx ou Caddy), lancé par une unité systemd. Ne jamais exposer le port en HTTP clair sur Internet.
