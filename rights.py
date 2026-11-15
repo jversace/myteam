@@ -6,28 +6,29 @@ from datetime import datetime
 
 from store import Err
 
-CAPS = ["subtask", "task_top", "module", "bug", "bug_update", "bug_verify", "link"]
+CAPS = ["subtask", "task_top", "module", "bug", "bug_update", "bug_verify", "mr_review", "link"]
 FREE, APPROVE, NO = "free", "approve", "no"
 MAX_TASK_DEPTH = 4
 STATUS = ("à faire", "en cours", "en attente", "à vérifier", "terminée")
 BUG_STATUS = ("ouvert", "en correction", "corrigé", "vérifié", "rouvert")
 BUG_CLOSED = ("vérifié", "résolu")        # « résolu » : ancien statut conservé
 
-_BASE = {"subtask": FREE, "task_top": NO, "module": NO, "bug": FREE, "bug_update": FREE, "bug_verify": NO, "link": FREE}
+_BASE = {"subtask": FREE, "task_top": NO, "module": NO, "bug": FREE, "bug_update": FREE, "bug_verify": NO, "mr_review": NO, "link": FREE}
 # Capacités par défaut des rôles standard (à garder synchronisées avec DEF_CAPS de static/index.html)
 DEFAULT_CAPS = {
-    "Chef de projet": {**_BASE, "task_top": APPROVE, "module": APPROVE, "bug_verify": FREE},
-    "Architecte": {**_BASE, "task_top": APPROVE, "module": APPROVE, "bug_verify": FREE},
+    "Chef de projet": {**_BASE, "task_top": APPROVE, "module": APPROVE, "bug_verify": FREE, "mr_review": FREE},
+    "Architecte": {**_BASE, "task_top": APPROVE, "module": APPROVE, "bug_verify": FREE, "mr_review": FREE},
     "Développeur back-end": dict(_BASE),
     "Développeur front-end": dict(_BASE),
-    "Testeur QA": {**_BASE, "task_top": APPROVE, "bug_verify": FREE},
+    "Testeur QA": {**_BASE, "task_top": APPROVE, "bug_verify": FREE, "mr_review": FREE},
     "DevOps": dict(_BASE),
     "Rédacteur technique": {**_BASE, "bug": NO, "bug_update": NO},
 }
 CAP_TXT = {"subtask": "Créer des sous-tâches (sous les tâches dont tu es responsable)",
            "task_top": "Créer des tâches de premier niveau", "module": "Créer des modules",
            "bug": "Déclarer des bugs", "bug_update": "Faire évoluer les bugs (en correction, corrigé)",
-           "bug_verify": "Vérifier ou rouvrir un bug", "link": "Associer tâches et bugs à des modules"}
+           "bug_verify": "Vérifier ou rouvrir un bug",
+           "mr_review": "Valider (fusionner) ou refuser les merge requests des autres agents", "link": "Associer tâches et bugs à des modules"}
 LV_TXT = {FREE: "libre", APPROVE: "soumis à validation (tu proposes, l'utilisateur décide)", NO: "interdit"}
 AUTONOMY_TXT = {"prudent": "prudent (toute création est soumise à validation)",
                 "balanced": "équilibré", "auto": "autonome (seules les décisions structurantes remontent)"}
@@ -66,7 +67,12 @@ def next_seq(pp):
 def level(p, a, cap, main=False):
     """Niveau effectif d'une capacité pour un agent : libre, soumis à validation ou interdit."""
     r = by_id(p.get("roles", []), a.get("role")) or {}
-    c = (a.get("caps") or {}).get(cap) or (r.get("caps") or {}).get(cap) or DEFAULT_CAPS.get(r.get("name"), _BASE).get(cap, NO)
+    c = (a.get("caps") or {}).get(cap) or (r.get("caps") or {}).get(cap)
+    if c is None and cap == "mr_review":             # rôles créés avant ce droit : on reprend « vérifier un bug »
+        c = (a.get("caps") or {}).get("bug_verify") or (r.get("caps") or {}).get("bug_verify")
+    c = c or DEFAULT_CAPS.get(r.get("name"), _BASE).get(cap, NO)
+    if cap == "mr_review":                           # validation : libre ou interdite (pas de niveau « soumis à validation »)
+        return FREE if main or c == FREE else NO
     if main and cap in ("task_top", "module") and c == NO:
         c = APPROVE
     if cap == "bug" and a.get("canBug") and c == NO:

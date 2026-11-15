@@ -865,6 +865,27 @@ class Integration(unittest.TestCase):
         self.set(mrs=[dict(proj()["mrs"][0], by_id="a1")])
         self.assertIn("propre merge request", do("a1", do="mr_review", id=mid, verdict="approved")[1])
 
+    def test_droit_valider_les_mr_par_role(self):
+        """Le droit « mr_review » s'accorde par rôle ; l'auteur ne valide jamais sa propre MR."""
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        engine.submit_mr("u", "p1", "a2", "Login")
+        mid = proj()["mrs"][0]["id"]
+        do = lambda aid, **x: engine.do_act("u", "p1", aid, x, 0)
+        self.assertIn("refusée pour ton rôle", do("a2", do="mr_review", id=mid, verdict="approved")[1])
+        st = store.load("u")                                                                     # on accorde le droit au rôle « Développeur back-end »
+        for r in st["projects"][0]["roles"]:
+            if r["id"] == "r2":
+                r["caps"] = {"mr_review": "free"}
+        pr = st["projects"][0]
+        pr["agents"].append({"id": "a4", "name": "Dave", "service": "s1", "role": "r2", "branch": "agent/dave", "canBug": False, "talk": [], "history": [], "notes": ""})
+        store.wj(store.state_path("u"), st)
+        self.assertIn("propre merge request", do("a2", do="mr_review", id=mid, verdict="approved")[1])  # a2 est l'auteur
+        self.assertEqual(engine.rights.level(proj(), proj()["agents"][-1], "mr_review"), engine.rights.FREE)
+        self.assertEqual(engine.rights.level(proj(), proj()["agents"][2], "mr_review"), engine.rights.FREE)    # QA : droit par défaut
+        self.assertEqual(engine.pick_mr_reviewer(proj(), "a1")["id"], "a2")                      # a1 (principal) est l'auteur → un autre agent habilité
+        self.assertNotEqual(engine.pick_mr_reviewer(proj(), "a2")["id"], "a2")
+
     def test_validation_par_l_utilisateur_sans_validateur(self):
         st = store.load("u")
         for ag in st["projects"][0]["agents"]:

@@ -68,7 +68,7 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"force_unlock","path":"<fichier>","reason":"..."} : (agent principal) libérer de force le verrou d’un fichier (détenteur inactif ou plantage) ; si le détenteur travaille encore, utilise stop_agent',
     '{"do":"pull"} : récupérer dans ta branche les changements de la branche de travail de la release (fusion ; en cas de conflit, la règle du projet s’applique)',
     '{"do":"merge_request","title":"...","body":"...","task":"<id de la tâche, facultatif>"} : soumettre ta branche à la branche de travail de la release (l’agent principal la valide)',
-    '{"do":"mr_review","id":"<id de la MR>","verdict":"approved|rejected","comment":"..."} : (agent principal / QA) valider (fusion) ou refuser une merge request',
+    '{"do":"mr_review","id":"<id de la MR>","verdict":"approved|rejected","comment":"..."} : (agent principal, ou tout agent dont le rôle a le droit « valider les merge requests » ; jamais ta propre MR) valider (fusion) ou refuser une merge request',
     '{"do":"resolve_merge","conflict":"<id>","files":[{"path":"...","content":"<contenu final complet, ou null pour supprimer>"}],"message":"..."} : résoudre un conflit de fusion qui t’est confié (un élément par fichier en conflit)',
     '{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable (sa réponse te revient)',
     '{"do":"get_progress","agent":"<prénom ou all>"} : avancement d’un agent ou de toute l’équipe (sans coût)',
@@ -687,8 +687,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             m = by_id(p.get("mrs", []), x.get("id"))
             if not m or m.get("status") != "ouverte":
                 return refuse("Cette merge request n’est pas en attente de validation.")
-            if not (mn or lv("bug_verify") == rights.FREE):
-                return refuse("Validation de merge request refusée pour ton rôle.")
+            if not (mn or lv("mr_review") == rights.FREE):
+                return refuse("Validation de merge request refusée pour ton rôle (droit « valider les merge requests » absent).")
             if m.get("by_id") == aid:
                 return refuse("Tu ne peux pas valider ta propre merge request.")
             verdict, comment = x.get("verdict"), str(x.get("comment", "")).strip()
@@ -1429,6 +1429,15 @@ def pick_reviewer(p, t):
     if ok(mg):
         return mg
     return next((g for g in p["agents"] if ok(g) and rights.level(p, g, "bug_verify") == rights.FREE), None)
+
+
+def pick_mr_reviewer(p, author_id):
+    """Validateur d'une merge request : l'agent principal, sinon un agent dont le rôle a le droit mr_review ; jamais l'auteur."""
+    ok = lambda g: g and g.get("mode") != "manual" and g["id"] != author_id
+    mg = by_id(p["agents"], p.get("mainId"))
+    if ok(mg):
+        return mg
+    return next((g for g in p["agents"] if ok(g) and rights.level(p, g, "mr_review") == rights.FREE), None)
 
 
 def review_task(u, pid, tid):
@@ -2268,7 +2277,7 @@ def review_mr(u, pid, mid):
     try:
         p = snap(u, pid)
         m = by_id(p["mrs"], mid)
-        rv = pick_reviewer(p, {"who": m["by_id"]})
+        rv = pick_mr_reviewer(p, m["by_id"])
         if rv is None:
             def ask_user(pp):
                 mm = by_id(pp["mrs"], mid)
