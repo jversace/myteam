@@ -6,12 +6,25 @@ import urllib.request
 from store import Err
 
 
+class System(str):
+    """Prompt système en blocs (`.blocks`, du plus stable au plus changeant) : l'API Anthropic met en cache les blocs stables
+    (prompt caching). Se comporte comme une chaîne ordinaire pour les autres usages (OpenAI, chat manuel, tests)."""
+    blocks = ()
+
+    @classmethod
+    def of(cls, blocks):
+        blocks = [b for b in blocks if b]
+        s = cls("\n\n".join(blocks))
+        s.blocks = tuple(blocks)
+        return s
+
+
 class Reply(str):
     """Texte de la réponse ; .usage = {"in": tokens d'entrée, "out": tokens de sortie} quand le fournisseur les donne."""
     usage = None
 
 
-def call_ai(s, system, messages):
+def call_ai(s, system, messages, max_tokens=8192):
     key, url, model = s.get("apiKey", ""), s.get("url", "").rstrip("/"), s.get("model", "")
     if not key:
         raise Err(400, "Clé API manquante pour le service « %s » : ouvrez l’onglet Services IA et cliquez sur « Configurer la clé »" % s.get("name", "?"))
@@ -19,7 +32,14 @@ def call_ai(s, system, messages):
     if anth:
         u = url + "/messages"
         hd = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-        body = {"model": model, "max_tokens": 8192, "system": system, "messages": messages}
+        blocks = getattr(system, "blocks", ())
+        if len(blocks) > 1:       # tous les blocs sauf le dernier (le plus changeant) sont mis en cache
+            sysb = [{"type": "text", "text": b} for b in blocks]
+            for b in sysb[:-1]:
+                b["cache_control"] = {"type": "ephemeral"}
+        else:
+            sysb = system
+        body = {"model": model, "max_tokens": max_tokens, "system": sysb, "messages": messages}
     else:
         u = url + "/chat/completions"
         hd = {"Authorization": "Bearer " + key}
@@ -45,8 +65,10 @@ def call_ai(s, system, messages):
     us = res.get("usage") or {}
     if anth:
         text = "".join(b.get("text", "") for b in res.get("content", []))
-        usage = {"in": us.get("input_tokens", 0) + us.get("cache_creation_input_tokens", 0) + us.get("cache_read_input_tokens", 0),
-                 "out": us.get("output_tokens", 0)}
+        cr, cw = us.get("cache_read_input_tokens", 0) or 0, us.get("cache_creation_input_tokens", 0) or 0
+        usage = {"in": us.get("input_tokens", 0) + cr + cw, "out": us.get("output_tokens", 0)}
+        if cr or cw:                  # détail du cache : lectures (tarif réduit) et écritures (tarif majoré)
+            usage.update(cache_read=cr, cache_write=cw)
     else:
         text = res["choices"][0]["message"]["content"] or ""
         usage = {"in": us.get("prompt_tokens", 0), "out": us.get("completion_tokens", 0)}

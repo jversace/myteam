@@ -15,7 +15,7 @@ import github
 import locks
 import project_rules as prules
 import rights
-from ai import call_ai
+from ai import call_ai, System
 from rights import by_id, mod_ids, now, uid
 from store import DATA, Err, load, mutate
 
@@ -223,7 +223,12 @@ def sys_prompt(p, a):
         ("# Décisions en attente de l’utilisateur\n" + "\n".join("- %s (%s)" % (d.get("question") or (d["payload"].get("title") or d["payload"].get("name")), d["byName"]) for d in pend)) if pend else "",
         ("# Spécifications actuelles\n" + p["spec"][:6000]) if p.get("spec") else "",
         "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), ACTIONS]
-    return "\n\n".join(x for x in parts if x)
+    # Blocs du plus stable au plus changeant (prompt caching Anthropic : les deux premiers sont mis en cache) :
+    # 1) commun à tous les agents, 2) propre à l'agent mais rarement modifié, 3) change à presque chaque tour.
+    shared = [parts[0], parts[18], parts[1], parts[11], parts[12], parts[16]]
+    per_agent = [parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
+    volatile = [parts[5], parts[10], parts[13], parts[14], parts[15], parts[17]]
+    return System.of(["\n\n".join(x for x in grp if x) for grp in (shared, per_agent, volatile)])
 
 
 def parse_acts(t):
@@ -249,6 +254,18 @@ def _overflow(e):
     m = (e.msg or "").lower()
     return e.code in (400, 413, 502) and any(k in m for k in (
         "too long", "context length", "maximum context", "context window", "token limit", "too many tokens", "reduce the length", "exceeds the"))
+
+
+OLD_RESULT = "[Application] Résultats de tes actions"
+
+
+def shrink_history(h, keep=2, cap=400):
+    """Abrège les anciens retours d'actions (contenu de fichiers, listes…) de l'historique envoyé à l'IA : seuls les `keep`
+    derniers messages restent intacts. L'historique stocké n'est pas modifié."""
+    n = len(h)
+    return [m if i >= n - keep or m["role"] != "user" or not m["content"].startswith(OLD_RESULT) or len(m["content"]) <= cap
+            else {"role": "user", "content": m["content"][:cap] + "\n[…ancien résultat abrégé : relis le fichier si besoin]"}
+            for i, m in enumerate(h)]
 
 
 def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None):
@@ -277,6 +294,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None)
             h = list(a.get("history", []))[-30:]
             while h and h[0]["role"] != "user":
                 h.pop(0)
+            h = shrink_history(h)
             locks.check_stop(u, pid, aid, ctx["t0"])           # arrêté par l'agent principal / l'utilisateur : on ne fait plus rien
             if not manual:
                 check_budget(p)
@@ -341,12 +359,16 @@ def num(x):
 def record_usage(u, pid, aid, svc, usage):
     """Comptabilise les tokens d'un appel API et son coût estimé (tarifs saisis dans le service, en $ par million de tokens)."""
     tin, tout = int(usage.get("in") or 0), int(usage.get("out") or 0)
-    cost = round(tin * num(svc.get("pin")) / 1e6 + tout * num(svc.get("pout")) / 1e6, 6)
+    cr, cw = int(usage.get("cache_read") or 0), int(usage.get("cache_write") or 0)
+    # tokens lus dans le cache : 10 % du tarif d'entrée ; écrits dans le cache : 125 % (tarifs Anthropic du cache de 5 min)
+    cost = round((max(tin - cr - cw, 0) + cr * 0.1 + cw * 1.25) * num(svc.get("pin")) / 1e6 + tout * num(svc.get("pout")) / 1e6, 6)
 
     def bump(d):
         d["calls"] = d.get("calls", 0) + 1
         d["in"] = d.get("in", 0) + tin
         d["out"] = d.get("out", 0) + tout
+        if cr:
+            d["cached"] = d.get("cached", 0) + cr
         d["cost"] = round(d.get("cost", 0) + cost, 6)
 
     def f(pp):
@@ -355,7 +377,7 @@ def record_usage(u, pid, aid, svc, usage):
         if a:
             bump(a.setdefault("usage", {}))
         led = pp.setdefault("ledger", [])
-        led.append({"d": now(), "agent": a["name"] if a else "?", "model": svc.get("model", ""), "in": tin, "out": tout, "cost": cost})
+        led.append({"d": now(), "agent": a["name"] if a else "?", "model": svc.get("model", ""), "in": tin, "out": tout, "cached": cr, "cost": cost})
         del led[:-300]
     mp(u, pid, f)
 

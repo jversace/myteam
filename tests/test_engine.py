@@ -290,7 +290,7 @@ class Usage(unittest.TestCase):
         threading.Thread(target=sv.serve_forever, daemon=True).start()
         base = "http://127.0.0.1:%d/v1" % sv.server_port
         r = ai.call_ai({"apiKey": "k", "url": base, "kind": "anthropic", "model": "m"}, "s", [{"role": "user", "content": "x"}])
-        self.assertEqual((str(r), r.usage), ("salut", {"in": 25, "out": 9}))
+        self.assertEqual((str(r), r.usage), ("salut", {"in": 25, "out": 9, "cache_read": 4, "cache_write": 0}))
         r = ai.call_ai({"apiKey": "k", "url": base, "kind": "openai", "model": "m"}, "s", [{"role": "user", "content": "x"}])
         self.assertEqual((str(r), r.usage), ("hello", {"in": 11, "out": 7}))
         sv.shutdown()
@@ -1476,6 +1476,63 @@ class Integration(unittest.TestCase):
         engine.release("u", "p1", "v1.0.0", "notes")
         self.assertNotIn("encore ouverte", self.logs())
         self.assertEqual(proj()["mrs"][0]["status"], "fusionnée")
+
+
+class Economie(unittest.TestCase):
+    """Économie de tokens : blocs de prompt mis en cache, historique abrégé, coût du cache."""
+    def test_blocs_systeme_et_cache(self):
+        seen = {}
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                b = json.dumps({"content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        sv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=sv.serve_forever, daemon=True).start()
+        svc = {"apiKey": "k", "url": "http://127.0.0.1:%d/v1" % sv.server_port, "kind": "anthropic", "model": "m"}
+        sysm = ai.System.of(["commun", "agent", "", "volatile"])
+        self.assertEqual(str(sysm), "commun\n\nagent\n\nvolatile")                                   # reste une chaîne ordinaire
+        ai.call_ai(svc, sysm, [{"role": "user", "content": "x"}], max_tokens=300)
+        sb = seen["body"]["system"]
+        self.assertEqual([b["text"] for b in sb], ["commun", "agent", "volatile"])
+        self.assertEqual([("cache_control" in b) for b in sb], [True, True, False])              # le dernier bloc (changeant) n'est pas mis en cache
+        self.assertEqual(seen["body"]["max_tokens"], 300)
+        ai.call_ai(svc, "texte simple", [{"role": "user", "content": "x"}])
+        self.assertEqual((seen["body"]["system"], seen["body"]["max_tokens"]), ("texte simple", 8192))
+        sv.shutdown()
+
+    def test_prompt_en_trois_blocs(self):
+        st = make_state()
+        p = st["projects"][0]
+        sp = engine.sys_prompt(p, p["agents"][1])
+        self.assertEqual(len(sp.blocks), 3)
+        self.assertIn("Actions (un objet JSON", sp.blocks[0])                                    # ACTIONS fait partie du bloc commun
+        self.assertIn("# Tes droits", sp.blocks[1])
+        self.assertIn("# Tâches", sp.blocks[2])
+        self.assertNotIn("# Tâches", sp.blocks[0] + sp.blocks[1])
+        sp2 = engine.sys_prompt(p, p["agents"][0])
+        self.assertEqual(sp.blocks[0], sp2.blocks[0])                                            # bloc commun identique d'un agent à l'autre
+
+    def test_historique_abrege(self):
+        big = "[Application] Résultats de tes actions :\n\n" + "x" * 5000
+        h = [{"role": "user", "content": big}, {"role": "assistant", "content": "a"}, {"role": "user", "content": big}, {"role": "assistant", "content": "b"}]
+        r = engine.shrink_history(h)
+        self.assertTrue(len(r[0]["content"]) < 600 and "abrégé" in r[0]["content"])
+        self.assertEqual(r[2]["content"], big)                                                   # les 2 derniers messages restent intacts
+        self.assertEqual(h[0]["content"], big)                                                   # l'original n'est pas modifié
+
+    def test_cout_avec_cache(self):
+        reset()
+        st = make_state()
+        store.wj(store.state_path("u"), st)
+        engine.record_usage("u", "p1", "a2", {"pin": "10", "pout": "0", "model": "m"}, {"in": 1000, "out": 0, "cache_read": 800, "cache_write": 100})
+        u = proj()["usage"]
+        self.assertEqual((u["in"], u["cached"]), (1000, 800))
+        self.assertAlmostEqual(u["cost"], (100 + 800 * 0.1 + 100 * 1.25) * 10 / 1e6, places=9)
 
 
 class Regles(unittest.TestCase):
