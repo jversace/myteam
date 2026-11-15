@@ -1462,6 +1462,33 @@ def pick_mr_reviewer(p, author_id):
     return next((g for g in p["agents"] if ok(g) and rights.level(p, g, "mr_review") == rights.FREE), None)
 
 
+def diff_text(rp, base, head, budget=12000, per_file=3000):
+    """Diff (compare GitHub) de `head` par rapport à `base`, prêt à être placé dans le message d'un validateur : évite les tours de
+    lecture `read_file`. Tronqué par fichier (`per_file`) et au total (`budget`) ; les fichiers sans patch (binaires, trop gros)
+    et ceux qui dépassent le budget sont listés pour être lus à la demande. Chaîne vide si la comparaison est impossible."""
+    try:
+        files = rp.compare(base, head).get("files", [])
+    except Err:
+        return ""
+    out, used, omitted = [], 0, []
+    for f in files:
+        name, patch = f.get("filename", "?"), f.get("patch")
+        head_line = "--- %s (%s, +%s/-%s)" % (name, f.get("status", "?"), f.get("additions", "?"), f.get("deletions", "?"))
+        if not patch:
+            omitted.append("%s (pas de diff : binaire ou trop gros)" % name)
+            continue
+        if len(patch) > per_file:
+            patch = patch[:per_file] + "\n[…diff tronqué : lis le fichier avec read_file pour la suite]"
+        if used + len(patch) > budget:
+            omitted.append("%s (budget de diff atteint)" % name)
+            continue
+        used += len(patch)
+        out.append(head_line + "\n" + patch)
+    if omitted:
+        out.append("Fichiers non détaillés (lis-les avec read_file si besoin) : " + " ; ".join(omitted))
+    return "\n".join(out)
+
+
 def review_task(u, pid, tid):
     """Fait vérifier par l'agent principal (ou un agent habilité) qu'une tâche soumise est réellement terminée."""
     if snap(u, pid).get("supervision") == "off":
@@ -1488,11 +1515,25 @@ def review_task(u, pid, tid):
                     add_escalation(pp, tt, "Compte rendu de l’agent : %s." % (tt.get("result") or "aucun")[:300], review=True)
             mp(u, pid, ask_user)
             return
+        dif = ""
+        if a.get("branch") and a.get("source") != "local":          # diff fourni directement : le vérificateur n'a pas à relire les fichiers un par un
+            try:
+                rp = github.Repo(p)
+                mr = next((m for m in p.get("mrs", []) if m.get("id") and m.get("task") == tid), None)
+                if mr:
+                    dif = diff_text(rp, mr["to"], mr["from"])
+                elif rp.work != a["branch"]:
+                    dif = diff_text(rp, rp.work, a["branch"])
+            except Err:
+                dif = ""
         msg = ("[Application — vérification] La tâche « %s » (id %s), réalisée par %s, est soumise à vérification.\nDescription demandée : %s\n"
-               "Compte rendu de l’agent : %s\n%s\n"
-               "Vérifie que le travail demandé est EFFECTIVEMENT fait : lis les fichiers concernés avec read_file en précisant \"agent\":\"%s\", compare avec la description et les spécifications. "
+               "Compte rendu de l’agent : %s\n%s\n%s"
+               "Vérifie que le travail demandé est EFFECTIVEMENT fait : %s, compare avec la description et les spécifications. "
                "Conclus obligatoirement par task_review : accepted seulement si tout est fait, sinon rejected avec la liste précise de ce qui manque.") % (
-            t["title"], tid, a["name"], t.get("desc") or "(aucune)", (t.get("result") or "(aucun)")[:1500], evidence(p, t, a), a["name"])
+            t["title"], tid, a["name"], t.get("desc") or "(aucune)", (t.get("result") or "(aucun)")[:1500], evidence(p, t, a),
+            ("Changements de la branche de %s (le diff peut inclure d’autres tâches) :\n%s\n" % (a["name"], dif)) if dif else "",
+            "le diff ci-dessus est fourni ; n’utilise read_file (avec \"agent\":\"%s\") que pour un fichier tronqué ou absent du diff" % a["name"] if dif
+            else "lis les fichiers concernés avec read_file en précisant \"agent\":\"%s\"" % a["name"])
         ask(u, pid, rv["id"], msg, "Vérification")
         if by_id(snap(u, pid)["tasks"], tid)["status"] == "à vérifier":
             def nofinal(pp):
@@ -2310,11 +2351,15 @@ def review_mr(u, pid, mid):
         cmp = github.Repo(p).compare(m["to"], m["from"])
         commits = "\n".join("  - %s" % c["commit"]["message"].splitlines()[0] for c in cmp.get("commits", [])[-15:]) or "  (aucun)"
         files = ", ".join(f["filename"] for f in cmp.get("files", [])[:30]) or "(aucun)"
+        dif = diff_text(github.Repo(p), m["to"], m["from"], budget=15000)
         task = by_id(p["tasks"], m.get("task"))
-        msg = ("[Application — validation de merge request] MR #%s « %s » de %s : branche %s vers %s.\nTâche liée : %s\nCommits :\n%s\nFichiers modifiés : %s\n"
-               "Valide cette merge request : relis les changements (read_file avec \"agent\":\"%s\"), vérifie qu’ils sont cohérents avec les spécifications et la branche de travail. "
+        msg = ("[Application — validation de merge request] MR #%s « %s » de %s : branche %s vers %s.\nTâche liée : %s\nCommits :\n%s\nFichiers modifiés : %s\n%s"
+               "Valide cette merge request : %s, vérifie qu’ils sont cohérents avec les spécifications et la branche de travail. "
                "Conclus par mr_review : approved (elle sera fusionnée) ou rejected avec ce qu’il faut corriger.") % (
-            m["n"], m.get("title", ""), m["by"], m["from"], m["to"], task["title"] if task else "aucune", commits, files, m["by"])
+            m["n"], m.get("title", ""), m["by"], m["from"], m["to"], task["title"] if task else "aucune", commits, files,
+            ("Diff :\n%s\n" % dif) if dif else "",
+            "le diff ci-dessus est fourni (relis avec read_file et \"agent\":\"%s\" seulement un fichier tronqué ou absent)" % m["by"] if dif
+            else "relis les changements (read_file avec \"agent\":\"%s\")" % m["by"])
         ask(u, pid, rv["id"], msg, "Validation MR")
         if by_id(snap(u, pid)["mrs"], mid)["status"] == "ouverte":
             def nofinal(pp):

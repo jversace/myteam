@@ -168,7 +168,9 @@ class GH(BaseHTTPRequestHandler):
                 if fb.get(k) != fh.get(k):
                     if k in fh:
                         BLOBS[_hash(fh[k])] = fh[k]
-                    files.append({"filename": k, "status": "removed" if k not in fh else ("added" if k not in fb else "modified"), "sha": _hash(fh.get(k, ""))})
+                    files.append({"filename": k, "status": "removed" if k not in fh else ("added" if k not in fb else "modified"), "sha": _hash(fh.get(k, "")),
+                                  "additions": len((fh.get(k) or "").splitlines()), "deletions": len((fb.get(k) or "").splitlines()),
+                                  "patch": "".join("-%s\n" % l for l in (fb.get(k) or "").splitlines()) + "".join("+%s\n" % l for l in (fh.get(k) or "").splitlines())})
             mine = ancestors(b) - ancestors(a)
             return self.send(200, {"merge_base_commit": {"sha": mb}, "files": files, "ahead_by": len(mine), "behind_by": len(ancestors(a) - ancestors(b)),
                                    "commits": [{"sha": c, "commit": {"message": COMMITS[c]["msg"]}} for c in mine if len(COMMITS[c]["parents"]) < 2]})
@@ -864,6 +866,53 @@ class Integration(unittest.TestCase):
         self.assertIn("Verdict invalide", do("a1", do="mr_review", id=mid, verdict="rejected")[1])        # refus sans motif
         self.set(mrs=[dict(proj()["mrs"][0], by_id="a1")])
         self.assertIn("propre merge request", do("a1", do="mr_review", id=mid, verdict="approved")[1])
+
+    def test_diff_fourni_au_validateur_de_mr(self):
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        engine.submit_mr("u", "p1", "a2", "Login", "", "t1")
+        mid = proj()["mrs"][0]["id"]
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return "ok"
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.review_mr("u", "p1", mid)
+        self.assertIn("Diff :", vus[0])
+        self.assertIn("+print(1)", vus[0])                                                        # le contenu modifié est dans le message
+        self.assertIn("le diff ci-dessus est fourni", vus[0])
+
+    def test_diff_fourni_au_verificateur_de_tache(self):
+        self.start()
+        self.write(1, "api.py", "print(1)")
+        self.set_task_status("t1", "à vérifier")
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return "ok"
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.review_task("u", "p1", "t1")
+        self.assertIn("+print(1)", vus[0])
+        self.assertIn("le diff ci-dessus est fourni", vus[0])
+
+    def test_diff_text_troncature(self):
+        class Rp:
+            def compare(self, b, h):
+                return {"files": [{"filename": "a.py", "status": "added", "patch": "x" * 5000},
+                                  {"filename": "b.bin", "status": "added"},
+                                  {"filename": "c.py", "status": "added", "patch": "y" * 100}]}
+        d = engine.diff_text(Rp(), "base", "head", budget=3100, per_file=3000)
+        self.assertIn("diff tronqué", d)                                                         # fichier trop long coupé
+        self.assertIn("b.bin (pas de diff", d)                                                   # binaire listé, non détaillé
+        self.assertIn("c.py (budget de diff atteint)", d)                                        # budget total respecté
+        self.assertLess(len(d), 3700)
+
+        class Boom:
+            def compare(self, b, h):
+                raise engine.Err(502, "x")
+        self.assertEqual(engine.diff_text(Boom(), "b", "h"), "")                                 # comparaison impossible : pas de diff, pas d'erreur
 
     def test_droit_valider_les_mr_par_role(self):
         """Le droit « mr_review » s'accorde par rôle ; l'auteur ne valide jamais sa propre MR."""
