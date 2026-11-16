@@ -12,6 +12,11 @@ WF_MAX_STEPS = 20           # garde-fou : nombre maximal d'étapes exécutées p
 WF_MAX_PER_HOUR = 10        # garde-fou : déroulements d'un même workflow par heure
 
 
+def roles_of(p):
+    """Rôles **globaux** rattachés au projet (`_roles`), sinon `p["roles"]` (ancien format)."""
+    return p["_roles"] if p.get("_roles") is not None else p.get("roles", [])
+
+
 def by_id(lst, i):
     return next((x for x in lst or [] if x.get("id") == i), None)
 
@@ -58,7 +63,7 @@ def trigger_text(w):
 def step_text(p, st, i):
     a = resolve_actor(p, st) if (st.get("who") or "principal") not in ("assignee", "requester") else None
     who = {"principal": "l’agent principal", "assignee": "l’agent assigné à la tâche cible", "requester": "l’agent qui a déclenché le workflow"}.get(st.get("who") or "principal") \
-        or ((a or {}).get("name", "?") if (st.get("who") or "").startswith("agent:") else "un agent du rôle %s" % ((by_id(p.get("roles", []), (st.get("who") or "")[5:]) or {}).get("name", "?")))
+        or ((a or {}).get("name", "?") if (st.get("who") or "").startswith("agent:") else "un agent du rôle %s" % ((by_id(roles_of(p), (st.get("who") or "")[5:]) or {}).get("name", "?")))
     kind = st.get("kind", "ask")
     body = {"start_tasks": "démarrer les tâches prêtes (assignées, à faire, dépendances satisfaites)", "ask_user": "demander à l’utilisateur : %s" % st.get("text", "")}.get(kind, "%s : %s" % (who, st.get("text", "")))
     ko = {"stop": "arrêter", "continue": "continuer", "ask_user": "demander à l’utilisateur", "goto": "aller à l’étape %s" % st.get("goto", "?")}.get(st.get("on_ko") or "stop", "arrêter")
@@ -248,7 +253,7 @@ def dump(p, builtin_rules):
     L = ["## Règles intégrées (non modifiables, appliquées à tous les agents)", "\n".join("- " + r for r in builtin_rules), "",
          "## Règles globales du projet (écrites par l'utilisateur)", (p.get("rules") or "(aucune)").strip(), "", "## Règles spécifiques par agent"]
     for a in p.get("agents", []):
-        role = (by_id(p.get("roles", []), a.get("role")) or {}).get("name", "?")
+        role = (by_id(roles_of(p), a.get("role")) or {}).get("name", "?")
         L.append("- %s (rôle : %s%s, mode : %s) : %s" % (a["name"], role, ", agent principal" if a["id"] == p.get("mainId") else "", a.get("mode", "api"), (a.get("rules") or "(aucune)").strip()))
     L += ["", "## Workflows"]
     for w in p.get("workflows", []):
@@ -257,5 +262,5 @@ def dump(p, builtin_rules):
     L += ["", "## Réglages du projet",
           "- Autonomie des agents : %s ; règle des conflits de fusion : %s ; lancement automatique : %s ; suivi automatique : %s" % (
               p.get("autonomy", "balanced"), p.get("conflict_policy", "ask"), p.get("autopilot", "on"), p.get("supervision", "on")),
-          "- Droits des rôles : " + "; ".join("%s : %s" % (r.get("name"), ", ".join("%s=%s" % kv for kv in (r.get("caps") or {}).items())) for r in p.get("roles", []))]
+          "- Droits des rôles : " + "; ".join("%s : %s" % (r.get("name"), ", ".join("%s=%s" % kv for kv in (r.get("caps") or {}).items())) for r in roles_of(p))]
     return "\n".join(L)

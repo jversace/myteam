@@ -42,6 +42,11 @@ def uid():
     return secrets.token_hex(4)
 
 
+def roles_of(p):
+    """Rôles utilisables par le projet : les rôles **globaux** (`_roles`, rattachés au chargement), sinon `p["roles"]` (ancien format)."""
+    return p["_roles"] if p.get("_roles") is not None else p.get("roles", [])
+
+
 def by_id(lst, i):
     return next((x for x in lst if x.get("id") == i), None)
 
@@ -66,7 +71,7 @@ def next_seq(pp):
 
 def level(p, a, cap, main=False):
     """Niveau effectif d'une capacité pour un agent : libre, soumis à validation ou interdit."""
-    r = by_id(p.get("roles", []), a.get("role")) or {}
+    r = by_id(roles_of(p), a.get("role")) or {}
     c = (a.get("caps") or {}).get(cap) or (r.get("caps") or {}).get(cap)
     if c is None and cap == "mr_review":             # rôles créés avant ce droit : on reprend « vérifier un bug »
         c = (a.get("caps") or {}).get("bug_verify") or (r.get("caps") or {}).get("bug_verify")
@@ -194,7 +199,7 @@ def create_from(pp, kind, d, by):
 def instr_applies(p, a, i):
     sc = i.get("scope", "global")
     if sc.startswith("role:"):
-        return norm(sc[5:]) == norm((by_id(p.get("roles", []), a.get("role")) or {}).get("name"))
+        return norm(sc[5:]) == norm((by_id(roles_of(p), a.get("role")) or {}).get("name"))
     if sc.startswith("agent:"):
         return norm(sc[6:]) == norm(a.get("name"))
     return True

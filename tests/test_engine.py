@@ -923,7 +923,7 @@ class Integration(unittest.TestCase):
         do = lambda aid, **x: engine.do_act("u", "p1", aid, x, 0)
         self.assertIn("refusée pour ton rôle", do("a2", do="mr_review", id=mid, verdict="approved")[1])
         st = store.load("u")                                                                     # on accorde le droit au rôle « Développeur back-end »
-        for r in st["projects"][0]["roles"]:
+        for r in st["roles"]:                                                                    # rôles globaux
             if r["id"] == "r2":
                 r["caps"] = {"mr_review": "free"}
         pr = st["projects"][0]
@@ -2005,6 +2005,59 @@ class Http(unittest.TestCase):
         with mock.patch.object(server, "call_ai", lambda s, sy, m: "OK"):
             self.assertEqual(self.call("POST", "/api/service/test", {"serviceId": "s1"}, t)["sample"], "OK")
 
+
+
+class RolesGlobaux(unittest.TestCase):
+    """Les rôles sont globaux (st[\"roles\"]) et réutilisables dans plusieurs projets ; migration des anciens états."""
+
+    def setUp(self):
+        reset()
+
+    def test_migration_depuis_les_roles_de_projet(self):
+        st = make_state()                                   # ancien format : p1 a ses propres rôles
+        p2 = json.loads(json.dumps(st["projects"][0]))
+        p2.update(id="p2", name="Autre")
+        for r in p2["roles"]:
+            r["id"] = "x" + r["id"]                         # mêmes noms, autres identifiants
+        p2["agents"][1]["role"] = "xr2"
+        p2["workflows"] = [{"id": "w", "name": "W", "steps": [{"id": "s", "kind": "ask", "who": "role:xr2", "text": "t"}]}]
+        st["projects"].append(p2)
+        store.wj(store.state_path("u"), st)
+        g = store.load("u")
+        self.assertTrue(all("roles" not in p for p in g["projects"]))
+        self.assertEqual(sorted(r["name"] for r in g["roles"]), sorted(set(r["name"] for r in g["roles"])))   # pas de doublon
+        self.assertEqual(g["projects"][1]["agents"][1]["role"], "r2")                                         # remappé sur le rôle global
+        self.assertEqual(g["projects"][1]["workflows"][0]["steps"][0]["who"], "role:r2")
+        on_disk = json.loads(store.state_path("u").read_text(encoding="utf-8"))
+        self.assertNotIn("_roles", json.dumps(on_disk))                                                       # rattachement jamais écrit
+
+    def test_un_role_sert_a_plusieurs_projets(self):
+        st = make_state()
+        st["roles"] = st["projects"][0].pop("roles")
+        p2 = json.loads(json.dumps(st["projects"][0]))
+        p2["id"] = "p2"
+        st["projects"].append(p2)
+        store.wj(store.state_path("u"), st)
+        for p in store.load("u")["projects"]:
+            self.assertEqual(engine.rights.level(p, p["agents"][0], "mr_review"), engine.rights.FREE)          # Chef de projet
+            self.assertEqual(engine.role(p, p["agents"][1])["name"], "Développeur back-end")
+        st = store.load("u")
+        for r in st["roles"]:
+            if r["id"] == "r2":
+                r["caps"] = {"subtask": "no"}
+        store.wj(store.state_path("u"), st)                  # une seule modification du rôle vaut pour les deux projets
+        for p in store.load("u")["projects"]:
+            self.assertEqual(engine.rights.level(p, p["agents"][1], "subtask"), engine.rights.NO)
+
+    def test_put_navigateur_ancien_format_reste_global(self):
+        store.wj(store.state_path("u"), {"roles": [{"id": "r1", "name": "Chef de projet", "desc": "", "caps": {}}], "projects": []})
+        rev, ser, st = store.get("u")
+        st["projects"] = [{"id": "p", "name": "P", "agents": [{"id": "a", "name": "A", "role": "z9"}], "tasks": [],
+                           "roles": [{"id": "z9", "name": "Chef de projet", "desc": ""}]}]    # vieux navigateur : rôles dans le projet
+        _, _, merged = store.put("u", rev, st)
+        self.assertEqual(len(merged["roles"]), 1)
+        self.assertNotIn("roles", merged["projects"][0])
+        self.assertEqual(merged["projects"][0]["agents"][0]["role"], "r1")
 
 
 if __name__ == "__main__":

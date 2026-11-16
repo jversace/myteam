@@ -16,7 +16,7 @@ import locks
 import project_rules as prules
 import rights
 from ai import call_ai, System
-from rights import by_id, mod_ids, now, uid
+from rights import by_id, mod_ids, now, uid, roles_of
 from store import DATA, Err, load, mutate
 
 MAX_STEPS, MAX_DEPTH, MAX_CREATE = 6, 3, 8   # tours par échange, profondeur des messages, créations par échange
@@ -100,7 +100,7 @@ def is_main(p, a):
 
 
 def role(p, a):
-    return by_id(p.get("roles", []), a.get("role")) or {"name": "—", "desc": ""}
+    return by_id(roles_of(p), a.get("role")) or {"name": "—", "desc": ""}
 
 
 def mod_names(p, ids):
