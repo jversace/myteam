@@ -144,6 +144,7 @@ Cause des « agents qui s'arrêtent » corrigée ici : avant, rien ne lançait l
 
 ## Limites connues / suite prévue
 - La détection de tâche « inactive » ne concerne que les tâches lancées par le moteur (`started`) ; une relance déclenchée par une réponse en chat (`say`) n'est vérifiée qu'au passage suivant du suivi si l'agent n'est pas passé par `run_task`.
+- Services préconfigurés (`SERV` dans `static/index.html`, appliqués à un état neuf uniquement) : Claude `claude-sonnet-4-6` (`https://api.anthropic.com/v1`) ; Mistral `mistral-small-latest` (`https://api.mistral.ai/v1`) ; ChatGPT `gpt-4o` (`https://api.openai.com/v1`) ; Gemini et **Gemini-free** `gemini-3.8-flash` (`https://generativelanguage.googleapis.com/v1beta/openai`) ; DeepSeek `deepseek-chat` (`https://api.deepseek.com`).
 - Les noms de modèles préconfigurés vieillissent (ex. `gemini-2.0-flash` a été retiré par Google, remplacé par `gemini-3.8-flash`) : à revérifier auprès du fournisseur ; une erreur 404 du service signale presque toujours un nom de modèle périmé.
 - Pas de base de données ; sessions sans expiration ; clés API stockées en clair dans `data/`.
 - Un serveur redémarré perd les travaux en cours (tâches marquées « Interrompu ») ; pas de file d'attente persistante.
