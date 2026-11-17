@@ -137,6 +137,7 @@ Cause des « agents qui s'arrêtent » corrigée ici : avant, rien ne lançait l
 - Limites : verrous exclusifs (pas de verrou partagé en lecture) ; pas de commit git du répertoire local (c'est à l'utilisateur de le faire) ; un fichier modifié à la main pendant qu'un agent le verrouille n'est pas protégé.
 
 ## Conventions de travail
+- **Champs de dialogue** (`chatInput`, ids `ci` onglet agent et `gi` vue globale) : `<textarea>` multiligne à hauteur auto (max 260 px, redimensionnable) ; Entrée envoie, Maj+Entrée insère un retour à la ligne (la saisie IME n'envoie pas). Le motif de refus d'une décision (`dn-`) est aussi un `<textarea>`.
 - Modifier `static/index.html` par remplacements ciblés ; vérifier la syntaxe JS (extraire le `<script>` et `node --check`).
 - Lancer `python -m unittest discover -s tests` avant tout commit. Les tests n'utilisent ni réseau ni clé (faux GitHub, IA scriptée).
 - Ne jamais committer `data/`, de token ni de clé API. Ne jamais tester sur le vrai dépôt sans supprimer ensuite les branches créées.
