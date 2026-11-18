@@ -268,8 +268,9 @@ def shrink_history(h, keep=2, cap=400):
             for i, m in enumerate(h)]
 
 
-def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None):
+def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None, fresh=False):
     """Envoie un message à un agent et exécute ses actions jusqu'à sa réponse finale.
+    `fresh` : appel sans mémoire (historique de l'agent ni lu ni écrit) — pour les analyses qui doivent ne voir que l'état courant.
     `stats` (facultatif) reçoit {actions, pending} : nombre d'actions exécutées, et retour non traité si les étapes sont épuisées."""
     p = snap(u, pid)
     a = by_id(p["agents"], aid)
@@ -291,7 +292,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None)
             manual = a.get("mode") == "manual"
             if not s and not manual:
                 raise Err(400, "Service IA révoqué pour %s" % a["name"])
-            h = list(a.get("history", []))[-30:]
+            h = [] if fresh else list(a.get("history", []))[-30:]
             while h and h[0]["role"] != "user":
                 h.pop(0)
             h = shrink_history(h)
@@ -325,7 +326,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None)
 
             def add(pp):
                 ag = by_id(pp["agents"], aid)
-                if ag:
+                if ag and not fresh:
                     ag["history"] = (ag.get("history", []) + [{"role": "user", "content": keep}, {"role": "assistant", "content": keep_out}])[-30:]
             mp(u, pid, add)
             if clean:
@@ -771,9 +772,9 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                 return refuse("Instruction vide.")
             if sc != "global" and sc.split(":")[0] not in ("role", "agent", "module"):
                 sc = "global"
-            mp(u, pid, lambda pp: pp.setdefault("instructions", []).append(
-                {"id": uid(), "n": rights.next_seq(pp), "d": now(), "by": a["name"], "scope": sc, "text": text, "active": True}))
-            return "Instruction enregistrée (%s) : %s" % (sc, text), None
+            out = []
+            mp(u, pid, lambda pp: out.extend(rights.add_instruction(pp, {"id": uid(), "by": a["name"], "scope": sc, "text": text}, x.get("replaces"))))
+            return "Instruction enregistrée (%s) : %s%s" % (sc, text, (" — remplace n° " + ", ".join(map(str, out))) if out else ""), None
         if kind == "spec":
             if not mn:
                 return refuse("Mise à jour des spécifications refusée : réservée à l’agent principal.")
@@ -824,8 +825,8 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
             dd = by_id(pp["decisions"], did)
             dd.update(status="répondue", answer=full, done=now(), n_done=rights.next_seq(pp))
             if dd.get("structural"):
-                pp.setdefault("instructions", []).append({"id": uid(), "n": rights.next_seq(pp), "d": now(), "by": "Décision", "scope": "global",
-                                                          "active": True, "text": "Décision (%s) : %s → %s" % (dd["byName"], dd["question"], full)})
+                rights.add_instruction(pp, {"id": uid(), "by": "Décision", "scope": "global", "key": "dec:" + rights.norm(dd["question"]),
+                                            "text": "Décision (%s) : %s → %s" % (dd["byName"], dd["question"], full)})
             t = by_id(pp["tasks"], tid)
             if t and t.get("blocked") == did:
                 t.pop("blocked", None)
@@ -900,14 +901,13 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
         ask(u, pid, ag["id"], "L’utilisateur a refusé ta proposition « %s ».%s" % (title, (" Motif : " + note) if note else ""), "Vous")
 
 
-def instr_add(u, pid, scope, text):
+def instr_add(u, pid, scope, text, replaces=()):
     text = text.strip()
     if not text:
         raise Err(400, "Instruction vide")
     sc = scope if scope == "global" or scope.split(":")[0] in ("role", "agent", "module") else "global"
-    mp(u, pid, lambda pp: pp.setdefault("instructions", []).append(
-        {"id": uid(), "n": rights.next_seq(pp), "d": now(), "by": "Vous", "scope": sc, "text": text, "active": True}))
-    log(u, pid, "Système", "Vous", "Instruction enregistrée (%s) : %s" % (sc, text))
+    mp(u, pid, lambda pp: rights.add_instruction(pp, {"id": uid(), "by": "Vous", "scope": sc, "text": text}, replaces))
+    log(u, pid, "Système", "Vous", "Instruction enregistrée (%s) : %s%s" % (sc, text, (" — remplace n° " + ", ".join(map(str, replaces))) if replaces else ""))
 
 
 def local_act(u, pid, p, a, x, kind, t0=0):
@@ -1601,9 +1601,10 @@ def rules_analysis(u, pid):
     msg = ("[Analyse des règles] Analyse la COHÉRENCE des règles ci-dessous : contradictions entre elles (y compris avec les règles intégrées), règles incomplètes ou ambiguës, "
            "workflows irréalisables, dépendances manquantes. Réponds par UNE action rules_report "
            "{\"issues\":[{\"severity\":\"erreur|avertissement|info\",\"where\":\"...\",\"text\":\"...\",\"suggestion\":\"...\"}]} (liste vide si tout est cohérent). "
-           "Ne signale que ce qui découle du texte ci-dessous, sans rien inventer.\n\n" + prules.dump(p, RULES))
+           "Ne signale que ce qui découle du texte ci-dessous, sans rien inventer. Ce texte est l'état ACTUEL et complet : ignore toute version antérieure des règles. "
+           "Les instructions et décisions de l'utilisateur sont plus récentes que les règles et les complètent ou les remplacent : un point qu'elles précisent n'est PLUS ambigu, ne le signale pas.\n\n" + prules.dump(p, RULES))
     try:
-        reply = ask(u, pid, an["id"], msg, "Analyse des règles", relog=False)
+        reply = ask(u, pid, an["id"], msg, "Analyse des règles", relog=False, fresh=True)
     except Err as e:
         return mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(analyzing="", ai_note="Analyse impossible : %s" % e.msg))
 
@@ -2567,7 +2568,7 @@ def start(u, j):
             "mr_done": lambda: mr_done(u, pid, j.get("mrId")),
             "mr_sync": lambda: mr_sync(u, pid),
             "decide": lambda: decide(u, pid, j.get("decisionId"), str(j.get("decision", "")), str(j.get("note", "")), j.get("fields") or {}, str(j.get("answer", ""))),
-            "instr_add": lambda: instr_add(u, pid, str(j.get("scope", "global")), str(j.get("text", ""))),
+            "instr_add": lambda: instr_add(u, pid, str(j.get("scope", "global")), str(j.get("text", "")), j.get("replaces") or ()),
             "instr_del": lambda: mp(u, pid, lambda pp: pp.__setitem__("instructions", [i for i in pp.get("instructions", []) if i["id"] != j.get("instrId")]))}
     if t not in jobs:
         raise Err(400, "Type de travail inconnu")

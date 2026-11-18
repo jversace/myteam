@@ -1,6 +1,7 @@
 """Droits des agents (capacités par rôle, niveau d'autonomie du projet) et création des éléments de projet.
 
 Les fonctions « create_* » travaillent sur le dictionnaire du projet à l'intérieur d'un store.mutate."""
+import re
 import secrets
 from datetime import datetime
 
@@ -205,11 +206,32 @@ def instr_applies(p, a, i):
     return True
 
 
+def add_instruction(pp, ins, replaces=()):
+    """Ajoute une instruction en « annule et remplace » : elle désactive les instructions dont les numéros sont dans `replaces`,
+    ainsi que toute instruction active de même `key` (même décision reposée). Retourne les numéros désactivés."""
+    reps = set()
+    for r in replaces or ():
+        m = re.search(r"\d+", str(r))
+        if m:
+            reps.add(int(m.group()))
+    ins.update(n=next_seq(pp), d=now(), active=True)
+    off = []
+    for i in pp.get("instructions", []):
+        if i.get("active", True) and (i.get("n") in reps or (ins.get("key") and i.get("key") == ins["key"])):
+            i.update(active=False, replaced_by=ins["n"])
+            off.append(i.get("n"))
+    pp.setdefault("instructions", []).append(ins)
+    inactive = [i for i in pp["instructions"] if not i.get("active", True)]
+    for i in inactive[:-30]:                                   # on ne garde que les 30 dernières instructions remplacées
+        pp["instructions"].remove(i)
+    return off
+
+
 def instruction_lines(p, a, only_new=False):
     seen = a.get("seen_seq", 0)
     out = []
     for i in p.get("instructions", []):
         if i.get("active", True) and instr_applies(p, a, i) and (not only_new or i.get("n", 0) > seen):
             sc = i.get("scope", "global")
-            out.append("- %s%s" % (("[%s] " % sc) if sc != "global" else "", i["text"]))
+            out.append("- n°%s %s%s" % (i.get("n", "?"), ("[%s] " % sc) if sc != "global" else "", i["text"]))
     return out[-40:]

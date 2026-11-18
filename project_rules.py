@@ -259,6 +259,9 @@ def dump(p, builtin_rules):
     for w in p.get("workflows", []):
         L.append("- « %s » (%s) : %s\n  Déclenchement : %s\n%s" % (w.get("name", "?"), "actif" if w.get("enabled", True) else "désactivé", w.get("desc", ""), trigger_text(w),
                                                                   "\n".join("  " + step_text(p, st, i) for i, st in enumerate(w.get("steps", []), 1))))
+    ins = [i for i in p.get("instructions", []) if i.get("active", True)]
+    L += ["", "## Instructions et décisions de l'utilisateur (PLUS RÉCENTES que les règles ci-dessus : elles les précisent ou les remplacent)"]
+    L += ["- n°%s [%s] %s" % (i.get("n", "?"), i.get("scope", "global"), i.get("text", "")) for i in ins[-40:]] or ["(aucune)"]
     L += ["", "## Réglages du projet",
           "- Autonomie des agents : %s ; règle des conflits de fusion : %s ; lancement automatique : %s ; suivi automatique : %s" % (
               p.get("autonomy", "balanced"), p.get("conflict_policy", "ask"), p.get("autopilot", "on"), p.get("supervision", "on")),

@@ -1902,6 +1902,41 @@ class Regles(unittest.TestCase):
         self.set(rules="Règle claire.")
         self.assertEqual([i for i in prules.lint(proj()) if i["level"] == "erreur"], [])
 
+    def act(self, aid, **x):
+        return engine.do_act("u", "p1", aid, x, 0)
+
+    def test_analyse_sans_memoire_et_avec_instructions(self):
+        """L'analyse ne voit que l'état courant (pas l'historique de l'agent) et reçoit les précisions de l'utilisateur."""
+        self.set(rules="Version ANCIENNE des règles.")
+        self.act("a1", do="instruction", text="Précision : les merges se font le lundi.", scope="global")
+        vus = []
+
+        def analyste(s, system, msgs):
+            vus.append(msgs)
+            return "RAS"
+        with mock.patch.object(engine, "call_ai", analyste):
+            engine.rules_analysis("u", "p1")
+            hist1 = list(proj()["agents"][0].get("history", []))
+            self.set(rules="Version NOUVELLE des règles.")
+            engine.rules_analysis("u", "p1")
+        self.assertEqual(len(vus[1]), 1)                                                            # aucun historique envoyé
+        self.assertNotIn("ANCIENNE", vus[1][0]["content"])
+        self.assertIn("NOUVELLE", vus[1][0]["content"])
+        self.assertIn("Précision : les merges se font le lundi.", vus[1][0]["content"])             # instructions dans le dump
+        self.assertEqual(hist1, list(proj()["agents"][0].get("history", [])))                      # l'historique de l'agent n'est pas alourdi
+
+    def test_instruction_annule_et_remplace(self):
+        self.act("a1", do="instruction", text="Merges le lundi", scope="global")
+        self.act("a1", do="instruction", text="Merges le mardi", scope="global")
+        n1 = [i for i in proj()["instructions"] if i["text"] == "Merges le lundi"][0]["n"]
+        back = self.act("a1", do="instruction", text="Merges le vendredi", scope="global", replaces=[n1])[0]
+        self.assertIn("remplace n° %d" % n1, back)
+        actives = [i["text"] for i in proj()["instructions"] if i.get("active", True)]
+        self.assertEqual(actives, ["Merges le mardi", "Merges le vendredi"])
+        self.assertNotIn("Merges le lundi", "\n".join(engine.rights.instruction_lines(proj(), proj()["agents"][1])))
+        engine.instr_add("u", "p1", "global", "Merges le jeudi", [int(proj()["instructions"][1]["n"])])    # remplacement par l'utilisateur
+        self.assertNotIn("Merges le mardi", [i["text"] for i in proj()["instructions"] if i.get("active", True)])
+
     def test_analyse_de_coherence_par_un_agent(self):
         self.set(rules="Les agents ne doivent jamais fusionner dans la branche principale.")
         self.set_agent(1, rules="Tu peux fusionner directement dans main quand tu as fini.")
