@@ -1937,6 +1937,28 @@ class Regles(unittest.TestCase):
         engine.instr_add("u", "p1", "global", "Merges le jeudi", [int(proj()["instructions"][1]["n"])])    # remplacement par l'utilisateur
         self.assertNotIn("Merges le mardi", [i["text"] for i in proj()["instructions"] if i.get("active", True)])
 
+    def test_consolidation_des_instructions(self):
+        for tx in ("Zoé merge dans release", "Merges réalisés par l'utilisateur", "Style strict"):
+            self.act("a1", do="instruction", text=tx, scope="global")
+        ns = {i["text"]: i["n"] for i in proj()["instructions"]}
+
+        def consolide(s, system, msgs):
+            rep = {"do": "instr_rewrite", "items": [{"text": "Les merges sont faits par l'utilisateur", "scope": "global",
+                                                      "replaces": [ns["Zoé merge dans release"], ns["Merges réalisés par l'utilisateur"], 9999]}], "obsolete": []}
+            return "OK\n```action\n" + json.dumps(rep) + "\n```"
+        with mock.patch.object(engine, "call_ai", consolide):
+            engine.instr_consolidate("u", "p1")
+        act = [i["text"] for i in proj()["instructions"] if i.get("active", True)]
+        self.assertEqual(sorted(act), ["Les merges sont faits par l'utilisateur", "Style strict"])
+        self.assertEqual(proj()["instr_consol"]["analyzing"], "")
+        self.assertIn("refusé" if False else "Aucune consolidation", engine.do_act("u", "p1", "a1", {"do": "instr_rewrite", "items": []}, 0)[1])   # pas de consolidation non demandée
+
+    def test_dump_politique_de_conflit_lisible(self):
+        self.set(conflict_policy="agent:a2")
+        d = engine.prules.dump(proj(), engine.RULES)
+        self.assertIn("l'agent %s résout" % proj()["agents"][1]["name"], d)
+        self.assertNotIn("agent:a2", d)
+
     def test_analyse_de_coherence_par_un_agent(self):
         self.set(rules="Les agents ne doivent jamais fusionner dans la branche principale.")
         self.set_agent(1, rules="Tu peux fusionner directement dans main quand tu as fini.")

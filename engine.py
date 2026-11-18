@@ -87,6 +87,7 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"bug_status","id":"<id>","status":"en correction|corrigé|vérifié|rouvert"} : faire évoluer un bug (vérifié/rouvert : droit de vérification)',
     '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>","replaces":[<n° des décisions en attente auxquelles cette question répond aussi>]} : poser une question à l’utilisateur (ambiguïté, décision structurante) ; si elle répond aussi à une question déjà en attente, indique son numéro dans replaces : l’ancienne est annulée et remplacée',
     '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur',
+    '{"do":"instr_rewrite","items":[...],"obsolete":[...]} : (uniquement lors d’une consolidation demandée par l’application) liste consolidée des instructions',
     '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications'])
 
 
@@ -764,6 +765,36 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                                    "text": str(it["text"])[:500], "suggestion": str(it.get("suggestion", ""))[:400]})
             mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(ai=issues, ai_ts=now(), ai_note="", analyzing=""))
             return "Analyse des règles enregistrée : %d point(s) relevé(s)." % len(issues), None
+        if kind == "instr_rewrite":
+            if (p.get("instr_consol") or {}).get("analyzing") != aid:
+                return refuse("Aucune consolidation des instructions ne t’est demandée.")
+            actifs = {i["n"]: i for i in p.get("instructions", []) if i.get("active", True)}
+            items, obs = [], set()
+            for it in (x.get("items") or [])[:40]:
+                if isinstance(it, dict) and str(it.get("text", "")).strip():
+                    sc = str(it.get("scope") or "global")
+                    sc = sc if sc == "global" or sc.split(":")[0] in ("role", "agent", "module") else "global"
+                    reps = [int(m.group()) for r in (it.get("replaces") or []) for m in [re.search(r"\d+", str(r))] if m and int(m.group()) in actifs]
+                    items.append({"text": str(it["text"]).strip()[:1500], "scope": sc, "replaces": reps})
+            for r in x.get("obsolete") or []:
+                m = re.search(r"\d+", str(r))
+                if m and int(m.group()) in actifs:
+                    obs.add(int(m.group()))
+            res = {"added": 0, "off": set()}
+
+            def f(pp):
+                if obs:
+                    for i in pp.get("instructions", []):
+                        if i.get("active", True) and i.get("n") in obs:
+                            i.update(active=False)
+                            res["off"].add(i["n"])
+                for it in items:
+                    res["off"].update(rights.add_instruction(pp, {"id": uid(), "by": a["name"] + " (consolidation)", "scope": it["scope"], "text": it["text"]}, it["replaces"]))
+                    res["added"] += 1
+                pp.setdefault("instr_consol", {}).update(analyzing="", ts=now(), note="%d instruction(s) consolidée(s), %d désactivée(s)." % (res["added"], len(res["off"])))
+            mp(u, pid, f)
+            gone = "\n".join("  × n°%s : %s" % (n, actifs[n]["text"][:160]) for n in sorted(res["off"]) if n in actifs)
+            return "Consolidation des instructions : %d ajoutée(s), %d désactivée(s).%s" % (res["added"], len(res["off"]), ("\n" + gone) if gone else ""), None
         if kind == "instruction":
             if not mn:
                 return refuse("Enregistrement d’instruction refusé : réservé à l’agent principal (écris-lui un message).")
@@ -899,6 +930,29 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
     log(u, pid, "Vous", d["byName"], "Proposition « %s » refusée.%s" % (title, (" Motif : " + note) if note else ""))
     if ag:
         ask(u, pid, ag["id"], "L’utilisateur a refusé ta proposition « %s ».%s" % (title, (" Motif : " + note) if note else ""), "Vous")
+
+
+def instr_consolidate(u, pid):
+    """Consolide les instructions actives : un agent (sans mémoire) fusionne les doublons et supprime les instructions
+    contredites ou obsolètes (la plus récente l'emporte) ; résultat appliqué par l'action instr_rewrite."""
+    p = snap(u, pid)
+    ins = [i for i in p.get("instructions", []) if i.get("active", True)]
+    an = next((g for g in [by_id(p["agents"], p.get("mainId"))] + p["agents"] if g and g.get("mode") != "manual"), None)
+    if not ins or not an:
+        return mp(u, pid, lambda pp: pp.setdefault("instr_consol", {}).update(analyzing="", ts=now(), note="Aucune instruction à consolider." if not ins else "Impossible : aucun agent en mode API."))
+    mp(u, pid, lambda pp: pp.setdefault("instr_consol", {}).update(analyzing=an["id"], note="Consolidation en cours…"))
+    log(u, pid, "Système", an["name"], "Consolidation des instructions demandée à %s (%d instructions actives)." % (an["name"], len(ins)))
+    liste = "\n".join("- n°%s [%s] %s" % (i.get("n"), i.get("scope", "global"), i["text"]) for i in ins)
+    msg = ("[Consolidation des instructions] Voici TOUTES les instructions actives de l'utilisateur, de la plus ancienne à la plus récente. Elles se sont accumulées : certaines sont des doublons, "
+           "d'autres sont contredites ou rendues obsolètes par une plus récente (la plus récente l'emporte), d'autres ne sont que des décisions ponctuelles déjà appliquées. "
+           "Produis la liste MINIMALE et sans contradiction qui conserve toute l'intention actuelle de l'utilisateur, sans rien inventer ni perdre de contrainte encore valable. "
+           "Réponds par UNE action instr_rewrite {\"items\":[{\"text\":\"...\",\"scope\":\"global|role:<rôle>|agent:<prénom>|module:<module>\",\"replaces\":[<n° remplacés>]}],\"obsolete\":[<n° simplement obsolètes, à supprimer sans remplaçant>]}. "
+           "Une instruction non citée dans replaces ni obsolete reste inchangée.\n\n" + liste)
+    try:
+        ask(u, pid, an["id"], msg, "Consolidation des instructions", relog=False, fresh=True)
+    except Err as e:
+        return mp(u, pid, lambda pp: pp.setdefault("instr_consol", {}).update(analyzing="", note="Consolidation impossible : %s" % e.msg))
+    mp(u, pid, lambda pp: pp.setdefault("instr_consol", {}).update(analyzing="", note=pp["instr_consol"].get("note") if pp["instr_consol"].get("note", "").endswith("désactivée(s).") else "Aucun changement proposé par l’agent."))
 
 
 def instr_add(u, pid, scope, text, replaces=()):
@@ -1602,7 +1656,8 @@ def rules_analysis(u, pid):
            "workflows irréalisables, dépendances manquantes. Réponds par UNE action rules_report "
            "{\"issues\":[{\"severity\":\"erreur|avertissement|info\",\"where\":\"...\",\"text\":\"...\",\"suggestion\":\"...\"}]} (liste vide si tout est cohérent). "
            "Ne signale que ce qui découle du texte ci-dessous, sans rien inventer. Ce texte est l'état ACTUEL et complet : ignore toute version antérieure des règles. "
-           "Les instructions et décisions de l'utilisateur sont plus récentes que les règles et les complètent ou les remplacent : un point qu'elles précisent n'est PLUS ambigu, ne le signale pas.\n\n" + prules.dump(p, RULES))
+           "Les instructions et décisions de l'utilisateur sont plus récentes que les règles et les complètent ou les remplacent : un point qu'elles précisent n'est PLUS ambigu, ne le signale pas. "
+           "Entre deux instructions qui se contredisent, la plus RÉCENTE (n° le plus élevé) l'emporte : ce n'est pas une incohérence, signale seulement l'ancienne comme « instruction obsolète n°X » (niveau info).\n\n" + prules.dump(p, RULES))
     try:
         reply = ask(u, pid, an["id"], msg, "Analyse des règles", relog=False, fresh=True)
     except Err as e:
@@ -2569,6 +2624,7 @@ def start(u, j):
             "mr_sync": lambda: mr_sync(u, pid),
             "decide": lambda: decide(u, pid, j.get("decisionId"), str(j.get("decision", "")), str(j.get("note", "")), j.get("fields") or {}, str(j.get("answer", ""))),
             "instr_add": lambda: instr_add(u, pid, str(j.get("scope", "global")), str(j.get("text", "")), j.get("replaces") or ()),
+            "instr_consolidate": lambda: instr_consolidate(u, pid),
             "instr_del": lambda: mp(u, pid, lambda pp: pp.__setitem__("instructions", [i for i in pp.get("instructions", []) if i["id"] != j.get("instrId")]))}
     if t not in jobs:
         raise Err(400, "Type de travail inconnu")

@@ -248,6 +248,13 @@ def due(w, st, now):
     return False, None
 
 
+def _policy_text(p):
+    pol = p.get("conflict_policy") or "ask"
+    if pol.startswith("agent:"):
+        return "l'agent %s résout" % (by_id(p.get("agents", []), pol[6:]) or {}).get("name", "(agent supprimé)")
+    return {"ask": "l'utilisateur décide", "author": "l'auteur de la branche résout"}.get(pol, pol)
+
+
 def dump(p, builtin_rules):
     """Texte complet des règles, pour l'analyse de cohérence par un agent."""
     L = ["## Règles intégrées (non modifiables, appliquées à tous les agents)", "\n".join("- " + r for r in builtin_rules), "",
@@ -264,6 +271,6 @@ def dump(p, builtin_rules):
     L += ["- n°%s [%s] %s" % (i.get("n", "?"), i.get("scope", "global"), i.get("text", "")) for i in ins[-40:]] or ["(aucune)"]
     L += ["", "## Réglages du projet",
           "- Autonomie des agents : %s ; règle des conflits de fusion : %s ; lancement automatique : %s ; suivi automatique : %s" % (
-              p.get("autonomy", "balanced"), p.get("conflict_policy", "ask"), p.get("autopilot", "on"), p.get("supervision", "on")),
+              p.get("autonomy", "balanced"), _policy_text(p), p.get("autopilot", "on"), p.get("supervision", "on")),
           "- Droits des rôles : " + "; ".join("%s : %s" % (r.get("name"), ", ".join("%s=%s" % kv for kv in (r.get("caps") or {}).items())) for r in roles_of(p))]
     return "\n".join(L)
