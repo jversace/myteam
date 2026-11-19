@@ -2117,5 +2117,154 @@ class RolesGlobaux(unittest.TestCase):
         self.assertEqual(merged["projects"][0]["agents"][0]["role"], "r1")
 
 
+class Chantier0(unittest.TestCase):
+    """Agents « en attente » : aucun retour d'action ne doit se perdre (reprise en dialogue, blocs illisibles, erreurs internes, limites GitHub)."""
+    def setUp(self):
+        reset()
+        store.wj(store.state_path("u"), make_state())
+        self.sp = mock.patch.object(engine, "spawn", lambda *a, **k: None)
+        self.sp.start()
+        engine.TIMERS.clear()
+
+    def tearDown(self):
+        self.sp.stop()
+
+    def logs(self):
+        return "\n".join(m["text"] for m in proj()["log"])
+
+    def test_parse_acts_ne_perd_rien_en_silence(self):
+        clean, acts, errs = engine.parse_acts('Salut\n```action\n{"do":"read_file","path":"a"}\n```')
+        self.assertEqual((clean, [x["do"] for x in acts], errs), ("Salut", ["read_file"], []))
+        _, acts, errs = engine.parse_acts('```action\n[{"do":"read_file","path":"a"},{"do":"read_file","path":"b"}]\n```')      # liste dans un bloc
+        self.assertEqual([x["path"] for x in acts], ["a", "b"])
+        self.assertEqual(errs, [])
+        _, acts, errs = engine.parse_acts('```action\n{"do":"write_file","content":"ligne 1\nligne 2"}\n```')                  # retour à la ligne non échappé
+        self.assertEqual((acts, len(errs)), ([], 1))
+        self.assertIn("n° 1 invalide", errs[0])
+        clean, acts, errs = engine.parse_acts('Début\n```action\n{"do":"write_file","content":"tronqué')                       # réponse coupée
+        self.assertEqual((clean, acts, len(errs)), ("Début", [], 1))
+        self.assertIn("pas refermé", errs[0])
+        _, acts, errs = engine.parse_acts('```action\n"read_file"\n```')                                                       # pas un objet
+        self.assertEqual((acts, len(errs)), ([], 1))
+
+    def test_bloc_illisible_renvoye_a_l_agent(self):
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            if len(vus) == 1:
+                return 'Je lis.\n```action\n{"do":"read_file","path":"README.md"\n```'          # accolade manquante
+            return "Compris."
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.ask("u", "p1", "a1", "lis le README", "Vous")
+        self.assertEqual(len(vus), 2)
+        self.assertTrue(vus[1].startswith("[Application] Résultats"))
+        self.assertIn("invalide", vus[1])
+        self.assertIn("illisible", self.logs())
+
+    def test_liste_d_actions_dans_un_bloc_executee(self):
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            if len(vus) == 1:
+                return '```action\n[{"do":"list_files","path":""},{"do":"read_file","path":"README.md"}]\n```'
+            return "Fait."
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.ask("u", "p1", "a1", "regarde", "Vous")
+        self.assertIn("# demo", vus[1])                                                  # le contenu du fichier a bien été renvoyé
+
+    def test_erreur_interne_d_action_renvoyee_a_l_agent(self):
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            return '```action\n{"do":"read_file","path":"README.md"}\n```' if len(vus) == 1 else "ok"
+
+        def boom(*a, **k):
+            raise AttributeError("bogue simulée")
+        with mock.patch.object(engine, "call_ai", fake), mock.patch.object(engine, "repo_act", boom):
+            engine.ask("u", "p1", "a1", "lis", "Vous")
+        self.assertEqual(len(vus), 2)
+        self.assertIn("erreur interne", vus[1])
+        self.assertIn("AttributeError", vus[1])
+
+    def test_dialogue_reprend_le_retour_non_traite(self):
+        calls = []
+        n = engine.MAX_STEPS + 2                                                          # plus d'étapes qu'un seul échange n'en permet
+
+        def fake(s, system, msgs):
+            calls.append(msgs[-1]["content"])
+            return '```action\n{"do":"list_files","path":""}\n```' if len(calls) < n else "Terminé."
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.say("u", "p1", "a1", "explore")
+        self.assertEqual(len(calls), n)                                                   # avant : l'échange s'arrêtait à MAX_STEPS, retour perdu
+        self.assertTrue(calls[-1].startswith("[Application] Résultats"))                   # le dernier retour est bien délivré
+        self.assertIn("Terminé.", self.logs())
+        self.assertNotIn("travaille encore", self.logs())
+
+    def test_dialogue_borne_et_previent_l_utilisateur(self):
+        calls = []
+
+        def fake(s, system, msgs):
+            calls.append(1)
+            return '```action\n{"do":"list_files","path":""}\n```'
+        with mock.patch.object(engine, "call_ai", fake):
+            engine.say("u", "p1", "a1", "boucle")
+        self.assertEqual(len(calls), engine.SAY_ROUNDS * engine.MAX_STEPS)
+        self.assertIn("travaille encore", self.logs())
+        self.assertIn("continue", self.logs())
+
+
+class LimitesGithub(unittest.TestCase):
+    """github.call_status : nouvelles tentatives sur limite de débit et pannes temporaires (lecture seule pour les 5xx)."""
+    def setUp(self):
+        import github
+        self.gh = github
+        self.sleeps = []
+        self.s = mock.patch.object(github, "SLEEP", self.sleeps.append)
+        self.s.start()
+
+    def tearDown(self):
+        self.s.stop()
+
+    def run_calls(self, method, seq):
+        with mock.patch.object(self.gh, "_once", side_effect=seq) as m:
+            try:
+                r = self.gh.call_status("t", method, "/x")
+            except Err as e:
+                r = e
+        return r, m.call_count
+
+    def test_429_reessaye_avec_retry_after(self):
+        r, n = self.run_calls("POST", [(429, {"message": "slow", "_retry_after": 7}), (201, {"ok": 1})])
+        self.assertEqual((r, n, self.sleeps), ((201, {"ok": 1}), 2, [7]))
+
+    def test_403_limite_secondaire_reessaye_mais_pas_403_de_droits(self):
+        r, n = self.run_calls("GET", [(403, {"message": "You have exceeded a secondary rate limit"}), (200, [])])
+        self.assertEqual((r[0], n), (200, 2))
+        r, n = self.run_calls("GET", [(403, {"message": "Resource not accessible by personal access token"})])
+        self.assertEqual((r[0], n), (403, 1))                                              # permission manquante : inutile de réessayer
+
+    def test_5xx_reessaye_seulement_en_lecture(self):
+        r, n = self.run_calls("GET", [(502, {}), (200, {"a": 1})])
+        self.assertEqual((r[0], n), (200, 2))
+        r, n = self.run_calls("PUT", [(502, {})])                                          # une écriture a pu être appliquée : pas de rejeu
+        self.assertEqual((r[0], n), (502, 1))
+
+    def test_reseau_injoignable_reessaye_en_lecture_et_abandon_borne(self):
+        r, n = self.run_calls("GET", [Err(502, "GitHub injoignable : x"), (200, {})])
+        self.assertEqual((r[0], n), (200, 2))
+        r, n = self.run_calls("GET", [Err(502, "GitHub injoignable : x")] * 10)
+        self.assertIsInstance(r, Err)
+        self.assertEqual(n, self.gh.RETRIES + 1)
+        r, n = self.run_calls("POST", [Err(502, "GitHub injoignable : x")] * 3)
+        self.assertEqual(n, 1)
+
+    def test_delai_plafonne(self):
+        self.run_calls("GET", [(429, {"_retry_after": 3600})] * 2 + [(200, {})])
+        self.assertTrue(all(w <= self.gh.MAX_WAIT for w in self.sleeps))
+
+
 if __name__ == "__main__":
     unittest.main()

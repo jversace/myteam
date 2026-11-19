@@ -19,7 +19,8 @@ from ai import call_ai, System
 from rights import by_id, mod_ids, now, uid, roles_of
 from store import DATA, Err, load, mutate
 
-MAX_STEPS, MAX_DEPTH, MAX_CREATE = 6, 3, 8   # tours par échange, profondeur des messages, créations par échange
+MAX_STEPS, MAX_DEPTH, MAX_CREATE = 6, 3, 8
+SAY_ROUNDS = 4                                      # échanges successifs d'un dialogue direct tant que l'agent n'a pas fini (reprise du retour non traité)   # tours par échange, profondeur des messages, créations par échange
 MAX_TEMP = 6                          # tentatives automatiques après erreur temporaire avant de remonter le problème
 BACKOFF = [0, 300, 900, 1800, 3600]   # délais minimaux entre relances (s) ; ensuite : toutes les heures
 STALL_SECONDS, SUP_COOLDOWN, STALE_RUNNING = 600, 600, 900   # inactivité, délai entre deux interventions, exécution « fantôme »
@@ -232,14 +233,32 @@ def sys_prompt(p, a):
     return System.of(["\n\n".join(x for x in grp if x) for grp in (shared, per_agent, volatile)])
 
 
+ACT_RE = re.compile(r"```action\s*([\s\S]*?)```")
+
+
 def parse_acts(t):
-    acts = []
-    for m in re.finditer(r"```action\s*([\s\S]*?)```", t):
+    """Extrait les blocs ```action de la réponse d'un agent : (texte sans les blocs, actions, erreurs).
+    Aucun bloc ne se perd en silence : JSON illisible, bloc non refermé (réponse tronquée) ou élément qui n'est pas un objet
+    produisent une erreur factuelle renvoyée à l'agent. Un bloc peut contenir une liste d'actions."""
+    acts, errs = [], []
+    for i, m in enumerate(ACT_RE.finditer(t), 1):
         try:
-            acts.append(json.loads(m.group(1)))
-        except ValueError:
-            pass
-    return re.sub(r"```action\s*([\s\S]*?)```", "", t).strip(), acts
+            d = json.loads(m.group(1))
+        except ValueError as e:
+            errs.append("Bloc action n° %d invalide (JSON illisible : %s) : il n'a PAS été exécuté. Renvoie-le en JSON valide "
+                        "(guillemets et retours à la ligne échappés dans les chaînes, une seule action par bloc)." % (i, e))
+            continue
+        for x in (d if isinstance(d, list) else [d]):
+            if isinstance(x, dict):
+                acts.append(x)
+            else:
+                errs.append("Bloc action n° %d : chaque action doit être un objet JSON {\"do\": …} : élément ignoré." % i)
+    rest = ACT_RE.sub("", t)
+    if "```action" in rest:
+        errs.append("Un bloc action n'est pas refermé (réponse tronquée ?) : il n'a PAS été exécuté. Renvoie-le complet, "
+                    "en plusieurs écritures de fichier plus courtes si le contenu est long.")
+        rest = rest[:rest.index("```action")]
+    return rest.strip(), acts, errs
 
 
 def safe_path(path, write=False):
@@ -321,7 +340,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
             if getattr(out, "usage", None) and s:
                 record_usage(u, pid, aid, s, out.usage)
             locks.check_stop(u, pid, aid, ctx["t0"])           # arrêté pendant l'appel IA : les actions de cette réponse ne sont pas exécutées
-            clean, acts = parse_acts(out)
+            clean, acts, errs = parse_acts(out)
             keep = msg if len(msg) < 3000 else msg[:3000] + "\n[…tronqué]"
             keep_out = out if len(out) < 6000 else out[:6000] + "\n[…tronqué dans l’historique]"
 
@@ -333,7 +352,9 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
             if clean:
                 log(u, pid, a["name"], frm, clean)
                 final = clean
-            fb = []
+            fb = list(errs)                                    # blocs illisibles : l'agent en est informé (sinon il attend un retour qui ne viendra jamais)
+            if errs:
+                log(u, pid, "Système", a["name"], "%d bloc(s) action de %s illisible(s) : erreur renvoyée à l’agent." % (len(errs), a["name"]))
             stats["actions"] += len(acts)
             for x in acts:
                 note, back = do_act(u, pid, aid, x, depth, ctx)
@@ -823,6 +844,9 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return "Spécifications mises à jour.", None
     except Err as e:
         return refuse("Action « %s » en échec : %s" % (kind, e.msg))
+    except Exception as e:                                 # bogue inattendue : l'agent reçoit un retour (sinon il attend sans fin) et la trace reste dans la console
+        print("Erreur interne dans l'action %s de %s : %r" % (kind, a["name"], e), flush=True)
+        return refuse("Action « %s » en échec (erreur interne de l’application : %s). Réessaie ou signale-le à l’agent principal." % (kind, type(e).__name__))
     return refuse("Action inconnue : %s" % kind)
 
 
@@ -1203,9 +1227,23 @@ def sync_all(u, pid):
     return out
 
 
+def ask_through(u, pid, aid, text, frm, relog=True):
+    """`ask` qui ne perd pas le dernier retour d'actions : si les étapes sont épuisées en plein travail (`stats["pending"]`), le retour
+    non traité est renvoyé à l'agent (au plus SAY_ROUNDS échanges). Retourne True si l'agent a fini, False s'il restait du travail."""
+    stats = {}
+    ask(u, pid, aid, text, frm, relog=relog, stats=stats)
+    for _ in range(SAY_ROUNDS - 1):
+        if not stats.get("pending"):
+            return True
+        ask(u, pid, aid, stats["pending"].removeprefix("[Application] ") + "\nPoursuis.", "Application", relog=False, stats=stats)
+    return not stats.get("pending")
+
+
 def say(u, pid, aid, text, attempt=0, relog=True):
     try:
-        ask(u, pid, aid, text, "Vous", relog=relog)
+        if not ask_through(u, pid, aid, text, "Vous", relog=relog):
+            a = by_id(snap(u, pid)["agents"], aid) or {"name": "?"}
+            log(u, pid, "Système", a["name"], "%s travaille encore (limite de tours atteinte pour cet échange) : écrivez-lui « continue » pour qu’il reprenne." % a["name"])
         for t in snap(u, pid)["tasks"]:               # une tâche passée « à vérifier » pendant la conversation
             if t["status"] == "à vérifier" and not t.get("reviewing"):
                 spawn(review_task, u, pid, t["id"])

@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,8 +18,14 @@ API = os.environ.get("APM_GITHUB_API", "https://api.github.com")
 q = urllib.parse.quote
 
 
-def call_status(tok, method, path, body=None):
-    """Retourne (code HTTP, JSON) sans lever d'exception pour un code HTTP (seul un échec réseau lève)."""
+RETRIES = int(os.environ.get("APM_GITHUB_RETRIES", "3"))   # nouvelles tentatives après limite de débit / panne temporaire
+MAX_WAIT = 30                                              # attente maximale entre deux tentatives (s)
+SLEEP = time.sleep                                         # remplaçable dans les tests
+
+
+def _once(tok, method, path, body=None):
+    """Un appel : (code HTTP, JSON) sans lever d'exception pour un code HTTP (seul un échec réseau lève).
+    En cas d'erreur HTTP, le JSON contient `_retry_after` (secondes) si GitHub l'indique."""
     req = urllib.request.Request(
         API + path, json.dumps(body).encode() if body is not None else None,
         {"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json",
@@ -31,11 +38,42 @@ def call_status(tok, method, path, body=None):
     except urllib.error.HTTPError as e:
         raw = e.read().decode(errors="replace")
         try:
-            return e.code, json.loads(raw)
+            d = json.loads(raw)
         except ValueError:
-            return e.code, {"message": raw[:300]}
+            d = {"message": raw[:300]}
+        ra = e.headers.get("Retry-After") if e.headers else None
+        if isinstance(d, dict) and ra and str(ra).isdigit():
+            d["_retry_after"] = int(ra)
+        return e.code, d
     except urllib.error.URLError as e:
         raise Err(502, "GitHub injoignable : %s" % e.reason)
+
+
+def _retryable(method, st, d):
+    """Limite de débit (429, ou 403 qui l'annonce) : le refus n'a rien exécuté, on peut réessayer quelle que soit la méthode.
+    Panne temporaire (5xx) : seulement pour une lecture (GET), une écriture a pu être appliquée."""
+    msg = str((d or {}).get("message", "")).lower() if isinstance(d, dict) else ""
+    if st == 429 or (st == 403 and ("rate limit" in msg or (isinstance(d, dict) and d.get("_retry_after")))):
+        return True
+    return method == "GET" and st >= 500
+
+
+def call_status(tok, method, path, body=None):
+    """Comme `_once`, avec nouvelles tentatives (délai exponentiel, ou `Retry-After`, plafonné à MAX_WAIT) sur limite de débit
+    et, pour un GET, sur panne temporaire ou réseau injoignable."""
+    for n in range(RETRIES + 1):
+        try:
+            st, d = _once(tok, method, path, body)
+        except Err:
+            if method != "GET" or n >= RETRIES:
+                raise
+            SLEEP(min(MAX_WAIT, 2 ** (n + 1)))
+            continue
+        if n < RETRIES and _retryable(method, st, d):
+            ra = d.get("_retry_after") if isinstance(d, dict) else None
+            SLEEP(min(MAX_WAIT, ra if ra else 2 ** (n + 1)))
+            continue
+        return st, d
 
 
 def call(tok, method, path, body=None, ok404=False):

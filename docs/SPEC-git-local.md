@@ -15,12 +15,12 @@ Lecture du code (`engine.py`), causes probables, par ordre de vraisemblance :
 3. **Bloc contenant une liste JSON.** `x.get(...)` lève `AttributeError`, non rattrapée par `do_act` (`except Err`) ni par `say` (`except Err`) : le tour s'interrompt, trace uniquement dans la console.
 4. Les erreurs GitHub (403/404/422) sont, elles, **renvoyées à l'agent** (`refuse(...)`) : cause moins probable. Aucun retry/backoff sur les 403/429 GitHub (seuls les appels IA en ont).
 
-Correctifs proposés (chantier 0, petits, sans lien avec git local) :
+Correctifs du **chantier 0** — **appliqués** (19 nov. 2026, avec tests `Chantier0` et `LimitesGithub`), sans lien avec git local :
 - `say()` : reprendre `pending` comme `run_task` (jusqu'à N tours), au lieu de l'abandonner.
 - `parse_acts` : renvoyer à l'agent « bloc action n° k invalide : <erreur JSON> » ; accepter une liste d'actions dans un bloc ; ne jamais perdre un bloc en silence.
 - `do_act` : intercepter `Exception` (pas seulement `Err`) et renvoyer un refus factuel à l'agent.
 - `github.call` : retry avec backoff sur 403 (limite secondaire)/429/5xx, en respectant `Retry-After`.
-- Détecter un agent « en attente » (dernier message sans retour traité) et le relancer automatiquement avec le retour manquant.
+- Reste à faire : les autres appelants d'`ask` (message d'agent à agent, `decide`…) ne reprennent pas encore le retour non traité ; détecter un agent « en attente » (dernier message sans retour traité) et le relancer automatiquement.
 
 ### 0.2 Ce qui est réutilisable
 
@@ -139,7 +139,7 @@ Vrais dépôts git temporaires ; remote = dépôt nu local (`git init --bare`) ;
 
 ## 14. Étapes
 
-0. **Chantier 0** (§ 0.1) : reprise en dialogue, retours d'erreur d'actions, retry GitHub.
+0. **Chantier 0** (§ 0.1) : reprise en dialogue, retours d'erreur d'actions, retry GitHub — **fait**.
 1. Interface commune + `gitlocal.py`, mode B, worktrees, outils agents.
 2. Cycle tâche → validation → merge, file d'intégration, MR déduites de git.
 3. Mode C (initialisation), releases, tags.
