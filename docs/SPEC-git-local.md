@@ -172,7 +172,7 @@ Vrais dépôts git temporaires ; remote = dépôt nu local (`git init --bare`) ;
 ## 14. Étapes (état au 20 nov. 2026)
 
 0. **Chantier 0** (§ 0.1) : reprise en dialogue, retours d'erreur d'actions, retry GitHub — **fait**.
-1. Interface commune + `gitlocal.py`, mode B, worktrees, outils agents. **`gitlocal.py` fait** (initialisation, contrôles préalables, worktrees, commit/diff/log/show/search, sync, intégration, conflits, push, reprise ; 35 tests sur vrais dépôts). **Reste** : raccordement au moteur (outils des agents dans `local_act`, fournisseur de dépôt, réglages de projet, contrôles préalables dans `localdir_check`).
+1. Interface commune + `gitlocal.py`, mode B, worktrees, outils agents. **Fait (20 nov. 2026)** : `gitlocal.py` (35 tests) et raccordement au moteur derrière le réglage de projet `nogit` (désactivé par défaut) : worktree par agent, outils `status`/`commit`/`diff`/`search`/`sync`/`git_log`/`git_show`, contrôles préalables, contexte hors des branches, case à cocher dans l'interface (16 tests, dont la non-régression du mode sans git). **Non fait** : le choix d'une interface commune formelle avec `github.Repo` est reporté à l'étape 2 (les deux modes sont aiguillés dans `repo_act` ; `github.Repo` reste inchangé).
 2. Cycle tâche → validation → merge, file d'intégration, MR déduites de git.
 3. Mode C (initialisation), releases, tags.
 4. Conflits, reprise après crash, tableau de bord, option push de branche.

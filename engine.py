@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 
 import github
+import gitlocal
 import locks
 import project_rules as prules
 import rights
@@ -56,6 +57,7 @@ RULES = [
     "Ne t’arrête pas à la première erreur : analyse-la, corrige et continue (relis le fichier, change d’approche). Si tu es réellement bloqué, écris à l’agent qui peut t’aider ou pose la question avec ask_user ; ne laisse jamais une tâche en suspens sans le dire.",
     "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
     "Si tu travailles sur le RÉPERTOIRE LOCAL du projet (section « Dépôt et intégration »), il est partagé avec d’autres agents : verrouille chaque fichier AVANT de le lire pour le modifier (lock_file), modifie-le, puis libère-le dès que tu as fini (unlock_file). Si un fichier est verrouillé par un autre agent, la demande attend qu’il le libère ; ne le contourne jamais. Ne garde pas de verrou plus longtemps que nécessaire, et ne verrouille pas dans un ordre qui peut croiser celui d’un autre agent : demande tous tes fichiers d’un coup (lock_file accepte une liste). Il n’y a ni pull ni merge request sur le répertoire local.",
+    "Si ta section « Dépôt et intégration » décrit un WORKTREE GIT LOCAL : il est à toi seul (pas de verrou), write_file et delete_file modifient seulement tes fichiers, et rien n’est enregistré tant que tu n’as pas fait commit. Tu ne lances jamais de commande git toi-même : tout passe par les actions status, commit, diff, search, sync, git_log, git_show.",
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
@@ -67,6 +69,13 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"get_locks"} : (répertoire local) fichiers verrouillés, par qui, et agents en attente (sans coût)',
     '{"do":"stop_agent","agent":"<prénom>","cancel":false,"reason":"..."} : (agent principal) arrêter le travail d’un agent et libérer tous ses verrous ; cancel=true annule aussi ses modifications sur les fichiers qu’il avait verrouillés (retour à l’état d’avant)',
     '{"do":"force_unlock","path":"<fichier>","reason":"..."} : (agent principal) libérer de force le verrou d’un fichier (détenteur inactif ou plantage) ; si le détenteur travaille encore, utilise stop_agent',
+    '{"do":"status"} : (git local) fichiers modifiés non commités de ton worktree',
+    '{"do":"commit","message":"<message clair>"} : (git local) enregistrer tout ton worktree dans un commit (local)',
+    '{"do":"diff"} : (git local) tes changements par rapport à la branche cible',
+    '{"do":"search","pattern":"<texte>"} : (git local) chercher un texte dans les fichiers de ton worktree (évite de lire fichier par fichier)',
+    '{"do":"sync"} : (git local) intégrer la branche cible (celle de la release, sinon develop) dans ta branche ; commit d’abord ; en cas de conflit, résous les marqueurs puis commit ; {"do":"sync","abort":true} pour renoncer',
+    '{"do":"git_log","n":20} : (git local) derniers commits de ta branche',
+    '{"do":"git_show","rev":"<branche ou commit>","path":"<fichier, facultatif>"} : (git local) lire un commit ou une version d’un fichier (ex. la branche d’un autre agent)',
     '{"do":"pull"} : récupérer dans ta branche les changements de la branche de travail de la release (fusion ; en cas de conflit, la règle du projet s’applique)',
     '{"do":"merge_request","title":"...","body":"...","task":"<id de la tâche, facultatif>"} : soumettre ta branche à la branche de travail de la release (l’agent principal la valide)',
     '{"do":"mr_review","id":"<id de la MR>","verdict":"approved|rejected","comment":"..."} : (agent principal, ou tout agent dont le rôle a le droit « valider les merge requests » ; jamais ta propre MR) valider (fusion) ou refuser une merge request',
@@ -95,6 +104,67 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
 def local_agent(p, a):
     """Vrai si l'agent travaille sur le répertoire local du projet plutôt que sur sa branche GitHub."""
     return a.get("source") == "local"
+
+
+GIT_LOCK = threading.RLock()                           # initialisation du dépôt, création des worktrees : jamais deux en même temps
+GIT_OK = {}                                            # (utilisateur, projet, dossier, remote, base) -> dépôt validé (contrôles préalables passés)
+GIT_INTEGRATION = "develop"                            # branche d'intégration quand aucune release n'est ouverte
+GIT_KINDS = ("status", "diff", "commit", "search", "sync", "git_log", "git_show")
+
+
+def git_mode(p):
+    """Mode « git local » : répertoire local versionné, un worktree par agent (docs/SPEC-git-local.md). Réglage de projet `nogit` :
+    absent ou vrai = sans git (verrous de fichiers, comportement historique) ; faux = git local. Désactivé par défaut."""
+    return bool(str(p.get("localdir") or "").strip()) and p.get("nogit") is False
+
+
+def git_agent(p, a):
+    return local_agent(p, a) and git_mode(p)
+
+
+def git_target(p):
+    """Branche vers laquelle les agents se synchronisent : la branche de travail de la release en cours, sinon la branche d'intégration."""
+    return (p.get("cycle") or {}).get("branch") or GIT_INTEGRATION
+
+
+def git_repo(u, pid, p):
+    """Dépôt git local du projet : contrôles préalables puis initialisation, une seule fois (sous verrou) ; Err 409 si le dossier est inutilisable."""
+    repo = p.get("repo") or {}
+    lg = gitlocal.LocalGit(str(p["localdir"]).strip(), remote=(repo.get("url") or "").strip(), token=repo.get("token") or "",
+                           base=repo.get("branch") or "main", integration=GIT_INTEGRATION)
+    key = (u, pid, lg.root, lg.remote, lg.base)
+    with GIT_LOCK:
+        if key not in GIT_OK:
+            pf = gitlocal.preflight(lg.root, lg.remote)
+            if not pf["ok"]:
+                raise Err(409, "Répertoire local inutilisable pour git : %s" % " ".join(pf["problems"]))
+            GIT_OK[key] = lg.init()
+            lg.recover()
+    return lg
+
+
+def git_workspace(u, pid, p, a):
+    """(dépôt, chemin du worktree de l'agent) ; le worktree est créé sur la branche de l'agent, depuis la cible, au premier usage."""
+    lg = git_repo(u, pid, p)
+    tgt, br = git_target(p), (a.get("branch") or "").strip() or "agent/" + gitlocal.slug(a["name"], "agent", 30)
+    if br in (lg.base, tgt, GIT_INTEGRATION):
+        raise Err(403, "Ta branche (%s) est une branche de base ou de travail : l'écriture y est interdite." % br)
+    with GIT_LOCK:
+        lg.ensure_local(tgt, GIT_INTEGRATION if tgt != GIT_INTEGRATION else lg.base)
+        return lg, lg.worktree(a["name"], br, tgt)
+
+
+def git_source(lg, p):
+    """Référence à intégrer lors d'une synchronisation : la cible du remote si elle existe (après fetch), sinon la cible locale."""
+    tgt = git_target(p)
+    if lg.remote:
+        try:
+            lg.fetch()
+        except Err:
+            pass
+        if lg.has("origin/" + tgt):
+            return "origin/" + tgt
+    return tgt
 
 
 def is_main(p, a):
@@ -154,7 +224,7 @@ def ctx_text(p, a):
         ("\n## Règles du projet\n" + p["rules"]) if p.get("rules") else "",
         ("\n" + prules.agent_rules_text(p, a, "##")) if (a.get("rules") or "").strip() else "", ("\n" + prules.workflows_text(p, a, "##")) if prules.workflows_text(p, a) else "",
         "\n## Mon rôle\n%s — %s" % (r["name"], r["desc"]),
-        ("\n## Mon espace de travail\nRépertoire local du projet : %s (partagé : verrouille les fichiers avant de les modifier). Pas de branche, pas de pull ni de merge request." % (p.get("localdir") or "non défini")) if local_agent(p, a) else "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
+        ("\n## Mon espace de travail\nWorktree git local personnel (branche %s) : pas de verrou, tes modifications ne comptent qu'après commit." % (a.get("branch") or "?")) if git_agent(p, a) else ("\n## Mon espace de travail\nRépertoire local du projet : %s (partagé : verrouille les fichiers avant de les modifier). Pas de branche, pas de pull ni de merge request." % (p.get("localdir") or "non défini")) if local_agent(p, a) else "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
         "\n## Droits\n%s\n- Agents joignables : %s" % (rights.rights_text(p, a, mn), talk),
         "\n## " + ACTIONS, "\n## Notes de l’agent (à tenir à jour)\n" + (a.get("notes") or "(vides)")])
 
@@ -175,6 +245,12 @@ def teamwork_text(p, a):
 
 
 def repo_text(p, a):
+    if git_agent(p, a):
+        return ("Tu travailles dans un WORKTREE GIT LOCAL qui t’est personnel (branche %s, créée depuis %s) : aucun autre agent n’y écrit, donc AUCUN verrou.\n"
+                "Tes modifications ne sont enregistrées qu’avec l’action commit (message clair) ; elles restent locales. Utilise status, diff (contre %s), search, git_log, git_show.\n"
+                "Avant de commencer, et régulièrement, intègre les changements des autres avec sync (commit d’abord) ; en cas de conflit, résous-le dans les fichiers puis commit. "
+                "La soumission et la validation du travail terminé viennent à l’étape suivante : pour l’instant, commit puis task_status « à vérifier ».") % (
+                    a.get("branch") or "agent/" + gitlocal.slug(a["name"], "agent", 30), git_target(p), git_target(p))
     if local_agent(p, a):
         return ("Tu travailles sur le RÉPERTOIRE LOCAL du projet : %s (pas de branche, pas de pull ni de merge request).\n"
                 "Ce répertoire est partagé avec d’autres agents : verrouille un fichier (lock_file) avant de le modifier et libère-le (unlock_file) dès que tu as fini. "
@@ -212,7 +288,7 @@ def sys_prompt(p, a):
         ("# Nouveautés depuis ta dernière activité\n" + "\n".join(news)) if news else "",
         "# Toi\nPrénom : %s\nRôle : %s — %s\n%s\n%s" % (
             a["name"], r["name"], r["desc"],
-            "Espace de travail : répertoire local du projet" if local_agent(p, a) else "Branche git : %s (branche de base : %s)" % (a["branch"], repo.get("branch", "main")),
+            "Espace de travail : worktree git local (branche %s)" % (a.get("branch") or "?") if git_agent(p, a) else "Espace de travail : répertoire local du projet" if local_agent(p, a) else "Branche git : %s (branche de base : %s)" % (a["branch"], repo.get("branch", "main")),
             "Tu es l’AGENT PRINCIPAL : tu peux écrire à tous les agents et tu tiens les spécifications à jour. Quand l’utilisateur te donne un élément durable (consigne, contrainte, décision), enregistre-le avec l’action instruction et mets les spécifications à jour si besoin. Tu assures aussi le suivi : tu vérifies chaque tâche « à vérifier » (task_review : accepted seulement si le travail demandé est réellement fait — lis les fichiers de l’agent avec read_file et \"agent\" —, sinon rejected avec ce qui manque), tu interroges et relances (relaunch) les agents qui semblent bloqués, et tu remontes à l’utilisateur (ask_user) tout problème autre qu’un simple manque de tokens (ceux-là sont relancés automatiquement)." if mn else ""),
         "# Tes droits\n" + rights.rights_text(p, a, mn),
         "# Dépôt et intégration\n" + repo_text(p, a),
@@ -585,6 +661,10 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return "", "[Réponse de %s] %s" % (t["name"], r or "(pas de réponse écrite)")
         if kind in ("list_files", "read_file", "write_file", "delete_file"):
             return repo_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
+        if kind in GIT_KINDS:
+            if not git_agent(p, a):
+                return refuse("L’action %s n’existe qu’en mode git local (répertoire local versionné, un worktree par agent)." % kind)
+            return git_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
         if kind in ("lock_file", "unlock_file", "get_locks", "stop_agent", "force_unlock"):
             return lock_act(u, pid, p, a, x, kind, mn, ctx.get("t0", 0))
         if kind == "get_progress":
@@ -600,6 +680,11 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             p = snap(u, pid)
             a = by_id(p["agents"], aid)
             msg = "chore(%s) : mise à jour du contexte" % a["name"]
+            if git_agent(p, a):                            # git local : le contexte vit hors des branches (.myteam/agents/, ignoré par git)
+                try:
+                    return "Contexte mis à jour : %s" % git_context_write(u, pid, p, a), None
+                except Err as e:
+                    return refuse("Contexte enregistré dans l’application, fichier non écrit : %s" % e.msg)
             try:
                 rp = github.Repo(p)
                 sha = rp.put_file(a["branch"], ".agents/%s.md" % a["name"], ctx_text(p, a), msg)
@@ -720,6 +805,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                     t["status"], t["blocked"] = "en attente", d["id"]
             mp(u, pid, f)
             return "Question transmise à l’utilisateur : %s%s" % (q, " (tâche en attente de décision)" if tid else ""), None
+        if kind in ("pull", "merge_request") and git_agent(p, a):
+            return refuse("En mode git local : utilise sync pour intégrer la branche cible dans ta branche. La soumission et la validation du travail terminé arrivent à l’étape suivante : pour l’instant, commit puis task_status « à vérifier ».")
         if kind in ("pull", "merge_request") and local_agent(p, a):
             return refuse("Tu travailles sur le répertoire local du projet : il n’y a ni pull ni merge request (partage par verrous de fichiers).")
         if kind == "pull":
@@ -988,6 +1075,81 @@ def instr_add(u, pid, scope, text, replaces=()):
     log(u, pid, "Système", "Vous", "Instruction enregistrée (%s) : %s%s" % (sc, text, (" — remplace n° " + ", ".join(map(str, replaces))) if replaces else ""))
 
 
+def git_act(u, pid, p, a, x, kind, t0=0):
+    """Actions d'un agent en mode git local : fichiers de SON worktree (aucun verrou : une branche = un agent), puis commit, diff,
+    recherche, synchronisation avec la cible, historique. Tout git est exécuté par l'application (gitlocal), jamais par l'agent."""
+    refuse = lambda m: (m, m)
+    try:
+        lg, wt = git_workspace(u, pid, p, a)
+    except Err as e:
+        return refuse("Espace git indisponible : %s" % e.msg)
+    pw = dict(p, localdir=wt)                              # locks.* confine déjà tout accès à un dossier : ici, le worktree de l'agent
+    tgt = git_target(p)
+    ident = lambda: {"agent": a["name"], "service": str(a.get("service") or "")}
+    if kind in ("list_files", "read_file", "write_file", "delete_file"):
+        if str(x.get("agent") or "").strip():
+            return refuse("En mode git local, tu ne vois que ton propre worktree : pour le travail d'un autre agent, utilise git_show (rev = sa branche).")
+        path = safe_path(x.get("path"), write=kind in ("write_file", "delete_file"))
+        if kind == "list_files":
+            items = locks.list_dir(pw, path)
+            if items is None:
+                return refuse("Dossier introuvable : /%s" % path)
+            lines = "\n".join("- %s%s" % (i["name"], "/" if i["type"] == "dir" else " (%s o)" % i["size"]) for i in items)
+            return "Liste de /%s (%d éléments, worktree git)" % (path, len(items)), "Contenu de /%s dans ton worktree :\n%s" % (path, lines or "(vide)")
+        if kind == "read_file":
+            t = locks.read_text(pw, path)
+            if t is None:
+                return refuse("Fichier introuvable : %s" % path)
+            return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s (ton worktree) :\n%s\n%s\n%s%s" % (
+                path, F, t[:12000], F, "\n[…tronqué à 12000 caractères]" if len(t) > 12000 else "")
+        content = str(x.get("content", "")) if kind == "write_file" else None
+        if content is not None and len(content) > 200000:
+            raise Err(413, "Fichier trop volumineux (200 000 caractères maximum)")
+        with locks.IO:
+            locks.check_stop(u, pid, a["id"], t0)
+            if kind == "write_file":
+                locks.write_text(pw, path, content)
+            elif not locks.delete(pw, path):
+                return refuse("Fichier introuvable : %s" % path)
+        return "Fichier %s dans ton worktree : %s (non commité : utilise l’action commit)" % ("écrit" if kind == "write_file" else "supprimé", path), None
+    if kind == "status":
+        st = lg.status(wt)
+        return "État du worktree (%d)" % len(st), "Branche %s, cible %s. %s" % (
+            a.get("branch") or "?", tgt, ("Modifications non commitées :\n" + "\n".join("%s %s" % (i["code"], i["path"]) for i in st)) if st else "Rien à committer.")
+    if kind == "commit":
+        locks.check_stop(u, pid, a["id"], t0)
+        msg = str(x.get("message") or "").strip() or "Mise à jour"
+        sha = lg.commit(wt, msg, task=str(x.get("task") or ""), **ident())
+        if not sha:
+            return "Rien à committer", "Rien à committer : aucun changement dans ton worktree."
+        record_commit(u, pid, a["name"], msg, sha)
+        return "Commit %s : %s" % (sha[:7], msg), "Commit %s enregistré sur ta branche (local : il n’est poussé nulle part)." % sha[:7]
+    if kind == "diff":
+        d = lg.diff(wt, tgt, budget=15000)
+        return "Diff avec %s" % tgt, d or "Aucune différence avec %s." % tgt
+    if kind == "search":
+        r = lg.search(wt, x.get("pattern"))
+        return "Recherche « %s » (%d résultat(s))" % (str(x.get("pattern"))[:40], len(r)), "\n".join(r) or "Aucun résultat."
+    if kind == "git_log":
+        return "Historique", lg.log(wt, int(x.get("n") or 20) if str(x.get("n") or "20").isdigit() else 20) or "(vide)"
+    if kind == "git_show":
+        return "Lecture d'une version", lg.show(wt, str(x.get("rev") or "HEAD"), x.get("path") or None)
+    if kind == "sync":
+        locks.check_stop(u, pid, a["id"], t0)
+        if x.get("abort"):
+            lg.abort(wt)
+            return "Synchronisation annulée", "Synchronisation annulée : ton worktree est revenu à son dernier commit."
+        if lg.status(wt):
+            return refuse("Synchronisation refusée : tu as des modifications non commitées. Fais d’abord commit.")
+        src = git_source(lg, p)
+        r = lg.sync(wt, src, a["name"])
+        if r["state"] == "conflict":
+            return "Synchronisation avec %s : conflit" % tgt, ("Conflit avec %s dans : %s.\nOuvre chaque fichier : les marqueurs <<<<<<< ======= >>>>>>> montrent les deux versions. "
+                                                           "Réécris le fichier COMPLET résolu avec write_file, puis fais commit. Pour renoncer : {\"do\":\"sync\",\"abort\":true}.") % (tgt, ", ".join(r["files"]))
+        return "Synchronisation avec %s : %s" % (tgt, r["state"]), {"uptodate": "Ta branche contient déjà %s.", "merged": "%s a été intégrée à ta branche (aucun conflit)."}[r["state"]] % tgt
+    return refuse("Action inconnue : %s" % kind)
+
+
 def local_act(u, pid, p, a, x, kind, t0=0):
     """Fichiers du RÉPERTOIRE LOCAL du projet. Toute écriture exige le verrou du fichier : s'il est libre il est pris le temps de l'écriture,
     s'il est tenu par un autre agent la demande attend qu'il soit libéré (voir locks.acquire)."""
@@ -1039,6 +1201,8 @@ def local_act(u, pid, p, a, x, kind, t0=0):
 def repo_act(u, pid, p, a, x, kind, t0=0):
     tgt0 = str(x.get("agent") or "").strip()
     other = next((g for g in p["agents"] if g["name"].lower() == tgt0.lower()), None) if tgt0 and kind in ("list_files", "read_file") else None
+    if git_agent(p, a):
+        return git_act(u, pid, p, a, x, kind, t0)
     if (local_agent(p, a) and not (tgt0 and kind in ("list_files", "read_file"))) or (other and local_agent(p, other)):
         return local_act(u, pid, p, a, x, kind, t0)
     rp, b = github.Repo(p), a["branch"]
@@ -1099,6 +1263,8 @@ def lock_act(u, pid, p, a, x, kind, mn, t0=0):
     if kind == "get_locks":
         return "", lock_report(p)
     if kind in ("lock_file", "unlock_file"):
+        if git_agent(p, a):
+            return refuse("Pas de verrou en mode git local : ton worktree est à toi seul (une branche = un agent).")
         if not local_agent(p, a):
             return refuse("Les verrous ne concernent que le répertoire local du projet ; tu travailles sur ta branche GitHub (pas de verrou nécessaire).")
         paths = x.get("paths") if isinstance(x.get("paths"), list) else ([x["path"]] if x.get("path") else [])
@@ -1176,16 +1342,43 @@ def locks_clear(u, pid):
 
 
 def localdir_check(u, pid):
+    p = snap(u, pid)
     try:
-        m = locks.check_dir(snap(u, pid))
+        m = locks.check_dir(p)
     except Err as e:
         m = "Répertoire local inutilisable : " + e.msg
+    if git_mode(p):                                        # contrôles préalables git (dossier inutilisable = alerte, agents concernés refusés)
+        repo = p.get("repo") or {}
+        with GIT_LOCK:
+            for k in [k for k in GIT_OK if k[:2] == (u, pid)]:
+                del GIT_OK[k]                              # revalide au prochain usage
+        pf = gitlocal.preflight(str(p.get("localdir") or "").strip(), (repo.get("url") or "").strip())
+        m += "\nMode git local : " + ("dossier utilisable (%s)%s." % ({"git": "dépôt git existant", "empty": "dossier vide : sera initialisé ou cloné", "plain": "dossier non versionné : sera initialisé"}.get(pf["state"], pf["state"]),
+                                                                     (" — avertissement : " + " ".join(pf["warnings"])) if pf["warnings"] else "")
+                                                     if pf["ok"] else "INUTILISABLE — " + " ".join(pf["problems"]) + " Les agents concernés sont arrêtés sur ce dossier tant que le problème subsiste.")
     log(u, pid, "Système", "Vous", m)
+
+
+def git_context_write(u, pid, p, a):
+    """Écrit le fichier de contexte de l'agent dans `<répertoire local>/.myteam/agents/<prénom>.md` (hors des branches, ignoré par git) :
+    il reste stable d'une tâche à l'autre. Retourne le chemin."""
+    lg = git_repo(u, pid, p)
+    path = os.path.join(lg.root, ".myteam", "agents", gitlocal.slug(a["name"], "agent", 40) + ".md")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with locks.IO, open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(ctx_text(p, a))
+    return path
 
 
 def provision(u, pid, aid):
     p = snap(u, pid)
     a = by_id(p["agents"], aid)
+    if git_agent(p, a):                                    # git local : worktree de l'agent + fichier de contexte hors des branches
+        try:
+            lg, wt = git_workspace(u, pid, p, a)
+            return "Git local : worktree prêt (branche %s) ; contexte : %s." % (a.get("branch") or "?", git_context_write(u, pid, p, a))
+        except Err as e:
+            return "Répertoire local inutilisable pour git : %s" % e.msg
     if local_agent(p, a):                                  # répertoire local : pas de branche ; le fichier de contexte est écrit dans .agents/
         try:
             with locks.IO:
@@ -1360,7 +1553,13 @@ def run_task(u, pid, tid, retry=False, note=""):
     replies = []
     try:
         pull_note = ""
-        if local_agent(p, a):                              # répertoire local partagé : ni pull, ni branche
+        if git_agent(p, a):                                # git local : synchronisation programmatique (0 token) avec la cible avant de commencer
+            try:
+                sn, sb = git_act(u, pid, p, a, {}, "sync", time.time())
+                pull_note = "\n(Synchronisation automatique : %s)" % (sb or sn)
+            except Err as e:
+                pull_note = "\n(Synchronisation impossible : %s)" % e.msg
+        elif local_agent(p, a):                            # répertoire local partagé : ni pull, ni branche
             pull_note = "\n(Répertoire local partagé : verrouille chaque fichier avant de le modifier, libère-le dès que tu as fini.)"
         else:
             try:                                           # pull régulier : on repart de la branche de travail à jour
@@ -1376,7 +1575,8 @@ def run_task(u, pid, tid, retry=False, note=""):
             tid, t["title"], ("\n" + t["desc"]) if t.get("desc") else "",
             ("\nModules : " + ", ".join(mod_names(p, t.get("modules")))) if t.get("modules") else "", dep_context(p, t), coordination_hint(p, a),
             ("\n" + note) if note else "", pull_note)
-        msg += ("\nQuand ton travail est prêt, libère tes verrous (unlock_file) puis passe la tâche à « à vérifier »." if local_agent(p, a)
+        msg += ("\nQuand ton travail est prêt, fais commit (message clair) puis passe la tâche à « à vérifier »." if git_agent(p, a)
+                else "\nQuand ton travail est prêt, libère tes verrous (unlock_file) puis passe la tâche à « à vérifier »." if local_agent(p, a)
                 else "\nQuand ton travail est prêt, soumets une merge request vers la branche de travail de la release avec l’action merge_request, puis passe la tâche à « à vérifier ».")
         idle = 0
         for _ in range(MAX_ROUNDS):

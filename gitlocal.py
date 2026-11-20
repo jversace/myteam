@@ -229,6 +229,26 @@ class LocalGit:
             with open(ex, "a", encoding="utf-8", newline="\n") as f:
                 f.write(("" if cur.endswith("\n") or not cur else "\n") + ".myteam/\n")
 
+    def ensure_local(self, b, source=None):
+        """S'assure que la branche locale `b` existe : depuis `origin/b` si le remote l'a, sinon depuis `source` (par défaut l'intégration).
+        Retourne True si elle vient d'être créée."""
+        if self.branch_exists(b):
+            return False
+        self.check_branch(b)
+        if self.remote:
+            try:
+                self.fetch()
+            except Err:
+                pass                                       # remote injoignable : on se rabat sur la source locale
+            if self.has("origin/" + b):
+                self.g("branch", b, "origin/" + b)
+                return True
+        src = source or self.integration
+        if not self.has(src):
+            raise Err(404, "Branche source « %s » introuvable" % src)
+        self.g("branch", b, src)
+        return True
+
     # -- worktrees
     def _wt_path(self, name):
         return os.path.join(self.wt_dir, slug(name, "agent", 40))
@@ -282,7 +302,7 @@ class LocalGit:
 
     # -- état, commits, lecture (outils des agents, sans IA)
     def status(self, wt):
-        return [{"code": l[:2].strip() or "?", "path": l[3:]} for l in self.g("status", "--porcelain", cwd=wt)[1].splitlines()]
+        return [{"code": l[:2].strip() or "?", "path": l[3:]} for l in self.g("status", "--porcelain", "--untracked-files=all", cwd=wt)[1].splitlines()]
 
     def commit(self, wt, message, agent="myteam", service="", task=""):
         """Commit programmatique de tout le worktree ; retourne le sha, ou None s'il n'y a rien à committer."""
