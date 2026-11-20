@@ -101,8 +101,21 @@ Liste de contrôles par projet ; chacun : nom, commande, délai maximal, **bloqu
 - **Après le merge dans le worktree d'intégration, avant le push** : détecte les conflits sémantiques ; échec bloquant → merge annulé, tâche renvoyée à l'agent.
 - Par défaut : tests bloquants à l'intégration, lint informatif ; réglable par contrôle.
 - **État de référence** : un contrôle ne devient bloquant qu'après une première exécution verte sur la cible. Option « rejouer une fois » pour les tests instables.
-- **Sécurité** : la commande est exécutée par l'application avec les droits de son compte ; seul l'**utilisateur** la définit ou la modifie (jamais un agent) ; délai maximal, taille de sortie limitée, environnement nettoyé (sans jeton ni secrets de l'application), une exécution à la fois par défaut.
+- **Sécurité** : la commande est exécutée par l'application avec les droits de son compte ; délai maximal, taille de sortie limitée, environnement nettoyé (sans jeton ni secrets de l'application), une exécution à la fois par défaut.
+- **Qui décide** : un agent ne peut **jamais activer** ni modifier une commande ; il peut seulement la **proposer** (§ 6 ter). Seule l'approbation de l'utilisateur connecté l'active.
 - Sans contrôle configuré : le validateur est informé (« aucun contrôle automatique »), sans que cela soit présenté comme un succès.
+
+## 6 ter. Proposition et approbation d'une commande de contrôle
+
+L'utilisateur n'a pas à connaître la commande : les agents la proposent, il approuve en langage courant.
+
+- **Action `propose_check`** (droit par rôle « proposer des contrôles ») : nom, commande, moment, caractère bloquant, **explication en langage non technique** (ce que ça vérifie, ce que ça modifie, pourquoi la proposition ou le changement). Au démarrage d'un projet, l'agent principal examine le dépôt et propose les contrôles adaptés.
+- **Rien ne s'exécute avant approbation**, pas même une fois ; la commande active reste l'ancienne jusqu'à la décision. Sans commande active : « aucun contrôle automatique » (§ 6 bis).
+- **Carte d'approbation** (même mécanisme que la confirmation des tâches de premier niveau, avec pastille « à valider ») : explication de l'agent, **ce qui change** par rapport à la commande actuelle, **niveau de vigilance calculé par l'application, indépendamment de l'agent** (l'explication d'un agent peut être inexacte), et la commande exacte repliée sous « détail technique ». Boutons : **Approuver / Refuser** (avec commentaire facultatif, renvoyé à l'agent).
+- **Vigilance calculée** par analyse déterministe du texte : *faible* (lecture, tests, lint) ; *moyenne* (télécharge des paquets sur Internet, écrit des fichiers, enchaîne plusieurs commandes) ; *élevée* (supprime des fichiers, accède au réseau pour envoyer ou exécuter du code, touche aux secrets ou en dehors du dossier de travail) → confirmation renforcée ; certains motifs (`sudo`, téléchargement exécuté directement, suppression hors du dossier de travail) sont **refusés automatiquement**, sans carte.
+- **L'approbation porte sur le texte exact** : toute modification, même minime, redemande une approbation.
+- **Historique versionné** : proposant, date, approbateur, ancienne et nouvelle version, motif ; restauration d'une version précédente possible.
+- L'API de décision n'est **pas exposée aux outils des agents** (session utilisateur uniquement).
 
 ## 7. Releases et merge requests
 
@@ -171,4 +184,4 @@ Vrais dépôts git temporaires ; remote = dépôt nu local (`git init --bare`) ;
 3. **Remote GitHub** : push direct sur `develop`/`release/*`, une PR par release vers `main`, repli automatique en mode PR si le push est refusé (§ 7).
 4. **Mode sans git conservé** : case à cocher dans les paramètres du projet.
 5. **Dossier local non vide avec remote** : alerte, dossier inutilisable (pas de réconciliation assistée) ; mêmes contrôles préalables pour un `origin` différent ou des modifications non commitées (§ 2).
-6. **Contrôles automatiques** : liste de contrôles par projet, bloquants ou informatifs, avant validation et à l'intégration (§ 6 bis).
+6. **Contrôles automatiques** : liste de contrôles par projet, bloquants ou informatifs, avant validation et à l'intégration (§ 6 bis) ; **proposés par les agents avec explication non technique, activés uniquement par approbation de l'utilisateur** (§ 6 ter).
