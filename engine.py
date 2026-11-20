@@ -127,6 +127,10 @@ def git_target(p):
     return (p.get("cycle") or {}).get("branch") or GIT_INTEGRATION
 
 
+def git_branch(p, a):
+    return (a.get("branch") or "").strip() or "agent/" + gitlocal.slug(a["name"], "agent", 30)
+
+
 def git_repo(u, pid, p):
     """Dépôt git local du projet : contrôles préalables puis initialisation, une seule fois (sous verrou) ; Err 409 si le dossier est inutilisable."""
     repo = p.get("repo") or {}
@@ -146,7 +150,7 @@ def git_repo(u, pid, p):
 def git_workspace(u, pid, p, a):
     """(dépôt, chemin du worktree de l'agent) ; le worktree est créé sur la branche de l'agent, depuis la cible, au premier usage."""
     lg = git_repo(u, pid, p)
-    tgt, br = git_target(p), (a.get("branch") or "").strip() or "agent/" + gitlocal.slug(a["name"], "agent", 30)
+    tgt, br = git_target(p), git_branch(p, a)
     if br in (lg.base, tgt, GIT_INTEGRATION):
         raise Err(403, "Ta branche (%s) est une branche de base ou de travail : l'écriture y est interdite." % br)
     with GIT_LOCK:
@@ -249,7 +253,8 @@ def repo_text(p, a):
         return ("Tu travailles dans un WORKTREE GIT LOCAL qui t’est personnel (branche %s, créée depuis %s) : aucun autre agent n’y écrit, donc AUCUN verrou.\n"
                 "Tes modifications ne sont enregistrées qu’avec l’action commit (message clair) ; elles restent locales. Utilise status, diff (contre %s), search, git_log, git_show.\n"
                 "Avant de commencer, et régulièrement, intègre les changements des autres avec sync (commit d’abord) ; en cas de conflit, résous-le dans les fichiers puis commit. "
-                "La soumission et la validation du travail terminé viennent à l’étape suivante : pour l’instant, commit puis task_status « à vérifier ».") % (
+                "Quand ton travail est prêt : task_status « à vérifier » (l’application fait le commit restant, se synchronise avec la cible et soumet la merge request, que l’agent principal valide) ou merge_request. "
+                "Si ta merge request entre en conflit avec la cible, elle te revient : sync, résous, commit, puis merge_request de nouveau.") % (
                     a.get("branch") or "agent/" + gitlocal.slug(a["name"], "agent", 30), git_target(p), git_target(p))
     if local_agent(p, a):
         return ("Tu travailles sur le RÉPERTOIRE LOCAL du projet : %s (pas de branche, pas de pull ni de merge request).\n"
@@ -805,9 +810,9 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                     t["status"], t["blocked"] = "en attente", d["id"]
             mp(u, pid, f)
             return "Question transmise à l’utilisateur : %s%s" % (q, " (tâche en attente de décision)" if tid else ""), None
-        if kind in ("pull", "merge_request") and git_agent(p, a):
-            return refuse("En mode git local : utilise sync pour intégrer la branche cible dans ta branche. La soumission et la validation du travail terminé arrivent à l’étape suivante : pour l’instant, commit puis task_status « à vérifier ».")
-        if kind in ("pull", "merge_request") and local_agent(p, a):
+        if kind == "pull" and git_agent(p, a):
+            return refuse("En mode git local : utilise sync pour intégrer la branche cible dans ta branche.")
+        if kind in ("pull", "merge_request") and local_agent(p, a) and not git_agent(p, a):
             return refuse("Tu travailles sur le répertoire local du projet : il n’y a ni pull ni merge request (partage par verrous de fichiers).")
         if kind == "pull":
             st, msg = pull(u, pid, aid)
@@ -1619,8 +1624,8 @@ def run_task(u, pid, tid, retry=False, note=""):
         mp(u, pid, fin)
         if by_id(snap(u, pid)["tasks"], tid)["status"] == "à vérifier":
             try:
-                if local_agent(snap(u, pid), a):
-                    raise Err(0, "")                       # répertoire local : pas de merge request
+                if local_agent(snap(u, pid), a) and not git_agent(snap(u, pid), a):
+                    raise Err(0, "")                       # répertoire local sans git : pas de merge request
                 st, mm = submit_mr(u, pid, a["id"], "Tâche : %s" % t["title"], "", tid)
                 if st in ("submitted", "conflict"):
                     log(u, pid, "Système", a["name"], mm)
@@ -2572,10 +2577,125 @@ def after_conflict(u, pid, cid):
         spawn(run_task, u, pid, c["task"], False, "[Fusion] Le conflit de fusion est résolu et ta branche est à jour : reprends la tâche.")
 
 
+def git_submit(u, pid, aid, title="", body="", task=""):
+    """Soumission d'un agent en mode git local (même retour que `submit_mr`) : commit programmatique du reste, synchronisation avec la cible
+    (conflit = à résoudre dans son worktree), puis merge request interne validée par l'agent principal. 0 token jusqu'à la validation."""
+    p = snap(u, pid)
+    a = by_id(p["agents"], aid)
+    try:
+        lg, wt = git_workspace(u, pid, p, a)
+    except Err as e:
+        return "skip", "Espace git indisponible : %s" % e.msg
+    tgt, br = git_target(p), git_branch(p, a)
+    title = title or "Merge request de %s" % a["name"]
+    sha = lg.commit(wt, title, agent=a["name"], service=str(a.get("service") or ""), task=task)
+    if sha:
+        record_commit(u, pid, a["name"], title, sha)
+    ex = next((m for m in p.get("mrs", []) if m.get("git") and m.get("from") == br and m.get("status") in MR_ACTIVE), None)
+    if ex and sync_mrs(u, pid, force=True, only=ex["id"]):          # elle est peut-être déjà fusionnée
+        p = snap(u, pid)
+        ex = next((m for m in p.get("mrs", []) if m.get("git") and m.get("from") == br and m.get("status") in MR_ACTIVE), None)
+    r = lg.sync(wt, git_source(lg, p), a["name"])
+    if r["state"] == "conflict":
+        return "conflict", ("Conflit avec %s dans : %s. Les marqueurs <<<<<<< ======= >>>>>>> sont dans tes fichiers : réécris chaque fichier COMPLET résolu avec write_file, "
+                            "fais commit, puis soumets à nouveau (merge_request). Pour renoncer : {\"do\":\"sync\",\"abort\":true}.") % (tgt, ", ".join(r["files"]))
+    if r["state"] == "merged":
+        record_commit(u, pid, a["name"], "sync : %s" % tgt, lg.sha("HEAD", cwd=wt) or "")
+    if not lg.ahead_behind(br, tgt)["ahead"]:
+        return "skip", "Rien à soumettre : ta branche n’a aucun commit en avance sur %s." % tgt
+    if ex:
+        if ex["status"] == "conflit":                                # l'agent a résolu : la MR repart en validation
+            mp(u, pid, lambda pp: by_id(pp["mrs"], ex["id"]).update(status="ouverte", note="Reprise après résolution du conflit.", merge_tries=ex.get("merge_tries", 0)))
+            spawn(review_mr, u, pid, ex["id"])
+            return "submitted", "Merge request #%s reprise après résolution du conflit : l’agent principal va la valider." % ex["n"]
+        return "exists", "Une merge request est déjà ouverte (#%s) : elle sera validée." % ex["n"]
+    mid = uid()
+
+    def add(pp):
+        n = 1 + max([m.get("n") or 0 for m in pp.get("mrs", [])] or [0])
+        pp.setdefault("mrs", []).append({"id": mid, "n": n, "git": True, "from": br, "to": tgt, "t": "#%d %s" % (n, title), "title": title, "by": a["name"],
+                                          "by_id": aid, "task": task, "d": now(), "status": "ouverte", "note": ""})
+        return n
+    n = mp(u, pid, add)
+    spawn(review_mr, u, pid, mid)
+    return "submitted", "Merge request #%d soumise vers %s : l’agent principal va la valider." % (n, tgt)
+
+
+def git_mr_view(u, pid, p, m):
+    """(commits, fichiers, diff) d'une merge request git, pour le message du validateur."""
+    c = git_repo(u, pid, p).compare(m["to"], m["from"], budget=15000)
+    return "\n".join("  - %s" % x for x in c["commits"][-15:]) or "  (aucun)", ", ".join(c["files"][:30]) or "(aucun)", c["diff"]
+
+
+def git_mr_state(u, pid, p, m):
+    """État d'une MR git DÉDUIT de git (sans IA, sans réseau) : merged | closed (branche supprimée) | open."""
+    lg = git_repo(u, pid, p)
+    if not lg.has(m["from"]):
+        return "closed"
+    return "merged" if lg.merged(m["from"], m["to"]) else "open"
+
+
+def git_merge_mr(u, pid, mid):
+    """Intègre une MR git validée dans sa cible (merge programmatique, sérialisé), puis pousse si un remote est défini. Conflit : la MR repasse
+    à son auteur (sync, résolution, nouvelle soumission) ; au-delà de 3 essais, intervention manuelle (bouton « Réessayer »)."""
+    p = snap(u, pid)
+    m = by_id(p.get("mrs", []), mid)
+    pre = []
+    try:
+        lg = git_repo(u, pid, p)
+        with GIT_LOCK:
+            if not lg.has(m["from"]):
+                r = {"state": "closed"}
+            else:
+                if lg.remote:
+                    try:
+                        lg.update_target(m["to"])
+                    except Err as e:
+                        if e.code == 409:                          # divergence/conflit avec le remote : on n'intègre pas
+                            raise
+                        pre.append("remote injoignable (%s)" % e.msg.splitlines()[0][:120])    # réseau : la fusion locale reste possible
+                lg.ensure_local(m["to"], GIT_INTEGRATION if m["to"] != GIT_INTEGRATION else lg.base)
+                r = lg.integrate(m["from"], m["to"], message="Merge %s dans %s (MR #%s : %s)" % (m["from"], m["to"], m["n"], m.get("title", "")))
+    except Err as e:
+        return "Merge request #%s : fusion impossible pour le moment : %s" % (m["n"], e.msg)
+    if r["state"] == "closed":
+        ready = mp(u, pid, lambda pp: _close_mr_in(pp, mid, "annulée", "Branche %s introuvable." % m["from"]) if (by_id(pp["mrs"], mid) or {}).get("status") in MR_ACTIVE else None)
+        return "Merge request #%s annulée : la branche %s n’existe plus." % (m["n"], m["from"])
+    if r["state"] == "conflict":
+        tries = m.get("merge_tries", 0) + 1
+        mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(status="conflit", merge_tries=tries, conflict_files=r["files"]))
+        if tries > 3:
+            return "Merge request #%s : toujours en conflit après %d essais ; intervention manuelle nécessaire (bouton « Réessayer »)." % (m["n"], tries - 1)
+        spawn(ask, u, pid, m["by_id"], "[Intégration] Ta merge request #%s est en conflit avec %s sur : %s. Lance sync (les marqueurs apparaissent dans les fichiers), "
+              "résous-les en réécrivant chaque fichier COMPLET avec write_file, fais commit, puis soumets à nouveau avec merge_request." % (m["n"], m["to"], ", ".join(r["files"])), "Intégration MR")
+        return "Merge request #%s en conflit avec %s (fichiers : %s) : renvoyée à %s pour résolution." % (m["n"], m["to"], ", ".join(r["files"]), m["by"])
+    notes = list(pre)
+    if r.get("sha"):
+        record_commit(u, pid, m["by"], "Merge MR #%s : %s" % (m["n"], m.get("title", "")), r["sha"])
+    if lg.remote:                                          # décision 2 : branche de l'agent poussée à la validation ; la cible l'est toujours
+        for what, fn in (("de la branche %s" % m["from"], lambda: lg.push(m["from"])), ("de %s" % m["to"], lambda: lg.push_target(m["to"]))):
+            try:
+                fn()
+            except Err as e:
+                notes.append("poussée %s impossible : %s" % (what, e.msg))
+
+    def f(pp):
+        cur = by_id(pp.get("mrs", []), mid)
+        if not cur or cur["status"] not in MR_ACTIVE:
+            return None
+        return _close_mr_in(pp, mid, "fusionnée", "Fusionnée dans %s (git local)." % m["to"])
+    ready = mp(u, pid, f)
+    spawn(tick, u, pid)
+    return "Merge request #%s fusionnée dans %s.%s%s" % (m["n"], m["to"], (" Tâches désormais débloquées : %s." % ", ".join("« %s »" % x for x in (ready or []))) if ready else "",
+                                                          (" Attention : " + " ; ".join(notes) + ".") if notes else "")
+
+
 def submit_mr(u, pid, aid, title="", body="", task=""):
     """Soumet la branche de l'agent à la branche de travail. Retourne (état, message) : submitted | exists | conflict | skip."""
     p = snap(u, pid)
     a = by_id(p["agents"], aid)
+    if git_agent(p, a):
+        return git_submit(u, pid, aid, title, body, task)
     try:
         rp = github.Repo(p)
     except Err:
@@ -2642,18 +2762,24 @@ def review_mr(u, pid, mid):
                     mm["review_asked"] = True
                     add_mr_decision(pp, mm)
             return mp(u, pid, ask_user)
-        cmp = github.Repo(p).compare(m["to"], m["from"])
-        commits = "\n".join("  - %s" % c["commit"]["message"].splitlines()[0] for c in cmp.get("commits", [])[-15:]) or "  (aucun)"
-        files = ", ".join(f["filename"] for f in cmp.get("files", [])[:30]) or "(aucun)"
-        dif = diff_text(github.Repo(p), m["to"], m["from"], budget=15000)
+        if m.get("git"):
+            commits, files, dif = git_mr_view(u, pid, p, m)
+            how = ("le diff ci-dessus est fourni (relis avec git_show, rev \"%s\" et path, seulement un fichier tronqué ou absent)" if dif
+                   else "relis les changements (git_show avec rev \"%s\")") % m["from"]
+        else:
+            cmp = github.Repo(p).compare(m["to"], m["from"])
+            commits = "\n".join("  - %s" % c["commit"]["message"].splitlines()[0] for c in cmp.get("commits", [])[-15:]) or "  (aucun)"
+            files = ", ".join(f["filename"] for f in cmp.get("files", [])[:30]) or "(aucun)"
+            dif = diff_text(github.Repo(p), m["to"], m["from"], budget=15000)
+            how = ("le diff ci-dessus est fourni (relis avec read_file et \"agent\":\"%s\" seulement un fichier tronqué ou absent)" % m["by"] if dif
+                   else "relis les changements (read_file avec \"agent\":\"%s\")" % m["by"])
         task = by_id(p["tasks"], m.get("task"))
         msg = ("[Application — validation de merge request] MR #%s « %s » de %s : branche %s vers %s.\nTâche liée : %s\nCommits :\n%s\nFichiers modifiés : %s\n%s"
                "Valide cette merge request : %s, vérifie qu’ils sont cohérents avec les spécifications et la branche de travail. "
                "Conclus par mr_review : approved (elle sera fusionnée) ou rejected avec ce qu’il faut corriger.") % (
             m["n"], m.get("title", ""), m["by"], m["from"], m["to"], task["title"] if task else "aucune", commits, files,
             ("Diff :\n%s\n" % dif) if dif else "",
-            "le diff ci-dessus est fourni (relis avec read_file et \"agent\":\"%s\" seulement un fichier tronqué ou absent)" % m["by"] if dif
-            else "relis les changements (read_file avec \"agent\":\"%s\")" % m["by"])
+            how)
         ask(u, pid, rv["id"], msg, "Validation MR")
         if by_id(snap(u, pid)["mrs"], mid)["status"] == "ouverte":
             def nofinal(pp):
@@ -2692,6 +2818,8 @@ def merge_mr(u, pid, mid):
     m = by_id(p.get("mrs", []), mid)
     if not m or m["status"] not in ("ouverte", "conflit"):
         return "Merge request introuvable ou déjà traitée."
+    if m.get("git"):
+        return git_merge_mr(u, pid, mid)
     if github.Repo(p).pr_merge_number(m["n"]) == "merged":
         def f(pp):
             by_id(pp["mrs"], mid).update(status="fusionnée", done=now())
@@ -2733,23 +2861,24 @@ def sync_mrs(u, pid, force=False, only=None):
     todo = [m for m in p.get("mrs", []) if m.get("id") and m.get("n") and m.get("status") in MR_ACTIVE and (not only or m["id"] == only)]
     if not todo:
         return []
-    try:
-        rp = github.Repo(p)
-    except Err:
-        return []
-    out = []
+    rp, out = None, []
     for m in todo:
         if not force and time.time() - m.get("checked", 0) < MR_SYNC_EVERY:
             continue
         mp(u, pid, lambda pp, i=m["id"]: (by_id(pp["mrs"], i) or {}).__setitem__("checked", time.time()))
         try:
-            st = rp.pr_state(int(m["n"]))
+            if m.get("git"):
+                st = git_mr_state(u, pid, p, m)              # déduit de git : fusionnée si la branche est dans la cible, annulée si elle n'existe plus
+            else:
+                rp = rp or github.Repo(p)
+                st = rp.pr_state(int(m["n"]))
         except (Err, ValueError):
             continue
         if st in ("open", "missing"):
             continue
-        status, why = (("fusionnée", "Fusionnée sur GitHub (détectée automatiquement).") if st == "merged"
-                       else ("annulée", "Fermée sur GitHub sans fusion (détectée automatiquement)."))
+        where = "dans git" if m.get("git") else "sur GitHub"
+        status, why = (("fusionnée", "Fusionnée %s (détectée automatiquement)." % where) if st == "merged"
+                       else ("annulée", "%s sans fusion (détectée automatiquement)." % ("Branche supprimée" if m.get("git") else "Fermée sur GitHub")))
 
         def f(pp, i=m["id"], status=status, why=why):
             cur = by_id(pp["mrs"], i)
@@ -2760,8 +2889,8 @@ def sync_mrs(u, pid, force=False, only=None):
         if ready is None:
             continue
         out.append((m["n"], status))
-        log(u, pid, "Système", "Vous", "Merge request #%s « %s » : %s sur GitHub. Elle ne bloque plus les agents.%s" % (
-            m["n"], m.get("title", ""), "fusionnée" if status == "fusionnée" else "fermée sans fusion",
+        log(u, pid, "Système", "Vous", "Merge request #%s « %s » : %s %s. Elle ne bloque plus les agents.%s" % (
+            m["n"], m.get("title", ""), "fusionnée" if status == "fusionnée" else ("annulée" if m.get("git") else "fermée sans fusion"), where,
             (" Tâches désormais débloquées : %s." % ", ".join("« %s »" % x for x in ready)) if ready else ""))
     return out
 
@@ -2769,7 +2898,7 @@ def sync_mrs(u, pid, force=False, only=None):
 def mr_sync(u, pid):
     """Bouton « Vérifier sur GitHub » : revérifie tout de suite les MR en attente."""
     if not sync_mrs(u, pid, force=True):
-        log(u, pid, "Système", "Vous", "Vérification GitHub : aucune merge request à retirer (celles qui restent y sont bien encore ouvertes, ou GitHub n’a pas pu être interrogé).")
+        log(u, pid, "Système", "Vous", "Vérification : aucune merge request à retirer (celles qui restent sont bien encore ouvertes dans le dépôt, ou le dépôt n’a pas pu être interrogé).")
 
 
 def mr_done(u, pid, mid):

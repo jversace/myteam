@@ -480,5 +480,107 @@ class Reprise(Base):
         g.worktree("alice", "task/alice/t1")                                                 # recréable
 
 
+class Comparaison(Base):
+    def test_compare_commits_fichiers_diff_et_troncature(self):
+        g = self.seeded()
+        w = g.worktree("alice", "task/alice/t1")
+        write(os.path.join(w, "a.txt"), "un\nDEUX\ntrois\n")
+        g.commit(w, "Change a", "Alice")
+        write(os.path.join(w, "n.txt"), "neuf\n" * 5)
+        with open(os.path.join(w, "img.bin"), "wb") as f:
+            f.write(b"\x00\x01\x02" * 50)
+        g.commit(w, "Ajoute n et un binaire", "Alice")
+        c = g.compare("develop", "task/alice/t1")
+        self.assertEqual(len(c["commits"]), 2)
+        self.assertIn("Change a", c["commits"][1])
+        self.assertEqual(sorted(c["files"]), ["a.txt", "img.bin", "n.txt"])
+        self.assertIn("+DEUX", c["diff"])
+        self.assertIn("img.bin (binaire)", c["diff"])
+        small = g.compare("develop", "task/alice/t1", budget=30)
+        self.assertIn("budget de diff atteint", small["diff"])
+        cut = g.compare("develop", "task/alice/t1", per_file=40)
+        self.assertIn("[…diff tronqué]", cut["diff"])
+        self.assertEqual(g.compare("develop", "develop"), {"commits": [], "files": [], "diff": ""})
+
+
+class CibleDistante(Base):
+    def other_clone(self, remote):
+        other = os.path.join(self.tmp, "other")
+        sh(self.tmp, "clone", remote, other)
+        sh(other, "checkout", "-B", "develop", "origin/develop") if "origin/develop" in sh(other, "branch", "-r") else sh(other, "checkout", "-b", "develop")
+        return other
+
+    def push_other(self, other, name, text):
+        write(os.path.join(other, name), text)
+        sh(other, "add", "-A")
+        sh(other, "commit", "-m", "autre " + name)
+        sh(other, "push", "origin", "develop")
+
+    def test_sans_remote_ou_sans_cible_distante(self):
+        g = self.seeded()
+        self.assertEqual(g.update_target("develop"), "none")
+        self.assertEqual(g.push_target("develop"), "none")
+        r = self.bare({"README.md": "x\n"})
+        shutil.rmtree(self.root)
+        os.makedirs(self.root)
+        g = self.repo(remote=r)
+        self.assertEqual(g.update_target("develop"), "none")                       # develop n'existe pas encore sur le remote
+        self.assertEqual(g.push_target("develop"), "pushed")
+        self.assertEqual(g.update_target("develop"), "uptodate")
+
+    def test_avance_rapide_puis_fusion_si_divergence(self):
+        r = self.bare({"README.md": "x\n"})
+        g = self.repo(remote=r)
+        g.push("develop")
+        other = self.other_clone(r)
+        self.push_other(other, "o1.txt", "1\n")
+        self.assertEqual(g.update_target("develop"), "updated")                    # le local était en retard : avance rapide
+        self.assertTrue(g.merged("origin/develop", "develop"))
+        w = g.worktree("alice", "task/alice/t1")
+        write(os.path.join(w, "a1.txt"), "a\n")
+        g.commit(w, "a1", "Alice")
+        g.integrate("task/alice/t1", "develop")                                      # local en avance
+        self.push_other(other, "o2.txt", "2\n")                                     # …et le remote aussi : divergence
+        self.assertEqual(g.update_target("develop"), "updated")
+        self.assertEqual(g.ahead_behind("develop", "origin/develop")["behind"], 0)
+        self.assertEqual(sh(g.root, "show", "develop:o2.txt"), "2\n")
+        self.assertEqual(sh(g.root, "show", "develop:a1.txt"), "a\n")
+
+    def test_push_cible_reessaye_apres_avance_du_remote(self):
+        r = self.bare({"README.md": "x\n"})
+        g = self.repo(remote=r)
+        g.push("develop")
+        other = self.other_clone(r)
+        w = g.worktree("alice", "task/alice/t1")
+        write(os.path.join(w, "a1.txt"), "a\n")
+        g.commit(w, "a1", "Alice")
+        g.integrate("task/alice/t1", "develop")
+        self.push_other(other, "o1.txt", "1\n")                                     # le remote a avancé depuis le fetch du dépôt local
+        self.assertEqual(g.push_target("develop"), "pushed")
+        self.assertEqual(gl.git(["show", "develop:o1.txt"], r)[1], "1\n")
+        self.assertEqual(gl.git(["show", "develop:a1.txt"], r)[1], "a\n")
+        self.assertEqual(gl.git(["rev-parse", "develop"], r)[1].strip(), g.sha("develop"))
+
+    def test_conflit_avec_le_remote_leve_409(self):
+        r = self.bare({"a.txt": "un\ndeux\ntrois\n"})
+        g = self.repo(remote=r)
+        g.push("develop")
+        other = self.other_clone(r)
+        w = g.worktree("alice", "task/alice/t1")
+        write(os.path.join(w, "a.txt"), "un\nALICE\ntrois\n")
+        g.commit(w, "alice", "Alice")
+        g.integrate("task/alice/t1", "develop")
+        write(os.path.join(other, "a.txt"), "un\nAUTRE\ntrois\n")
+        sh(other, "add", "-A")
+        sh(other, "commit", "-m", "autre")
+        sh(other, "push", "origin", "develop")
+        before = g.sha("develop")
+        with self.assertRaises(Err) as c:
+            g.update_target("develop")
+        self.assertEqual(c.exception.code, 409)
+        self.assertIn("a.txt", c.exception.msg)
+        self.assertEqual(g.sha("develop"), before)                                    # cible locale intacte
+
+
 if __name__ == "__main__":
     unittest.main()

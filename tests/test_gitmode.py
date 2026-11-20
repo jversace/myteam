@@ -161,9 +161,9 @@ class ModeGit(Base):
         self.assertIn("interdite", str(r))
         self.assertFalse(os.path.exists(os.path.join(self.root, "x.txt")))
 
-    def test_pull_et_merge_request_redirigent_vers_sync(self):
+    def test_pull_redirige_vers_sync_et_merge_request_sans_travail(self):
         self.assertIn("sync", str(self.act("a2", "pull")))
-        self.assertIn("sync", str(self.act("a2", "merge_request", title="t")))
+        self.assertIn("Rien à soumettre", str(self.act("a2", "merge_request", title="t")))        # rien en avance sur la cible
 
     def test_provision_contexte_hors_des_branches(self):
         msg = engine.provision("u", "p1", "a2")
@@ -212,6 +212,240 @@ class DossierVideSansRemote(Base):
         engine.localdir_check("u", "p1")
         self.assertIn("Mode git local", self.logs())
         self.assertIn("utilisable", self.logs())
+
+
+class Mr(Base):
+    """Merge requests internes : soumission, validation, intégration programmatique, conflits, état déduit de git, push."""
+
+    def work(self, who, path, content, msg="travail"):
+        self.act(who, "write_file", path=path, content=content)
+        self.act(who, "commit", message=msg)
+
+    def mr(self, who="a2"):
+        return next(m for m in reversed(proj()["mrs"]) if m["by_id"] == who)
+
+    def base_file(self):
+        with open(os.path.join(self.root, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("un\ndeux\ntrois\n")
+
+    def test_soumission_commit_le_reste_et_cree_une_mr_interne(self):
+        self.act("a2", "write_file", path="src/x.py", content="print(1)\n")                    # pas de commit de l'agent
+        st, msg = engine.submit_mr("u", "p1", "a2", "Tâche : X", "", "")
+        self.assertEqual(st, "submitted", msg)
+        m = self.mr()
+        self.assertEqual((m["git"], m["from"], m["to"], m["status"], m["n"]), (True, "agent/bob", "develop", "ouverte", 1))
+        self.assertEqual(self.act("a2", "status")[1].split(". ")[-1], "Rien à committer.")        # le reste a été commité par l'application
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Tâche : X")[0], "exists")
+        self.assertEqual(engine.submit_mr("u", "p1", "a3", "Rien")[0], "skip")                   # Carl n'a rien en avance
+
+    def test_validation_fusionne_dans_la_cible(self):
+        self.act("a3", "status")                                                                  # le worktree de Carl existe avant la fusion
+        self.work("a2", "src/x.py", "print(1)\n")
+        engine.submit_mr("u", "p1", "a2", "Tâche : X")
+        r = engine.apply_mr_review("u", "p1", self.mr()["id"], "Alice", "approved", "ok")
+        self.assertIn("fusionnée dans develop", r)
+        self.assertEqual(self.mr()["status"], "fusionnée")
+        lg = engine.git_repo("u", "p1", proj())
+        self.assertEqual(sh(lg.root, "show", "develop:src/x.py"), "print(1)\n")
+        self.assertTrue(any("Merge MR #1" in c["m"] for c in proj()["commits"]))
+        self.assertEqual(self.act("a3", "sync")[0].split(" : ")[-1], "merged")                    # Carl récupère le travail de Bob
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Carl"), "src", "x.py")))
+        self.assertIn("introuvable ou déjà traitée", engine.merge_mr("u", "p1", self.mr()["id"]))
+
+    def test_refus_de_validation(self):
+        self.work("a2", "src/x.py", "print(1)\n")
+        engine.submit_mr("u", "p1", "a2", "Tâche : X")
+        r = engine.apply_mr_review("u", "p1", self.mr()["id"], "Alice", "rejected", "manque les tests")
+        self.assertIn("refusée", r)
+        self.assertEqual(self.mr()["status"], "refusée")
+        lg = engine.git_repo("u", "p1", proj())
+        self.assertNotEqual(gitlocal.git(["cat-file", "-e", "develop:src/x.py"], lg.root, check=False)[0], 0)    # absent de la cible
+
+    def test_conflit_detecte_a_la_soumission(self):
+        self.base_file()
+        self.work("a2", "a.txt", "un\nBOB\ntrois\n")
+        self.work("a3", "a.txt", "un\nCARL\ntrois\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mr("a2")["id"], "Alice", "approved", "")
+        st, msg = engine.submit_mr("u", "p1", "a3", "Carl")
+        self.assertEqual(st, "conflict")
+        self.assertIn("a.txt", msg)
+        self.assertIn("<<<<<<<", self.act("a3", "read_file", path="a.txt")[1])
+        self.work("a3", "a.txt", "un\nBOB+CARL\ntrois\n", "résolution")
+        self.assertEqual(engine.submit_mr("u", "p1", "a3", "Carl")[0], "submitted")
+        self.assertIn("fusionnée", engine.apply_mr_review("u", "p1", self.mr("a3")["id"], "Alice", "approved", ""))
+        self.assertEqual(sh(self.root, "show", "develop:a.txt"), "un\nBOB+CARL\ntrois\n")
+
+    def test_conflit_a_l_integration_renvoye_a_l_auteur_puis_repris(self):
+        self.base_file()
+        self.work("a2", "a.txt", "un\nBOB\ntrois\n")
+        self.work("a3", "a.txt", "un\nCARL\ntrois\n")
+        self.assertEqual(engine.submit_mr("u", "p1", "a3", "Carl")[0], "submitted")              # les deux soumises avant toute intégration
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Bob")[0], "submitted")
+        engine.apply_mr_review("u", "p1", self.mr("a2")["id"], "Alice", "approved", "")
+        calls = []
+        with mock.patch.object(engine, "spawn", lambda f, *a, **k: calls.append((f.__name__, a))):
+            r = engine.apply_mr_review("u", "p1", self.mr("a3")["id"], "Alice", "approved", "")
+        self.assertIn("renvoyée à Carl", r)
+        m = self.mr("a3")
+        self.assertEqual((m["status"], m["merge_tries"], m["conflict_files"]), ("conflit", 1, ["a.txt"]))
+        ask = [c for c in calls if c[0] == "ask"]
+        self.assertEqual(len(ask), 1)
+        self.assertEqual(ask[0][1][2], "a3")                                                      # l'auteur est prévenu
+        self.assertIn("sync", ask[0][1][3])
+        self.assertEqual(sh(self.root, "show", "develop:a.txt"), "un\nBOB\ntrois\n")           # la cible n'a pas été touchée
+        self.assertIn("conflit", str(self.act("a3", "sync")).lower())
+        self.work("a3", "a.txt", "un\nBOB+CARL\ntrois\n", "résolution")
+        st, msg = engine.submit_mr("u", "p1", "a3", "Carl")
+        self.assertEqual((st, self.mr("a3")["status"]), ("submitted", "ouverte"))                 # la même MR repart en validation
+        self.assertEqual(len([x for x in proj()["mrs"] if x["by_id"] == "a3"]), 1)
+        self.assertIn("fusionnée", engine.apply_mr_review("u", "p1", self.mr("a3")["id"], "Alice", "approved", ""))
+        self.assertEqual(sh(self.root, "show", "develop:a.txt"), "un\nBOB+CARL\ntrois\n")
+
+    def test_trop_d_essais_demande_une_intervention(self):
+        self.base_file()
+        self.work("a2", "a.txt", "un\nBOB\ntrois\n")
+        self.work("a3", "a.txt", "un\nCARL\ntrois\n")
+        engine.submit_mr("u", "p1", "a3", "Carl")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mr("a2")["id"], "Alice", "approved", "")
+        mid = self.mr("a3")["id"]
+        for _ in range(3):
+            engine.merge_mr("u", "p1", mid)
+        self.assertIn("intervention manuelle", engine.merge_mr("u", "p1", mid))
+        self.assertEqual(self.mr("a3")["status"], "conflit")
+
+    def test_etat_deduit_de_git_sans_ia_ni_reseau(self):
+        self.work("a2", "src/x.py", "print(1)\n")
+        self.work("a3", "src/y.py", "print(2)\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.submit_mr("u", "p1", "a3", "Carl")
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [])                              # rien n'est fusionné : elles restent ouvertes
+        lg = engine.git_repo("u", "p1", proj())
+        lg.integrate("agent/bob", "develop")                                                       # fusionnée « à la main » en dehors de l'application
+        lg.drop_worktree("Carl")
+        sh(lg.root, "branch", "-D", "agent/carl")                                                  # branche supprimée
+        out = engine.sync_mrs("u", "p1", force=True)
+        self.assertEqual(sorted(out), [(1, "fusionnée"), (2, "annulée")])
+        self.assertEqual({m["by"]: m["status"] for m in proj()["mrs"]}, {"Bob": "fusionnée", "Carl": "annulée"})
+        self.assertIn("dans git", self.logs())
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [])                              # idempotent
+
+    def test_mr_github_et_git_coexistent_dans_sync_mrs(self):
+        self.work("a2", "src/x.py", "print(1)\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        p = proj()
+        p["mrs"].append({"id": "gh1", "n": 77, "from": "agent/z", "to": "release/v1", "title": "gh", "by": "Z", "by_id": "a3", "status": "ouverte", "d": ""})
+        store.wj(store.state_path("u"), {**store.load("u"), "projects": [p]})
+        engine.git_repo("u", "p1", p).integrate("agent/bob", "develop")
+        out = engine.sync_mrs("u", "p1", force=True)                                               # la MR GitHub (sans accès) ne bloque pas celle de git
+        self.assertEqual(out, [(1, "fusionnée")])
+        self.assertEqual(by_id_status(proj(), "gh1"), "ouverte")
+
+    def test_vue_du_validateur(self):
+        self.work("a2", "src/x.py", "def f():\n    return 1\n", "Ajoute f")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        m = self.mr()
+        commits, files, dif = engine.git_mr_view("u", "p1", proj(), m)
+        self.assertIn("Ajoute f", commits)
+        self.assertEqual(files, "src/x.py")
+        self.assertIn("+    return 1", dif)
+        asked = []
+        with mock.patch.object(engine, "ask", lambda *a, **k: asked.append(a)), mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            engine.review_mr("u", "p1", m["id"])
+        if asked:                                                                                  # message envoyé au validateur
+            txt = asked[0][3]
+            self.assertIn("git_show", txt)
+            self.assertNotIn("read_file", txt.split("mr_review")[0].split("Diff :")[-1])
+            self.assertIn("+    return 1", txt)
+
+
+def by_id_status(p, mid):
+    return next(m for m in p["mrs"] if m["id"] == mid)["status"]
+
+
+class MrRemote(Base):
+    """Avec un remote (dépôt nu local) : branche de l'agent poussée à la validation, cible poussée, remote qui avance entre-temps."""
+
+    def setUp(self):
+        super().setUp()
+        self.remote = os.path.join(self.tmp, "remote.git")
+        sh(self.tmp, "init", "--bare", "-b", "main", self.remote)
+        seed = os.path.join(self.tmp, "seed")
+        sh(self.tmp, "init", "-b", "main", seed)
+        with open(os.path.join(seed, "README.md"), "w", encoding="utf-8") as f:
+            f.write("# demo\n")
+        sh(seed, "add", "-A")
+        sh(seed, "commit", "-m", "seed")
+        sh(seed, "push", self.remote, "main")
+        st = store.load("u")
+        st["projects"][0]["repo"]["url"] = self.remote
+        store.wj(store.state_path("u"), st)
+        engine.GIT_OK.clear()
+
+    def remote_show(self, spec):
+        return gitlocal.git(["show", spec], self.remote)[1]
+
+    def work(self, who, path, content):
+        self.act(who, "write_file", path=path, content=content)
+        self.act(who, "commit", message="travail")
+
+    def mid(self, who):
+        return next(m for m in reversed(proj()["mrs"]) if m["by_id"] == who)["id"]
+
+    def test_push_de_la_branche_de_l_agent_et_de_la_cible(self):
+        self.work("a2", "src/x.py", "print(1)\n")
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Bob")[0], "submitted")
+        r = engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        self.assertNotIn("Attention", r)
+        refs = sh(self.tmp, "ls-remote", self.remote)
+        self.assertIn("refs/heads/develop", refs)
+        self.assertIn("refs/heads/agent/bob", refs)
+        self.assertEqual(self.remote_show("develop:src/x.py"), "print(1)\n")
+        self.assertEqual(self.remote_show("develop:README.md"), "# demo\n")
+
+    def test_le_remote_a_avance_entre_temps(self):
+        self.work("a2", "src/x.py", "print(1)\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        lg = engine.git_repo("u", "p1", proj())
+        lg.push("develop")                                                                         # develop existe maintenant sur le remote
+        other = os.path.join(self.tmp, "other")
+        sh(self.tmp, "clone", self.remote, other)
+        sh(other, "checkout", "develop")
+        with open(os.path.join(other, "autre.txt"), "w", encoding="utf-8") as f:
+            f.write("autre\n")
+        sh(other, "add", "-A")
+        sh(other, "commit", "-m", "autre machine")
+        sh(other, "push", "origin", "develop")
+        r = engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        self.assertNotIn("Attention", r)
+        self.assertEqual(self.remote_show("develop:autre.txt"), "autre\n")                        # le travail de l'autre machine est conservé
+        self.assertEqual(self.remote_show("develop:src/x.py"), "print(1)\n")
+        self.assertEqual(lg.sha("develop"), gitlocal.git(["rev-parse", "develop"], self.remote)[1].strip())
+
+    def test_sync_prend_la_cible_du_remote(self):
+        self.work("a2", "src/x.py", "print(1)\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        other = os.path.join(self.tmp, "other")
+        sh(self.tmp, "clone", self.remote, other)
+        sh(other, "checkout", "develop")
+        with open(os.path.join(other, "externe.txt"), "w", encoding="utf-8") as f:
+            f.write("externe\n")
+        sh(other, "add", "-A")
+        sh(other, "commit", "-m", "externe")
+        sh(other, "push", "origin", "develop")
+        self.assertIn("merged", self.act("a3", "sync")[0])                                         # Carl reçoit le travail venu du remote
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Carl"), "externe.txt")))
+
+    def test_push_impossible_signale_sans_perdre_la_fusion(self):
+        self.work("a2", "src/x.py", "print(1)\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        shutil.rmtree(self.remote)                                                                 # remote devenu injoignable
+        r = engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        self.assertIn("fusionnée dans develop", r)
+        self.assertIn("Attention", r)
+        self.assertEqual(by_id_status(proj(), self.mid("a2")), "fusionnée")
 
 
 if __name__ == "__main__":

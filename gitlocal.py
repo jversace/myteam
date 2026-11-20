@@ -322,6 +322,33 @@ class LocalGit:
     def log(self, wt, n=20):
         return self.g("log", "-%d" % max(1, min(int(n), 100)), "--format=%h %an %ad %s", "--date=short", cwd=wt)[1].strip()
 
+    def current_branch(self, wt):
+        rc, o = self.g("symbolic-ref", "--short", "-q", "HEAD", cwd=wt, check=False)
+        return o.strip() if rc == 0 else None
+
+    def compare(self, base, head, budget=15000, per_file=3000):
+        """Ce que `head` apporte par rapport à `base` : {commits: [« sha titre »], files: [noms], diff: texte}. Le diff est tronqué par fichier
+        et au total ; les fichiers non détaillés sont listés pour être lus à la demande (équivalent de la comparaison GitHub, sans réseau)."""
+        commits = [l for l in self.g("log", "--format=%h %s", "%s..%s" % (base, head))[1].splitlines() if l.strip()]
+        files = [l.split("\t")[-1] for l in self.g("diff", "--name-status", "%s...%s" % (base, head))[1].splitlines() if l.strip()]
+        full = self.g("diff", "%s...%s" % (base, head))[1]
+        out, used, omitted = [], 0, []
+        for blk in [b for b in re.split(r"(?m)^(?=diff --git )", full) if b.strip()]:
+            name = (re.match(r"diff --git a/(.*?) b/", blk) or [None, "?"])[1]
+            if "\nBinary files" in blk or "\nGIT binary patch" in blk:
+                omitted.append("%s (binaire)" % name)
+                continue
+            if len(blk) > per_file:
+                blk = blk[:per_file] + "\n[…diff tronqué]"
+            if used + len(blk) > budget:
+                omitted.append("%s (budget de diff atteint)" % name)
+                continue
+            used += len(blk)
+            out.append(blk.rstrip("\n"))
+        if omitted:
+            out.append("Fichiers non détaillés : " + " ; ".join(omitted))
+        return {"commits": commits, "files": files, "diff": "\n".join(out)}
+
     def show(self, wt, rev, path=None, limit=12000):
         spec = "%s:%s" % (rev, str(path).replace("\\", "/").strip("/")) if path else rev
         if path:
@@ -404,6 +431,42 @@ class LocalGit:
     def _blob(self, wt, stage, path):
         rc, o = self.g("show", stage + path, cwd=wt, check=False)
         return o if rc == 0 else None
+
+    def update_target(self, target):
+        """Aligne la cible locale sur `origin/<cible>` avant une intégration : avance rapide, ou fusion si elles ont divergé (après un push
+        refusé). 'none' (pas de remote ou cible absente du remote) | 'uptodate' | 'updated'. Err 409 en cas de conflit avec le remote."""
+        if not self.remote:
+            return "none"
+        self.fetch()
+        ref = "origin/" + target
+        if not self.has(ref):
+            return "none"
+        if not self.has(target):
+            self.g("branch", target, ref)
+            return "updated"
+        if self.g("merge-base", "--is-ancestor", ref, target, check=False)[0] == 0:
+            return "uptodate"
+        if self.g("merge-base", "--is-ancestor", target, ref, check=False)[0] == 0:
+            self.g("merge", "--ff-only", ref, cwd=self._integration_wt(target))
+            return "updated"
+        r = self.integrate(ref, target, message="Merge %s dans %s" % (ref, target))
+        if r["state"] == "conflict":
+            raise Err(409, "La branche %s locale est en conflit avec celle du remote (fichiers : %s) : intervention nécessaire." % (target, ", ".join(r["files"])))
+        return "updated"
+
+    def push_target(self, target, tries=3):
+        """Pousse la cible ; si le remote a avancé entre-temps, la réaligne (fetch + fusion) puis réessaie, sans jamais forcer."""
+        if not self.remote:
+            return "none"
+        for i in range(tries):
+            self.update_target(target)
+            try:
+                self.push(target)
+                return "pushed"
+            except Err:
+                if i == tries - 1:
+                    raise
+        return "none"
 
     # -- remote
     def push(self, branch, delete=False):
