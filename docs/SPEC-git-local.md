@@ -60,13 +60,13 @@ Règle de cohérence : dans un projet dont le répertoire local **n'a pas de rem
 | `main` | Release finale uniquement, tag annoté |
 | `develop` | **Intégration permanente** quand aucune release n'est ouverte (la branche principale reste ainsi réservée) |
 | `release/<version>` | Créée depuis `develop` (ou `main`) à l'initiation de la release, par l'agent principal ou l'agent « gardien du dépôt » (droit par rôle, comme `mr_review`) |
-| `agent/<prénom>/<tâche>` | Une branche **par agent et par tâche**, créée depuis la cible courante |
+| `task/<prénom>/<id>-<titre>` | Une branche **par tâche** (un seul agent à la fois), créée depuis la cible courante. Espace de noms `task/` (et non `agent/`) : git interdit qu'une branche `agent/<nom>` (héritée) coexiste avec `agent/<nom>/…` |
 
 **Décision : une branche par tâche.** Réglage de projet « stratégie de branches » (par agent / par tâche), appliqué aux **nouvelles** tâches seulement.
 
 **Migration d'un projet en cours (une branche par agent)** : pas de bascule brutale ni de réécriture d'historique.
 - Branche d'agent déjà fusionnée dans la cible : archivée/supprimée.
-- Branche avec travail non fusionné : marquée « héritée » ; si l'agent n'a qu'une tâche en cours, elle est renommée `agent/<prénom>/<tâche>` ; s'il en a plusieurs, elle reste telle quelle jusqu'à fusion complète, ses nouvelles tâches démarrant ensuite en mode par tâche. Les MR en cours suivent leur branche.
+- Branche avec travail non fusionné : marquée « héritée » ; si l'agent n'a qu'une tâche en cours, elle est renommée `task/<prénom>/<id>-<titre>` ; s'il en a plusieurs, elle reste telle quelle jusqu'à fusion complète, ses nouvelles tâches démarrant ensuite en mode par tâche. Les MR en cours suivent leur branche.
 - **Fichier de contexte de l'agent** : sorti des branches, `<localdir>/.myteam/agents/<prénom>.md`, ignoré par git, stable d'une tâche à l'autre (le mode A n'est pas touché).
 
 **Un seul écrivain par branche** : une branche = un agent = un worktree (git refuse de sortir la même branche dans deux worktrees ; l'application applique la règle avant git). Deux agents sur une même fonctionnalité → sous-tâches, une branche chacune, fusionnées séparément (B dépend de A : B attend que A soit fusionnée). Changement d'agent sur une tâche : commit du travail en cours puis transfert du worktree (un seul détenteur à la fois). Deux tâches touchant les mêmes fichiers : conflit traité au § 6.
@@ -169,10 +169,10 @@ Initialisation, création des branches et worktrees, fetch, mise à jour, merge,
 
 Vrais dépôts git temporaires ; remote = dépôt nu local (`git init --bare`) ; scénarios : init (avec/sans remote, dossier non vide), deux agents en parallèle, mise à jour sans conflit, conflit à l'intégration puis résolution, push refusé puis nouvelle tentative, release complète (merge, tag, retour dans `develop`), crash et reprise, jeton absent de `.git/config` et des journaux.
 
-## 14. Étapes
+## 14. Étapes (état au 20 nov. 2026)
 
 0. **Chantier 0** (§ 0.1) : reprise en dialogue, retours d'erreur d'actions, retry GitHub — **fait**.
-1. Interface commune + `gitlocal.py`, mode B, worktrees, outils agents.
+1. Interface commune + `gitlocal.py`, mode B, worktrees, outils agents. **`gitlocal.py` fait** (initialisation, contrôles préalables, worktrees, commit/diff/log/show/search, sync, intégration, conflits, push, reprise ; 35 tests sur vrais dépôts). **Reste** : raccordement au moteur (outils des agents dans `local_act`, fournisseur de dépôt, réglages de projet, contrôles préalables dans `localdir_check`).
 2. Cycle tâche → validation → merge, file d'intégration, MR déduites de git.
 3. Mode C (initialisation), releases, tags.
 4. Conflits, reprise après crash, tableau de bord, option push de branche.

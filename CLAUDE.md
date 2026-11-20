@@ -21,11 +21,13 @@ Application de gestion de projets de développement par une **équipe d'agents I
 | `project_rules.py` | **règles du projet** (fonctions pures) : règles par agent, workflows, planification (`due`), contrôle de cohérence (`lint`), différences (`diff`), texte des prompts |
 | `rights.py` | **droits des agents** : capacités par rôle, autonomie du projet, création de tâches/modules/bugs, cycle de vie des bugs, instructions |
 | `engine.py` | **moteur d'agents serveur** : dialogues, actions, tâches, onboarding, releases, reprise après quota |
+| `gitlocal.py` | **client git local** (pas encore raccordé au moteur, voir `docs/SPEC-git-local.md`) : l'application exécute git (liste blanche de sous-commandes, sans shell, sans hooks, sans config globale, jeton par l'environnement et jamais dans `.git/config`) ; `preflight`, `LocalGit` : `init`, worktrees (un par agent + `_integration`), `commit`/`diff`/`log`/`show`/`search`, `sync`, `integrate` (conflits → `info` comme `github.Repo.conflict_info`), `merged`, `push`, `recover` ; branches de tâche `task/<agent>/<id>-<titre>` |
 | `locks.py` | **répertoire local et verrous de fichiers** : accès borné au répertoire, verrous exclusifs avec attente, détection de verrou circulaire, expiration, arrêt/annulation d'un agent |
 | `github.py` | classe `Repo` : branches, fichiers, **fusions (`/merges`), comparaisons, détection et résolution de conflits (commit de fusion à 2 parents via l'API Git Data)**, PR, release |
 | `ai.py` | `call_ai(s, system, messages, max_tokens=8192)` : API Anthropic ou compatible OpenAI. `System` : prompt système en blocs (`.blocks`) ; côté Anthropic, tous les blocs sauf le dernier portent `cache_control` (**prompt caching**) |
 | `static/index.html` | toute l'IHM (aucune logique d'agent : elle envoie des travaux au serveur) |
 | `static/logo-myteam.png`, `static/favicon.png` | logo (barre de menu et écran de connexion, au-dessus du titre « myTeam ») et icône d'onglet ; servis par `server.py` avec leur type MIME (charset ajouté seulement aux types texte) |
+| `tests/test_gitlocal.py` | tests de `gitlocal.py` sur de vrais dépôts git temporaires (remote = dépôt nu local) |
 | `tests/test_locks.py` | tests des verrous et du répertoire local |
 | `tests/test_engine.py` | tests (faux GitHub local + IA scriptée) : `python -m unittest discover -s tests` |
 
