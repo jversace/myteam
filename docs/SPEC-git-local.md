@@ -1,6 +1,6 @@
 # SPEC — Client git local intégré (mode « répertoire local »)
 
-> Statut : **proposition à valider** (19 nov. 2026). Rien de ce qui suit n'est implémenté.
+> Statut : **décisions prises le 20 nov. 2026 (§ 15)** ; rien de ce qui suit n'est encore implémenté (hors chantier 0, § 0.1).
 > Objectif : les agents travaillent sur un vrai dépôt git local ; **l'application** exécute git, pas les agents ; tout ce qui est mécanique se fait **sans IA** (économie de tokens, plus d'appels GitHub pour lire/écrire).
 > Le fonctionnement actuel (API GitHub, mode A) est conservé tel quel.
 
@@ -40,7 +40,7 @@ Correctifs du **chantier 0** — **appliqués** (19 nov. 2026, avec tests `Chant
 | A. GitHub (API) | Pas de répertoire local, ou agent en `source = github` | **Inchangé** |
 | B. Local, dépôt git existant | `localdir` contient un dépôt git | Worktrees, git local exécuté par l'application |
 | C. Local, à initialiser | `localdir` sans `.git` | L'application initialise (§ 2), puis mode B |
-| D. Local sans git (actuel) | `localdir` non versionné, option « sans git » | Verrous de fichiers actuels (`locks.py`) |
+| D. Local sans git (actuel) | Case à cocher **« sans git »** dans les paramètres du projet | Verrous de fichiers actuels (`locks.py`) ; si un `.git` existe, l'application l'ignore et le signale (aucun commit fait par elle) |
 
 Règle de cohérence : dans un projet dont le répertoire local **n'a pas de remote**, aucun agent ne peut être en mode A (deux sources de vérité).
 
@@ -49,7 +49,8 @@ Règle de cohérence : dans un projet dont le répertoire local **n'a pas de rem
 - Exécutée **par l'application**, une seule fois, sous mutex de projet (pas « le premier agent qui arrive » : course possible).
 - Sans remote : `git init -b main`, `.gitignore` de base (`.env`, `data/`, `.myteam/`, caches), commit initial, création de `develop`.
 - Avec remote, dossier **vide** : `git clone`.
-- Avec remote, dossier **non vide** : `clone` impossible → `init`, `remote add`, `fetch`, puis réconciliation **proposée à l'utilisateur** (décision) ; jamais d'écrasement de fichiers existants.
+- Avec remote, dossier **non vide** sans `.git` : cas qui ne doit pas se produire → le dossier est déclaré **inutilisable** (alerte explicite, agents concernés arrêtés, **aucun repli silencieux** vers le mode A) ; pas de réconciliation assistée.
+- **Contrôles préalables** à l'activation du dossier (même traitement : alerte + arrêt des agents concernés) : dossier avec `.git` dont `origin` ≠ remote du projet ; modifications non commitées au démarrage.
 - Prérequis contrôlés au démarrage et dans l'onglet *Git & releases* : git installé (Git for Windows sur PC), version minimale, `user.name` / `user.email` définis par worktree.
 
 ## 3. Branches
@@ -61,7 +62,14 @@ Règle de cohérence : dans un projet dont le répertoire local **n'a pas de rem
 | `release/<version>` | Créée depuis `develop` (ou `main`) à l'initiation de la release, par l'agent principal ou l'agent « gardien du dépôt » (droit par rôle, comme `mr_review`) |
 | `agent/<prénom>/<tâche>` | Une branche **par agent et par tâche**, créée depuis la cible courante |
 
-Décision à prendre : « une branche par agent » (continuité, plus de dérive) ou « par tâche » (courte, fusion plus propre ; recommandé).
+**Décision : une branche par tâche.** Réglage de projet « stratégie de branches » (par agent / par tâche), appliqué aux **nouvelles** tâches seulement.
+
+**Migration d'un projet en cours (une branche par agent)** : pas de bascule brutale ni de réécriture d'historique.
+- Branche d'agent déjà fusionnée dans la cible : archivée/supprimée.
+- Branche avec travail non fusionné : marquée « héritée » ; si l'agent n'a qu'une tâche en cours, elle est renommée `agent/<prénom>/<tâche>` ; s'il en a plusieurs, elle reste telle quelle jusqu'à fusion complète, ses nouvelles tâches démarrant ensuite en mode par tâche. Les MR en cours suivent leur branche.
+- **Fichier de contexte de l'agent** : sorti des branches, `<localdir>/.myteam/agents/<prénom>.md`, ignoré par git, stable d'une tâche à l'autre (le mode A n'est pas touché).
+
+**Un seul écrivain par branche** : une branche = un agent = un worktree (git refuse de sortir la même branche dans deux worktrees ; l'application applique la règle avant git). Deux agents sur une même fonctionnalité → sous-tâches, une branche chacune, fusionnées séparément (B dépend de A : B attend que A soit fusionnée). Changement d'agent sur une tâche : commit du travail en cours puis transfert du worktree (un seul détenteur à la fois). Deux tâches touchant les mêmes fichiers : conflit traité au § 6.
 
 ## 4. Arbres de travail (point critique)
 
@@ -74,7 +82,7 @@ Décision à prendre : « une branche par agent » (continuité, plus de dérive
 
 1. **Début** (programmatique) : `fetch` si remote ; création de la branche de l'agent depuis la cible (`release/x` si release ouverte, sinon `develop`) ; intégration des nouveautés de la cible. Une tâche qui dépend d'une autre ne démarre qu'après la **fusion** de celle-ci dans la cible (comportement actuel conservé).
 2. **Travail** : l'agent utilise les outils de haut niveau (§ 9). Il peut committer via `commit`.
-3. **Fin** : commit final par l'application, tâche au statut « à vérifier », travail **resté en local** (comme demandé). Option projet : « pousser aussi la branche de l'agent » (sauvegarde, visibilité), désactivée par défaut.
+3. **Fin** : commit final par l'application, tâche au statut « à vérifier », travail **resté en local** (comme demandé). **Push de la branche de l'agent** : à la validation de la tâche **ou** sur demande (bouton), uniquement si un remote est défini. Après la fusion, la branche distante est supprimée par défaut (option pour la conserver).
 4. **Validation** : l'application exécute la **commande de test/lint du projet** (configurable) et fournit le diff (déjà en place) au validateur.
 5. **Merge** (tâche validée) : dans le worktree d'intégration, `merge --no-ff` de la branche de l'agent dans la cible, puis `push` si remote. File d'attente **sérialisée**. Option `--squash` par projet.
 6. **Nettoyage** : branche et worktree de l'agent supprimés une fois la tâche fusionnée (la branche est conservée si la tâche est rouverte).
@@ -86,11 +94,22 @@ Décision à prendre : « une branche par agent » (continuité, plus de dérive
 - Jamais de résolution automatique (`-X ours/theirs`).
 - Push refusé (non fast-forward) : `fetch`, nouveau merge, nombre de tentatives borné, puis alerte.
 
+## 6 bis. Contrôles automatiques (tests, lint, build)
+
+Liste de contrôles par projet ; chacun : nom, commande, délai maximal, **bloquant / informatif**, moment (`validation`, `intégration`).
+- **Avant la validation**, dans le worktree de l'agent : en cas d'échec, la tâche retourne **automatiquement** à l'agent avec la fin de la sortie (tronquée), sans solliciter le validateur IA ; tentatives bornées (2 par défaut), puis escalade.
+- **Après le merge dans le worktree d'intégration, avant le push** : détecte les conflits sémantiques ; échec bloquant → merge annulé, tâche renvoyée à l'agent.
+- Par défaut : tests bloquants à l'intégration, lint informatif ; réglable par contrôle.
+- **État de référence** : un contrôle ne devient bloquant qu'après une première exécution verte sur la cible. Option « rejouer une fois » pour les tests instables.
+- **Sécurité** : la commande est exécutée par l'application avec les droits de son compte ; seul l'**utilisateur** la définit ou la modifie (jamais un agent) ; délai maximal, taille de sortie limitée, environnement nettoyé (sans jeton ni secrets de l'application), une exécution à la fois par défaut.
+- Sans contrôle configuré : le validateur est informé (« aucun contrôle automatique »), sans que cela soit présenté comme un succès.
+
 ## 7. Releases et merge requests
 
 - **Démarrer** : crée `release/x.y.z`. **Publier** : refuse s'il reste une tâche « à vérifier » ou un conflit ouvert ; merge de la release dans `main`, **tag annoté** `vX.Y.Z`, push de la branche et des tags, fusion retour dans `develop`. Release GitHub créée via l'API si remote GitHub.
 - **MR déduites de git** (fin des « blockers fantômes ») : `ouverte` = branche non fusionnée dans la cible ; `terminée` = fusionnée (`git branch --merged`) ; `annulée/abandonnée` = branche supprimée ou tâche annulée. Le bouton manuel « marquer comme terminée » reste en secours.
-- Remote GitHub avec branches protégées : option « créer une pull request via l'API au lieu du push direct ».
+- **Remote GitHub** : push direct par l'application sur `develop` et `release/*` (la validation a déjà eu lieu dans l'application) ; **une seule pull request par release** (release → `main`), créée et fusionnée via l'API ; **repli automatique en mode PR** si GitHub refuse le push direct (branche protégée, erreur `GH006`) : push de la branche de l'agent, ouverture de la PR, fusion via l'API ou attente des revues/contrôles exigés.
+- Permissions du jeton : **Contents** et **Pull requests** en lecture/écriture ; **Workflows** si les agents modifient `.github/workflows`.
 
 ## 8. Sécurité
 
@@ -145,11 +164,11 @@ Vrais dépôts git temporaires ; remote = dépôt nu local (`git init --bare`) ;
 3. Mode C (initialisation), releases, tags.
 4. Conflits, reprise après crash, tableau de bord, option push de branche.
 
-## 15. Décisions à prendre
+## 15. Décisions (20 nov. 2026)
 
-1. Branche **par tâche** (recommandé) ou **par agent** ?
-2. Pousser la branche de l'agent sur le remote : jamais / option / toujours ?
-3. Remote GitHub : push direct sur la release, ou pull request via l'API (branches protégées) ?
-4. Mode D (local sans git) : conservé, ou supprimé une fois le mode B stable ?
-5. Dossier local non vide avec remote : réconciliation assistée par l'utilisateur (proposé) ?
-6. Commande de test/lint : un champ par projet, bloquante ou informative ?
+1. **Branche par tâche** ; migration progressive des projets existants (§ 3).
+2. **Push de la branche de l'agent** : à la validation de la tâche ou sur demande, uniquement si un remote est défini ; branche distante supprimée après fusion par défaut, avec option pour la conserver.
+3. **Remote GitHub** : push direct sur `develop`/`release/*`, une PR par release vers `main`, repli automatique en mode PR si le push est refusé (§ 7).
+4. **Mode sans git conservé** : case à cocher dans les paramètres du projet.
+5. **Dossier local non vide avec remote** : alerte, dossier inutilisable (pas de réconciliation assistée) ; mêmes contrôles préalables pour un `origin` différent ou des modifications non commitées (§ 2).
+6. **Contrôles automatiques** : liste de contrôles par projet, bloquants ou informatifs, avant validation et à l'intégration (§ 6 bis).
