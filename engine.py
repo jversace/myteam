@@ -127,8 +127,42 @@ def git_target(p):
     return (p.get("cycle") or {}).get("branch") or GIT_INTEGRATION
 
 
-def git_branch(p, a):
+def git_strategy(p):
+    """Stratégie de branches du projet : « task » (une par tâche, défaut en mode git) ou « agent » (une par agent, historique)."""
+    return "agent" if p.get("branches") == "agent" else "task"
+
+
+def git_task_of(p, a):
+    """Tâche en cours de l'agent (la plus récente), sinon None."""
+    ts = [t for t in p.get("tasks", []) if t.get("who") == a["id"] and t.get("status") == "en cours"]
+    return max(ts, key=lambda t: t.get("started", 0)) if ts else None
+
+
+def git_agent_branch(a):
     return (a.get("branch") or "").strip() or "agent/" + gitlocal.slug(a["name"], "agent", 30)
+
+
+def git_branch_hint(p, a):
+    """Nom de la branche de l'agent pour les messages (sans appeler git)."""
+    if git_strategy(p) == "agent":
+        return git_agent_branch(a)
+    t = git_task_of(p, a)
+    return gitlocal.task_branch(a["name"], t["id"], t["title"]) if t else "task/%s/<tâche> (créée automatiquement à chaque tâche)" % gitlocal.slug(a["name"], "agent", 20)
+
+
+def git_branch(lg, p, a, tgt):
+    """Branche voulue pour l'agent, ou None = garder celle de son worktree.
+    - « agent » : sa branche historique ;
+    - « task » : tant que son ancienne branche (a["branch"]) porte du travail non fusionné dans la cible, il la garde (branche HÉRITÉE : elle doit être
+      fusionnée avant de passer aux branches par tâche) ; ensuite, une branche `task/<prénom>/<id>-<titre>` par tâche en cours."""
+    if git_strategy(p) == "agent":
+        return git_agent_branch(a)
+    old = (a.get("branch") or "").strip()
+    if old and old not in (lg.base, tgt, GIT_INTEGRATION) and lg.unmerged(old, tgt):
+        lg.ensure_local(old, tgt)
+        return old
+    t = git_task_of(p, a)
+    return gitlocal.task_branch(a["name"], t["id"], t["title"]) if t else None
 
 
 def git_repo(u, pid, p):
@@ -148,14 +182,21 @@ def git_repo(u, pid, p):
 
 
 def git_workspace(u, pid, p, a):
-    """(dépôt, chemin du worktree de l'agent) ; le worktree est créé sur la branche de l'agent, depuis la cible, au premier usage."""
+    """(dépôt, chemin du worktree de l'agent). Le worktree est créé au premier usage, depuis la cible, sur la branche voulue (`git_branch`) ; quand une
+    nouvelle tâche démarre, il change de branche (travail non commité enregistré en « WIP », ancienne branche supprimée si elle est fusionnée).
+    Sans tâche en cours, il reste sur sa branche ; sans worktree, il prend la branche libre `task/<prénom>/libre`."""
     lg = git_repo(u, pid, p)
-    tgt, br = git_target(p), git_branch(p, a)
-    if br in (lg.base, tgt, GIT_INTEGRATION):
-        raise Err(403, "Ta branche (%s) est une branche de base ou de travail : l'écriture y est interdite." % br)
+    tgt = git_target(p)
     with GIT_LOCK:
         lg.ensure_local(tgt, GIT_INTEGRATION if tgt != GIT_INTEGRATION else lg.base)
-        return lg, lg.worktree(a["name"], br, tgt)
+        cur = lg.worktrees().get(os.path.realpath(lg._wt_path(a["name"])))
+        br = git_branch(lg, p, a, tgt) or cur or gitlocal.task_branch(a["name"], "libre")
+        if br in (lg.base, tgt, GIT_INTEGRATION):
+            raise Err(403, "Ta branche (%s) est une branche de base ou de travail : l'écriture y est interdite." % br)
+        path, prev = lg.switch(a["name"], br, tgt, agent=a["name"])
+        if prev and prev.startswith("task/") and prev != br and lg.merged(prev, tgt):
+            lg.delete_branch(prev)
+    return lg, path
 
 
 def git_source(lg, p):
@@ -228,7 +269,7 @@ def ctx_text(p, a):
         ("\n## Règles du projet\n" + p["rules"]) if p.get("rules") else "",
         ("\n" + prules.agent_rules_text(p, a, "##")) if (a.get("rules") or "").strip() else "", ("\n" + prules.workflows_text(p, a, "##")) if prules.workflows_text(p, a) else "",
         "\n## Mon rôle\n%s — %s" % (r["name"], r["desc"]),
-        ("\n## Mon espace de travail\nWorktree git local personnel (branche %s) : pas de verrou, tes modifications ne comptent qu'après commit." % (a.get("branch") or "?")) if git_agent(p, a) else ("\n## Mon espace de travail\nRépertoire local du projet : %s (partagé : verrouille les fichiers avant de les modifier). Pas de branche, pas de pull ni de merge request." % (p.get("localdir") or "non défini")) if local_agent(p, a) else "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
+        ("\n## Mon espace de travail\nWorktree git local personnel (branche %s) : pas de verrou, tes modifications ne comptent qu'après commit." % git_branch_hint(p, a)) if git_agent(p, a) else ("\n## Mon espace de travail\nRépertoire local du projet : %s (partagé : verrouille les fichiers avant de les modifier). Pas de branche, pas de pull ni de merge request." % (p.get("localdir") or "non défini")) if local_agent(p, a) else "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
         "\n## Droits\n%s\n- Agents joignables : %s" % (rights.rights_text(p, a, mn), talk),
         "\n## " + ACTIONS, "\n## Notes de l’agent (à tenir à jour)\n" + (a.get("notes") or "(vides)")])
 
@@ -251,11 +292,12 @@ def teamwork_text(p, a):
 def repo_text(p, a):
     if git_agent(p, a):
         return ("Tu travailles dans un WORKTREE GIT LOCAL qui t’est personnel (branche %s, créée depuis %s) : aucun autre agent n’y écrit, donc AUCUN verrou.\n"
+                + ("Une branche est créée automatiquement pour chaque tâche (task/<prénom>/<tâche>) ; si tu as encore du travail non fusionné sur ton ancienne branche, tu la gardes jusqu’à sa fusion.\n" if git_strategy(p) == "task" else "") +
                 "Tes modifications ne sont enregistrées qu’avec l’action commit (message clair) ; elles restent locales. Utilise status, diff (contre %s), search, git_log, git_show.\n"
                 "Avant de commencer, et régulièrement, intègre les changements des autres avec sync (commit d’abord) ; en cas de conflit, résous-le dans les fichiers puis commit. "
                 "Quand ton travail est prêt : task_status « à vérifier » (l’application fait le commit restant, se synchronise avec la cible et soumet la merge request, que l’agent principal valide) ou merge_request. "
                 "Si ta merge request entre en conflit avec la cible, elle te revient : sync, résous, commit, puis merge_request de nouveau.") % (
-                    a.get("branch") or "agent/" + gitlocal.slug(a["name"], "agent", 30), git_target(p), git_target(p))
+                    git_branch_hint(p, a), git_target(p), git_target(p))
     if local_agent(p, a):
         return ("Tu travailles sur le RÉPERTOIRE LOCAL du projet : %s (pas de branche, pas de pull ni de merge request).\n"
                 "Ce répertoire est partagé avec d’autres agents : verrouille un fichier (lock_file) avant de le modifier et libère-le (unlock_file) dès que tu as fini. "
@@ -293,7 +335,7 @@ def sys_prompt(p, a):
         ("# Nouveautés depuis ta dernière activité\n" + "\n".join(news)) if news else "",
         "# Toi\nPrénom : %s\nRôle : %s — %s\n%s\n%s" % (
             a["name"], r["name"], r["desc"],
-            "Espace de travail : worktree git local (branche %s)" % (a.get("branch") or "?") if git_agent(p, a) else "Espace de travail : répertoire local du projet" if local_agent(p, a) else "Branche git : %s (branche de base : %s)" % (a["branch"], repo.get("branch", "main")),
+            "Espace de travail : worktree git local (branche %s)" % git_branch_hint(p, a) if git_agent(p, a) else "Espace de travail : répertoire local du projet" if local_agent(p, a) else "Branche git : %s (branche de base : %s)" % (a["branch"], repo.get("branch", "main")),
             "Tu es l’AGENT PRINCIPAL : tu peux écrire à tous les agents et tu tiens les spécifications à jour. Quand l’utilisateur te donne un élément durable (consigne, contrainte, décision), enregistre-le avec l’action instruction et mets les spécifications à jour si besoin. Tu assures aussi le suivi : tu vérifies chaque tâche « à vérifier » (task_review : accepted seulement si le travail demandé est réellement fait — lis les fichiers de l’agent avec read_file et \"agent\" —, sinon rejected avec ce qui manque), tu interroges et relances (relaunch) les agents qui semblent bloqués, et tu remontes à l’utilisateur (ask_user) tout problème autre qu’un simple manque de tokens (ceux-là sont relancés automatiquement)." if mn else ""),
         "# Tes droits\n" + rights.rights_text(p, a, mn),
         "# Dépôt et intégration\n" + repo_text(p, a),
@@ -1120,7 +1162,7 @@ def git_act(u, pid, p, a, x, kind, t0=0):
     if kind == "status":
         st = lg.status(wt)
         return "État du worktree (%d)" % len(st), "Branche %s, cible %s. %s" % (
-            a.get("branch") or "?", tgt, ("Modifications non commitées :\n" + "\n".join("%s %s" % (i["code"], i["path"]) for i in st)) if st else "Rien à committer.")
+            lg.current_branch(wt) or "?", tgt, ("Modifications non commitées :\n" + "\n".join("%s %s" % (i["code"], i["path"]) for i in st)) if st else "Rien à committer.")
     if kind == "commit":
         locks.check_stop(u, pid, a["id"], t0)
         msg = str(x.get("message") or "").strip() or "Mise à jour"
@@ -1381,7 +1423,7 @@ def provision(u, pid, aid):
     if git_agent(p, a):                                    # git local : worktree de l'agent + fichier de contexte hors des branches
         try:
             lg, wt = git_workspace(u, pid, p, a)
-            return "Git local : worktree prêt (branche %s) ; contexte : %s." % (a.get("branch") or "?", git_context_write(u, pid, p, a))
+            return "Git local : worktree prêt (branche %s) ; contexte : %s." % (lg.current_branch(wt) or "?", git_context_write(u, pid, p, a))
         except Err as e:
             return "Répertoire local inutilisable pour git : %s" % e.msg
     if local_agent(p, a):                                  # répertoire local : pas de branche ; le fichier de contexte est écrit dans .agents/
@@ -2586,7 +2628,9 @@ def git_submit(u, pid, aid, title="", body="", task=""):
         lg, wt = git_workspace(u, pid, p, a)
     except Err as e:
         return "skip", "Espace git indisponible : %s" % e.msg
-    tgt, br = git_target(p), git_branch(p, a)
+    tgt, br = git_target(p), lg.current_branch(wt)
+    if not br:
+        return "skip", "Ton worktree n’est sur aucune branche : rien à soumettre."
     title = title or "Merge request de %s" % a["name"]
     sha = lg.commit(wt, title, agent=a["name"], service=str(a.get("service") or ""), task=task)
     if sha:
@@ -2605,7 +2649,7 @@ def git_submit(u, pid, aid, title="", body="", task=""):
         return "skip", "Rien à soumettre : ta branche n’a aucun commit en avance sur %s." % tgt
     if ex:
         if ex["status"] == "conflit":                                # l'agent a résolu : la MR repart en validation
-            mp(u, pid, lambda pp: by_id(pp["mrs"], ex["id"]).update(status="ouverte", note="Reprise après résolution du conflit.", merge_tries=ex.get("merge_tries", 0)))
+            mp(u, pid, lambda pp: by_id(pp["mrs"], ex["id"]).update(status="ouverte", note="Reprise après résolution du conflit.", merge_tries=ex.get("merge_tries", 0), tip=lg.sha(br)))
             spawn(review_mr, u, pid, ex["id"])
             return "submitted", "Merge request #%s reprise après résolution du conflit : l’agent principal va la valider." % ex["n"]
         return "exists", "Une merge request est déjà ouverte (#%s) : elle sera validée." % ex["n"]
@@ -2614,11 +2658,38 @@ def git_submit(u, pid, aid, title="", body="", task=""):
     def add(pp):
         n = 1 + max([m.get("n") or 0 for m in pp.get("mrs", [])] or [0])
         pp.setdefault("mrs", []).append({"id": mid, "n": n, "git": True, "from": br, "to": tgt, "t": "#%d %s" % (n, title), "title": title, "by": a["name"],
-                                          "by_id": aid, "task": task, "d": now(), "status": "ouverte", "note": ""})
+                                          "by_id": aid, "task": task, "d": now(), "status": "ouverte", "note": "", "tip": lg.sha(br)})
         return n
     n = mp(u, pid, add)
     spawn(review_mr, u, pid, mid)
     return "submitted", "Merge request #%d soumise vers %s : l’agent principal va la valider." % (n, tgt)
+
+
+def git_push(u, pid, aid=None):
+    """Pousse sur le remote, à la demande de l'utilisateur, la branche courante de chaque agent en mode git (ou d'un seul). Sans effet sans remote."""
+    p = snap(u, pid)
+    if not git_mode(p):
+        return log(u, pid, "Système", "Vous", "Mode git local non activé : rien à pousser.")
+    try:
+        lg = git_repo(u, pid, p)
+    except Err as e:
+        return log(u, pid, "Système", "Vous", "Poussée impossible : %s" % e.msg)
+    if not lg.remote:
+        return log(u, pid, "Système", "Vous", "Aucun remote défini pour le projet : rien à pousser.")
+    tgt, out = git_target(p), []
+    for a in p["agents"]:
+        if (aid and a["id"] != aid) or not git_agent(p, a):
+            continue
+        br = lg.worktrees().get(os.path.realpath(lg._wt_path(a["name"])))
+        if not br or br in (lg.base, tgt, GIT_INTEGRATION):
+            continue
+        try:
+            with GIT_LOCK:
+                lg.push(br)
+            out.append("%s : %s poussée" % (a["name"], br))
+        except Err as e:
+            out.append("%s : échec pour %s (%s)" % (a["name"], br, e.msg))
+    log(u, pid, "Système", "Vous", "Poussée des branches des agents : " + (" ; ".join(out) if out else "aucune branche à pousser."))
 
 
 def git_mr_view(u, pid, p, m):
@@ -2630,9 +2701,12 @@ def git_mr_view(u, pid, p, m):
 def git_mr_state(u, pid, p, m):
     """État d'une MR git DÉDUIT de git (sans IA, sans réseau) : merged | closed (branche supprimée) | open."""
     lg = git_repo(u, pid, p)
-    if not lg.has(m["from"]):
+    ref = m["from"] if lg.has("refs/heads/" + m["from"]) else (m.get("tip") if m.get("tip") and lg.has(m["tip"]) else None)   # branche supprimée : on suit son dernier commit
+    if not ref:
         return "closed"
-    return "merged" if lg.merged(m["from"], m["to"]) else "open"
+    if lg.merged(ref, m["to"]):
+        return "merged"
+    return "closed" if ref != m["from"] else "open"
 
 
 def git_merge_mr(u, pid, mid):
@@ -2669,15 +2743,24 @@ def git_merge_mr(u, pid, mid):
         spawn(ask, u, pid, m["by_id"], "[Intégration] Ta merge request #%s est en conflit avec %s sur : %s. Lance sync (les marqueurs apparaissent dans les fichiers), "
               "résous-les en réécrivant chaque fichier COMPLET avec write_file, fais commit, puis soumets à nouveau avec merge_request." % (m["n"], m["to"], ", ".join(r["files"])), "Intégration MR")
         return "Merge request #%s en conflit avec %s (fichiers : %s) : renvoyée à %s pour résolution." % (m["n"], m["to"], ", ".join(r["files"]), m["by"])
-    notes = list(pre)
+    notes, pushed_from = list(pre), False
     if r.get("sha"):
         record_commit(u, pid, m["by"], "Merge MR #%s : %s" % (m["n"], m.get("title", "")), r["sha"])
     if lg.remote:                                          # décision 2 : branche de l'agent poussée à la validation ; la cible l'est toujours
         for what, fn in (("de la branche %s" % m["from"], lambda: lg.push(m["from"])), ("de %s" % m["to"], lambda: lg.push_target(m["to"]))):
             try:
                 fn()
+                pushed_from = pushed_from or what.startswith("de la branche")
             except Err as e:
                 notes.append("poussée %s impossible : %s" % (what, e.msg))
+        if pushed_from and m["from"].startswith("task/") and not p.get("keepbranches") and not [n for n in notes if "poussée de " + m["to"] in n]:
+            try:                                           # décision 2 : branche distante supprimée après fusion, sauf option « conserver »
+                lg.push(m["from"], delete=True)
+            except Err as e:
+                notes.append("suppression de la branche distante %s impossible : %s" % (m["from"], e.msg))
+    if m["from"].startswith("task/"):
+        with GIT_LOCK:
+            lg.delete_branch(m["from"])                    # sans effet tant que le worktree de l'agent l'occupe : nettoyée au changement de tâche
 
     def f(pp):
         cur = by_id(pp.get("mrs", []), mid)
@@ -2986,6 +3069,7 @@ def start(u, j):
             "locks_clear": lambda: locks_clear(u, pid),
             "agent_stop": lambda: stop_agent(u, pid, j.get("agentId"), bool(j.get("cancel")), "Vous", str(j.get("reason", ""))[:300]),
             "localdir_check": lambda: localdir_check(u, pid),
+            "git_push": lambda: git_push(u, pid, j.get("agentId") or None),
             "mr_retry": lambda: mr_retry(u, pid, j.get("mrId")),
             "mr_done": lambda: mr_done(u, pid, j.get("mrId")),
             "mr_sync": lambda: mr_sync(u, pid),

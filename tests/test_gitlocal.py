@@ -582,5 +582,63 @@ class CibleDistante(Base):
         self.assertEqual(g.sha("develop"), before)                                    # cible locale intacte
 
 
+class Changement(Base):
+    def test_switch_wip_et_nouvelle_branche(self):
+        g = self.seeded()
+        w, prev = g.switch("alice", "task/alice/t1", "develop", agent="Alice")
+        self.assertIsNone(prev)
+        write(os.path.join(w, "a.txt"), "un\nT1\ntrois\n")
+        write(os.path.join(w, "neuf.txt"), "x\n")
+        w2, prev = g.switch("alice", "task/alice/t2", "develop", agent="Alice")                       # tâche suivante : rien n'est perdu
+        self.assertEqual((w2, prev), (w, "task/alice/t1"))
+        self.assertEqual(g.current_branch(w), "task/alice/t2")
+        self.assertEqual(read(os.path.join(w, "a.txt")), "un\ndeux\ntrois\n")                       # repart de la cible, sans le travail de t1
+        self.assertFalse(os.path.exists(os.path.join(w, "neuf.txt")))
+        self.assertIn("WIP", sh(g.root, "log", "-1", "--format=%s", "task/alice/t1"))
+        self.assertEqual(sh(g.root, "show", "task/alice/t1:neuf.txt"), "x\n")
+        w3, prev = g.switch("alice", "task/alice/t1", "develop")                                       # retour à une branche existante
+        self.assertEqual((w3, prev), (w, "task/alice/t2"))
+        self.assertEqual(read(os.path.join(w, "neuf.txt")), "x\n")
+        self.assertEqual(g.switch("alice", "task/alice/t1")[1], None)                                  # déjà dessus : idempotent
+
+    def test_switch_branche_occupee_ou_source_absente(self):
+        g = self.seeded()
+        g.worktree("bob", "task/bob/t1")
+        g.switch("alice", "task/alice/t1", "develop")
+        with self.assertRaises(Err):
+            g.switch("alice", "task/bob/t1")                                                           # occupée par un autre agent
+        with self.assertRaises(Err):
+            g.switch("alice", "task/alice/t9", "release/9")
+        self.assertEqual(g.current_branch(g.worktree("alice", "task/alice/t1")), "task/alice/t1")      # l'échec n'a rien déplacé
+
+    def test_unmerged_et_delete_branch(self):
+        r = self.bare({"README.md": "x\n"})
+        g = self.repo(remote=r)
+        w = g.worktree("alice", "task/alice/t1", "develop")
+        self.assertEqual(g.unmerged("task/alice/t1", "develop"), 0)
+        self.assertEqual(g.unmerged("absente", "develop"), 0)
+        write(os.path.join(w, "n.txt"), "n\n")
+        g.commit(w, "n", "Alice")
+        self.assertEqual(g.unmerged("task/alice/t1", "develop"), 1)
+        g.push("task/alice/t1")
+        g.integrate("task/alice/t1", "develop")
+        self.assertEqual(g.unmerged("task/alice/t1", "develop"), 0)
+        self.assertFalse(g.delete_branch("task/alice/t1"))                                              # un worktree l'occupe
+        g.switch("alice", "task/alice/t2", "develop")
+        self.assertTrue(g.delete_branch("task/alice/t1"))
+        self.assertFalse(g.branch_exists("task/alice/t1"))
+        self.assertFalse(g.delete_branch("task/alice/t1"))
+        self.assertEqual(g.unmerged("task/alice/t1", "develop"), 0)                                     # branche locale supprimée, origin/ la même (fusionnée)
+        other = os.path.join(self.tmp, "o")
+        sh(self.tmp, "clone", r, other)
+        sh(other, "checkout", "-b", "task/x", "origin/main")
+        write(os.path.join(other, "x.txt"), "x\n")
+        sh(other, "add", "-A")
+        sh(other, "commit", "-m", "x")
+        sh(other, "push", "origin", "task/x")
+        g.fetch()
+        self.assertEqual(g.unmerged("task/x", "develop"), 1)                                            # branche présente seulement sur le remote
+
+
 if __name__ == "__main__":
     unittest.main()

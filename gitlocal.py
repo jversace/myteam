@@ -294,6 +294,42 @@ class LocalGit:
             self.g("worktree", "add", "-b", branch, path, src)
         return path
 
+    def switch(self, name, branch, source=None, agent="myteam"):
+        """Met le worktree de `name` sur `branch` (créée depuis `source` si besoin). S'il est sur une autre branche, le travail non commité y est
+        d'abord enregistré dans un commit « WIP » (rien n'est perdu). Retourne (chemin, branche précédente ou None si inchangée)."""
+        self.check_branch(branch)
+        path = self._wt_path(name)
+        real, wts = os.path.realpath(path), self.worktrees()
+        if real not in wts or wts[real] == branch:
+            return self.worktree(name, branch, source), None
+        prev = wts[real]
+        if self.g("status", "--porcelain", "--untracked-files=all", cwd=path)[1].strip():
+            if prev is None:
+                raise Err(409, "Le worktree de %s est détaché et contient des modifications non commitées." % name)
+            self.commit(path, "WIP : changement de branche (%s → %s)" % (prev, branch), agent=agent)
+        if self.branch_exists(branch):
+            self.g("checkout", branch, cwd=path)
+        else:
+            src = source or self.integration
+            if not self.has(src):
+                raise Err(404, "Branche source « %s » introuvable" % src)
+            self.g("checkout", "-b", branch, src, cwd=path)
+        return path, prev
+
+    def unmerged(self, branch, target):
+        """Nombre de commits de `branch` (locale, sinon `origin/<branch>`) absents de `target` ; 0 si la branche n'existe pas."""
+        ref = branch if self.has("refs/heads/" + branch) else ("origin/" + branch if self.remote and self.has("refs/remotes/origin/" + branch) else None)
+        if not ref or not self.has(target):
+            return 0
+        return int(self.g("rev-list", "--count", "%s..%s" % (target, ref))[1].strip() or 0)
+
+    def delete_branch(self, branch):
+        """Supprime une branche locale (l'appelant a vérifié qu'elle est fusionnée) ; False si un worktree l'occupe ou si elle n'existe pas."""
+        if not self.branch_exists(branch) or branch in self.worktrees().values():
+            return False
+        self.g("branch", "-D", branch)
+        return True
+
     def drop_worktree(self, name, force=False):
         path = self._wt_path(name)
         if os.path.realpath(path) in self.worktrees():

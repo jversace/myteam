@@ -14,7 +14,7 @@ import locks  # noqa: E402
 import store  # noqa: E402
 
 
-def make_state(localdir, nogit=None, url=""):
+def make_state(localdir, nogit=None, url="", branches=None):
     ag = lambda i, n, **k: {**dict(id=i, name=n, service="s1", role="r1", branch="agent/" + n.lower(), canBug=False, talk=["a1", "a2", "a3"],
                                    history=[], notes="", source="local"), **k}
     p = {"id": "p1", "name": "Demo", "rules": "", "spec": "", "mainId": "a1", "localdir": str(localdir),
@@ -24,6 +24,8 @@ def make_state(localdir, nogit=None, url=""):
          "tasks": [], "bugs": [], "modules": [], "log": [], "commits": [], "releases": [], "mrs": []}
     if nogit is not None:
         p["nogit"] = nogit
+    if branches is not None:
+        p["branches"] = branches
     return {"services": [{"id": "s1", "name": "S", "kind": "openai", "url": "x", "model": "m", "apiKey": "k"}], "projects": [p]}
 
 
@@ -38,13 +40,14 @@ def sh(cwd, *a):
 class Base(unittest.TestCase):
     NOGIT = False
     URL = ""
+    BRANCHES = "agent"                                     # les classes historiques testent la stratégie « une branche par agent »
 
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="myteam-mode-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.root = os.path.join(self.tmp, "proj")
         os.makedirs(self.root)
-        store.wj(store.state_path("u"), make_state(self.root, self.NOGIT, self.URL))
+        store.wj(store.state_path("u"), make_state(self.root, self.NOGIT, self.URL, self.BRANCHES))
         locks.STOP.clear()
         engine.GIT_OK.clear()
         self.sp = mock.patch.object(engine, "spawn", lambda *a, **k: None)
@@ -364,7 +367,7 @@ def by_id_status(p, mid):
     return next(m for m in p["mrs"] if m["id"] == mid)["status"]
 
 
-class MrRemote(Base):
+class RemoteBase(Base):
     """Avec un remote (dépôt nu local) : branche de l'agent poussée à la validation, cible poussée, remote qui avance entre-temps."""
 
     def setUp(self):
@@ -392,6 +395,10 @@ class MrRemote(Base):
 
     def mid(self, who):
         return next(m for m in reversed(proj()["mrs"]) if m["by_id"] == who)["id"]
+
+
+class MrRemote(RemoteBase):
+    """Avec un remote (dépôt nu local) : branche de l'agent poussée à la validation, cible poussée, remote qui avance entre-temps."""
 
     def test_push_de_la_branche_de_l_agent_et_de_la_cible(self):
         self.work("a2", "src/x.py", "print(1)\n")
@@ -446,6 +453,164 @@ class MrRemote(Base):
         self.assertIn("fusionnée dans develop", r)
         self.assertIn("Attention", r)
         self.assertEqual(by_id_status(proj(), self.mid("a2")), "fusionnée")
+
+
+def set_tasks(*tasks):
+    st = store.load("u")
+    st["projects"][0]["tasks"] = [dict(t) for t in tasks]
+    store.wj(store.state_path("u"), st)
+
+
+def task(i, who, title, status="en cours", started=1):
+    return {"id": i, "title": title, "who": who, "status": status, "started": started, "deps": []}
+
+
+class ParTache(Base):
+    """Une branche par tâche (stratégie par défaut), branche libre sans tâche, branche héritée, nettoyage."""
+    BRANCHES = "task"
+
+    def lg(self):
+        return engine.git_repo("u", "p1", proj())
+
+    def branch(self, name="Bob"):
+        return self.lg().current_branch(self.wt(name))
+
+    def test_une_branche_par_tache_et_changement_de_tache(self):
+        set_tasks(task("t1", "a2", "Ajoute x"))
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        self.assertEqual(self.branch(), "task/bob/t1-ajoute-x")
+        self.assertIn("task/bob/t1-ajoute-x", self.act("a2", "status")[1])
+        set_tasks(task("t1", "a2", "Ajoute x", "à vérifier"), task("t2", "a2", "Ajoute y", started=2))
+        self.act("a2", "write_file", path="y.txt", content="y\n")
+        self.assertEqual(self.branch(), "task/bob/t2-ajoute-y")
+        self.assertFalse(os.path.exists(os.path.join(self.wt("Bob"), "x.txt")))                  # t2 repart de la cible : sans le travail de t1
+        self.assertEqual(sh(self.root, "show", "task/bob/t1-ajoute-x:x.txt"), "x\n")            # t1 conservé (commit WIP automatique)
+        self.assertIn("WIP", sh(self.root, "log", "-1", "--format=%s", "task/bob/t1-ajoute-x"))
+        set_tasks(task("t1", "a2", "Ajoute x", started=3))                                         # t1 redémarre : on retrouve sa branche
+        self.act("a2", "status")
+        self.assertEqual(self.branch(), "task/bob/t1-ajoute-x")
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Bob"), "x.txt")))
+
+    def test_deux_agents_deux_tâches_sans_interference(self):
+        set_tasks(task("t1", "a2", "Bob"), task("t2", "a3", "Carl"))
+        self.act("a2", "write_file", path="b.txt", content="b\n")
+        self.act("a3", "write_file", path="c.txt", content="c\n")
+        self.assertEqual((self.branch("Bob"), self.branch("Carl")), ("task/bob/t1-bob", "task/carl/t2-carl"))
+        self.assertFalse(os.path.exists(os.path.join(self.wt("Carl"), "b.txt")))
+
+    def test_sans_tache_branche_libre_puis_branche_de_tache(self):
+        self.act("a2", "write_file", path="libre.txt", content="l\n")
+        self.assertEqual(self.branch(), "task/bob/libre")
+        set_tasks(task("t1", "a2", "Ajoute x"))
+        self.act("a2", "status")
+        self.assertEqual(self.branch(), "task/bob/t1-ajoute-x")
+        set_tasks(task("t1", "a2", "Ajoute x", "à vérifier"))
+        self.act("a2", "status")
+        self.assertEqual(self.branch(), "task/bob/t1-ajoute-x")                                   # la tâche finie ne fait pas changer de branche
+
+    def test_soumission_apres_fin_de_tache_puis_nettoyage_de_la_branche(self):
+        set_tasks(task("t1", "a2", "Ajoute x"))
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        self.act("a2", "commit", message="x")
+        set_tasks(task("t1", "a2", "Ajoute x", "à vérifier"))
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Tâche : Ajoute x", "", "t1")[0], "submitted")
+        m = next(m for m in proj()["mrs"] if m["by_id"] == "a2")
+        self.assertEqual((m["from"], m["task"]), ("task/bob/t1-ajoute-x", "t1"))
+        self.assertIn("fusionnée", engine.apply_mr_review("u", "p1", m["id"], "Alice", "approved", ""))
+        self.assertTrue(self.lg().branch_exists("task/bob/t1-ajoute-x"))                          # le worktree l'occupe encore
+        set_tasks(task("t1", "a2", "Ajoute x", "terminée"), task("t2", "a2", "Suite", started=5))
+        self.act("a2", "status")
+        self.assertEqual(self.branch(), "task/bob/t2-suite")
+        self.assertFalse(self.lg().branch_exists("task/bob/t1-ajoute-x"))                          # fusionnée : supprimée au changement de tâche
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Bob"), "x.txt")))                     # t2 part de la cible qui contient t1
+
+    def test_branche_heritee_gardee_jusqu_a_sa_fusion(self):
+        st = store.load("u")
+        st["projects"][0]["branches"] = "agent"                                                    # ancien fonctionnement : une branche par agent
+        store.wj(store.state_path("u"), st)
+        self.act("a2", "write_file", path="ancien.txt", content="a\n")
+        self.act("a2", "commit", message="avant la bascule")
+        self.assertEqual(self.branch(), "agent/bob")
+        st = store.load("u")
+        del st["projects"][0]["branches"]                                                          # bascule vers une branche par tâche
+        store.wj(store.state_path("u"), st)
+        set_tasks(task("t1", "a2", "Nouvelle"))
+        self.act("a2", "status")
+        self.assertEqual(self.branch(), "agent/bob")                                               # travail non fusionné : branche héritée conservée
+        self.assertIn("task/bob/", engine.repo_text(proj(), proj()["agents"][1]))
+        engine.submit_mr("u", "p1", "a2", "Ancien travail")
+        m = next(m for m in proj()["mrs"] if m["by_id"] == "a2")
+        self.assertEqual(m["from"], "agent/bob")
+        engine.apply_mr_review("u", "p1", m["id"], "Alice", "approved", "")
+        self.act("a2", "status")
+        self.assertEqual(self.branch(), "task/bob/t1-nouvelle")                                    # héritée fusionnée : passage aux branches par tâche
+        self.assertTrue(self.lg().branch_exists("agent/bob"))                                      # l'ancienne branche n'est pas supprimée
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Bob"), "ancien.txt")))
+
+    def test_mr_suivie_par_son_dernier_commit_si_la_branche_disparait(self):
+        set_tasks(task("t1", "a2", "Ajoute x"))
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        self.act("a2", "commit", message="x")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        lg = self.lg()
+        set_tasks(task("t1", "a2", "Ajoute x", "à vérifier"), task("t2", "a2", "Suite", started=5))
+        self.act("a2", "status")                                                                   # le worktree quitte la branche de t1
+        lg.integrate("task/bob/t1-ajoute-x", "develop")                                            # fusionnée hors de l'application…
+        sh(lg.root, "branch", "-D", "task/bob/t1-ajoute-x")                                        # …puis branche supprimée
+        self.assertEqual(engine.sync_mrs("u", "p1", force=True), [(1, "fusionnée")])               # fusionnée, pas « annulée »
+
+
+class ParTacheRemote(RemoteBase):
+    BRANCHES = "task"
+
+    def prep(self):
+        set_tasks(task("t1", "a2", "Ajoute x"))
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        self.act("a2", "commit", message="x")
+        engine.submit_mr("u", "p1", "a2", "Bob", "", "t1")
+
+    def branches(self):
+        return sh(self.tmp, "ls-remote", "--heads", self.remote)
+
+    def test_branche_distante_supprimee_apres_fusion(self):
+        self.prep()
+        r = engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        self.assertNotIn("Attention", r)
+        self.assertNotIn("task/bob/t1-ajoute-x", self.branches())
+        self.assertIn("refs/heads/develop", self.branches())
+        self.assertEqual(self.remote_show("develop:x.txt"), "x\n")
+
+    def test_option_conserver_les_branches_distantes(self):
+        st = store.load("u")
+        st["projects"][0]["keepbranches"] = True
+        store.wj(store.state_path("u"), st)
+        self.prep()
+        engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        self.assertIn("refs/heads/task/bob/t1-ajoute-x", self.branches())
+
+    def test_poussee_a_la_demande(self):
+        set_tasks(task("t1", "a2", "Ajoute x"), task("t2", "a3", "Autre"))
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        self.act("a2", "commit", message="x")
+        self.act("a3", "write_file", path="y.txt", content="y\n")
+        self.act("a3", "commit", message="y")
+        engine.git_push("u", "p1", "a2")                                                           # seulement Bob
+        self.assertIn("task/bob/t1-ajoute-x", self.branches())
+        self.assertNotIn("task/carl", self.branches())
+        engine.git_push("u", "p1")                                                                 # tous
+        self.assertIn("task/carl/t2-autre", self.branches())
+        self.assertIn("poussée", self.logs())
+        self.assertEqual(gitlocal.git(["rev-parse", "task/bob/t1-ajoute-x"], self.remote)[1].strip(),
+                         gitlocal.git(["rev-parse", "task/bob/t1-ajoute-x"], self.root)[1].strip())
+
+
+class PousseeSansRemote(Base):
+    BRANCHES = "task"
+
+    def test_sans_remote_ou_sans_mode_git(self):
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        engine.git_push("u", "p1")
+        self.assertIn("Aucun remote", self.logs())
 
 
 if __name__ == "__main__":
