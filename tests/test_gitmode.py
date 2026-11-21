@@ -613,5 +613,339 @@ class PousseeSansRemote(Base):
         self.assertIn("Aucun remote", self.logs())
 
 
+import rights  # noqa: E402
+import sys  # noqa: E402
+
+import shutil  # noqa: E402
+
+PYX = "python3" if shutil.which("python3") else "python"          # chemin relatif : un chemin absolu serait (à raison) signalé « hors du dossier de travail »
+OK_CMD = PYX + ' -c "pass"'
+FAIL_CMD = PYX + ' -c "import sys; print(\'échec simulé\'); sys.exit(1)"'
+BAD_FILE_CMD = PYX + ' -c "import os,sys; sys.exit(1 if os.path.exists(\'bad.txt\') else 0)"'
+
+
+def add_check(name="tests", command=OK_CMD, when="both", blocking=True, baseline="green", retry_once=False, cid=None):
+    st = store.load("u")
+    c = {"id": cid or name, "name": name, "command": command, "when": when, "blocking": blocking, "timeout": 60, "retry_once": retry_once,
+         "baseline": baseline, "active": True, "ver": 1}
+    st["projects"][0].setdefault("checks", []).append(c)
+    store.wj(store.state_path("u"), st)
+    return c
+
+
+def decisions(kind="check"):
+    return [d for d in proj().get("decisions", []) if d["kind"] == kind]
+
+
+class ChecksProposition(Base):
+    """Un agent PROPOSE ; seule l'approbation de l'utilisateur active la commande (texte exact)."""
+    EXPL = "Lance les tests du projet pour vérifier que rien n’est cassé ; ne modifie aucun fichier."
+
+    def propose(self, who="a2", **kw):
+        args = {"name": "tests", "command": OK_CMD, "when": "both", "blocking": True, "explain": self.EXPL, "reason": "Premier contrôle du projet"}
+        args.update(kw)
+        return self.act(who, "propose_check", **args)
+
+    def test_proposition_creee_sans_rien_activer(self):
+        note, back = self.propose()
+        self.assertIn("vigilance faible", note)
+        self.assertIn("rien ne s’exécute avant", back)
+        d = decisions()[0]
+        self.assertEqual((d["status"], d["byName"], d["payload"]["name"], d["payload"]["risk"]["level"]), ("attente", "Bob", "tests", "faible"))
+        self.assertEqual(d["payload"]["explain"], self.EXPL)
+        self.assertEqual(proj().get("checks", []), [])                                     # rien d'actif
+
+    def test_commande_refusee_d_office_et_explication_obligatoire(self):
+        r = self.propose(command="sudo apt install x")
+        self.assertIn("refusée d’office", r[1])
+        self.assertEqual(decisions(), [])
+        r = self.propose(explain="ok")
+        self.assertIn("Proposition incomplète", r[1])
+        self.assertEqual(decisions(), [])
+        r = self.propose(command="rm -rf build && pytest")                                  # élevée : proposée, mais signalée
+        self.assertIn("vigilance élevée", r[0])
+        self.assertEqual(decisions()[0]["payload"]["risk"]["level"], "élevée")
+
+    def test_droit_interdit_et_jamais_libre(self):
+        st = store.load("u")
+        st["roles"].append({"id": "r3", "name": "Rédacteur technique", "desc": ""})            # les rôles sont globaux (hors projets)
+        st["projects"][0]["agents"][2]["role"] = "r3"
+        st["projects"][0]["agents"][1]["caps"] = {"check": "free"}                          # même « libre » : l'agent ne peut qu'proposer
+        store.wj(store.state_path("u"), st)
+        self.assertIn("ne t’autorise pas", self.propose("a3")[1])
+        self.propose("a2")
+        self.assertEqual(proj().get("checks", []), [])
+        self.assertEqual(len(decisions()), 1)
+        p = proj()
+        self.assertEqual(rights.level(p, p["agents"][1], "check", False), rights.APPROVE)
+        self.assertEqual(rights.level(p, p["agents"][2], "check", False), rights.NO)
+
+    def test_doublon_en_attente_et_deja_actif(self):
+        self.propose()
+        self.assertIn("déjà en attente", self.propose()[0])
+        self.assertEqual(len(decisions()), 1)
+        add_check("lint", OK_CMD)
+        self.assertIn("déjà actif", self.propose(name="lint")[1])
+
+    def test_approbation_active_la_commande_et_etablit_la_reference(self):
+        self.propose()
+        did = decisions()[0]["id"]
+        engine.decide("u", "p1", did, "accept")
+        c = proj()["checks"][0]
+        self.assertEqual((c["name"], c["command"], c["when"], c["blocking"], c["ver"], c["baseline"]), ("tests", OK_CMD, "both", True, 1, None))
+        self.assertEqual(proj()["check_history"][0]["action"], "ajout")
+        self.assertEqual(decisions()[0]["status"], "acceptée")
+        engine.check_baseline("u", "p1", c["id"])                                           # lancé en arrière-plan à l'approbation
+        self.assertEqual(proj()["checks"][0]["baseline"], "green")
+        self.assertIn("état de référence VERT", self.logs())
+
+    def test_etat_de_reference_rouge(self):
+        self.propose(command=FAIL_CMD)
+        engine.decide("u", "p1", decisions()[0]["id"], "accept")
+        engine.check_baseline("u", "p1", proj()["checks"][0]["id"])
+        self.assertEqual(proj()["checks"][0]["baseline"], "red")
+        self.assertIn("reste informatif", self.logs())
+
+    def test_l_approbation_ne_permet_pas_de_modifier_la_commande(self):
+        self.propose()
+        engine.decide("u", "p1", decisions()[0]["id"], "accept", fields={"command": "rm -rf /", "name": "piège", "title": "piège"})
+        c = proj()["checks"][0]
+        self.assertEqual((c["command"], c["name"]), (OK_CMD, "tests"))
+
+    def test_modification_exige_une_nouvelle_approbation_et_garde_l_historique(self):
+        self.propose()
+        engine.decide("u", "p1", decisions()[0]["id"], "accept")
+        cid = proj()["checks"][0]["id"]
+        engine.check_baseline("u", "p1", cid)
+        new = OK_CMD + " && " + OK_CMD
+        self.propose(command=new, reason="ajoute une deuxième passe")
+        d = decisions()[-1]
+        self.assertEqual((d["payload"]["id"], d["payload"]["prev"]), (cid, OK_CMD))
+        self.assertEqual(proj()["checks"][0]["command"], OK_CMD)                             # l'ancienne reste active jusqu'à la décision
+        newer = new + " && " + OK_CMD
+        self.propose(command=newer)                                                           # version révisée : remplace la proposition en attente
+        ds = decisions()
+        self.assertEqual([x["status"] for x in ds], ["acceptée", "remplacée", "attente"])
+        engine.decide("u", "p1", ds[-1]["id"], "accept")
+        c = proj()["checks"][0]
+        self.assertEqual((c["command"], c["ver"], c["baseline"]), (newer, 2, None))          # commande différente : référence à rétablir
+        h = proj()["check_history"][-1]
+        self.assertEqual((h["action"], h["old"]["command"], h["new"]), ("modification", OK_CMD, newer))
+
+    def test_refus_prevenu_l_agent(self):
+        self.propose()
+        asked = []
+        with mock.patch.object(engine, "ask", lambda *a, **k: asked.append(a)):
+            engine.decide("u", "p1", decisions()[0]["id"], "refuse", note="trop lent")
+        self.assertEqual(proj().get("checks", []), [])
+        self.assertEqual(decisions()[0]["status"], "refusée")
+        self.assertEqual(asked[0][2], "a2")
+        self.assertIn("trop lent", asked[0][3])
+
+    def test_carte_et_prompt_sans_casser_le_formatage(self):
+        add_check("avec%", PYX + ' -c "print(\'100%\')"')
+        p = proj()
+        txt = engine.repo_text(p, p["agents"][1])                                            # un « % » dans la commande ne doit pas faire échouer le prompt
+        self.assertIn("100%", txt)
+        self.assertIn("avec%", txt)
+        self.assertIn('"do":"propose_check"', engine.ACTIONS)
+
+
+class ChecksExecution(Base):
+    """Contrôles approuvés exécutés par l'application à la soumission (worktree de l'agent), avec garde-fous."""
+
+    def work(self, who="a2", path="src/x.py", content="print(1)\n"):
+        self.act(who, "write_file", path=path, content=content)
+        self.act(who, "commit", message="travail")
+
+    def set_cmd(self, name, command):
+        st = store.load("u")
+        next(c for c in st["projects"][0]["checks"] if c["name"] == name)["command"] = command
+        store.wj(store.state_path("u"), st)
+
+    def test_echec_bloquant_renvoie_la_sortie_puis_transmet_apres_deux_tentatives(self):
+        add_check("tests", FAIL_CMD)
+        self.work()
+        st, msg = engine.submit_mr("u", "p1", "a2", "Bob")
+        self.assertEqual(st, "checks")
+        self.assertIn("tentative 1/2", msg)
+        self.assertIn("échec simulé", msg)                                                   # fin de la sortie renvoyée à l'agent
+        self.assertEqual(proj()["mrs"], [])
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Bob")[1].count("tentative 2/2"), 1)
+        st, msg = engine.submit_mr("u", "p1", "a2", "Bob")                                   # 3e : transmis au validateur tel quel
+        self.assertEqual(st, "submitted")
+        m = proj()["mrs"][0]
+        self.assertIn("transmis au validateur", m["checks_note"])
+        self.assertEqual([(c["name"], c["ok"], c["blocking"]) for c in m["checks"]], [("tests", False, True)])
+        commits, files, dif = engine.git_mr_view("u", "p1", proj(), m)
+        self.assertIn("✖ tests (bloquant)", commits)
+        self.assertIn("⚠", commits)
+
+    def test_une_reussite_remet_le_compteur_a_zero(self):
+        add_check("tests", FAIL_CMD)
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        self.assertEqual(proj()["check_tries"], {"agent/bob": 1})
+        self.set_cmd("tests", OK_CMD)
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Bob")[0], "submitted")
+        self.assertNotIn("agent/bob", proj().get("check_tries", {}))
+        self.assertEqual([(c["name"], c["ok"]) for c in proj()["mrs"][0]["checks"]], [("tests", True)])
+
+    def test_informatif_ou_reference_non_verte_ne_bloque_pas(self):
+        add_check("lint", FAIL_CMD, blocking=False)
+        add_check("tests", FAIL_CMD, blocking=True, baseline=None)                         # déclaré bloquant mais jamais vert sur la cible
+        self.work()
+        st, msg = engine.submit_mr("u", "p1", "a2", "Bob")
+        self.assertEqual(st, "submitted", msg)
+        m = proj()["mrs"][0]
+        self.assertEqual([(c["name"], c["ok"], c["blocking"], c["declared_blocking"]) for c in m["checks"]], [("lint", False, False, False), ("tests", False, False, True)])
+        txt = engine.git_mr_view("u", "p1", proj(), m)[0]
+        self.assertIn("informatif", txt)
+        self.assertIn("pas encore bloquant", txt)
+
+    def test_selon_le_moment(self):
+        add_check("integ", FAIL_CMD, when="integration")
+        self.work()
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Bob")[0], "submitted")           # non lancé à la validation
+        self.assertEqual(proj()["mrs"][0]["checks"], [])
+        self.assertEqual(proj().get("check_runs", []), [])
+
+    def test_rejouer_une_fois(self):
+        marker = os.path.join(self.tmp, "marqueur")
+        cmd = PYX + ' -c "import os,sys; f=r\'%s\'; ok=os.path.exists(f); open(f,\'w\').close(); sys.exit(0 if ok else 1)"' % marker
+        add_check("instable", cmd, retry_once=True)
+        self.work()
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Bob")[0], "submitted")
+        c = proj()["mrs"][0]["checks"][0]
+        self.assertEqual((c["ok"], c["flaky"]), (True, True))
+        self.assertIn("instable", engine.git_mr_view("u", "p1", proj(), proj()["mrs"][0])[0])
+
+    def test_executions_enregistrees_et_aucun_controle(self):
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        self.assertIn("aucun contrôle configuré", engine.git_mr_view("u", "p1", proj(), proj()["mrs"][0])[0])      # le validateur n'est pas induit en erreur
+        add_check("tests", OK_CMD)
+        self.work(path="src/y.py", content="y\n")
+        self.act("a2", "commit", message="y")
+        engine.run_checks("u", "p1", proj(), self.wt("Bob"), "validation", "Bob")
+        r = proj()["check_runs"][-1]
+        self.assertEqual((r["name"], r["ok"], r["when"], r["who"]), ("tests", True, "validation", "Bob"))
+
+    def test_soumission_refusee_renvoie_la_tache_a_l_agent_puis_escalade(self):
+        set_tasks(task("t1", "a2", "Ajoute x", "à vérifier"))
+        calls = []
+        with mock.patch.object(engine, "spawn", lambda f, *a, **k: calls.append((f.__name__, a))):
+            for n in (1, 2, 3):
+                set_tasks(dict(proj()["tasks"][0], status="à vérifier"))
+                self.assertTrue(engine.task_resubmit("u", "p1", "t1", proj()["agents"][1], "checks", "tests en échec"))
+                self.assertEqual(proj()["tasks"][0]["status"], "à faire")
+            self.assertEqual([c[0] for c in calls], ["run_task"] * 3)
+            self.assertIn("[Soumission refusée] tests en échec", calls[0][1][4])
+            set_tasks(dict(proj()["tasks"][0], status="à vérifier"))
+            self.assertTrue(engine.task_resubmit("u", "p1", "t1", proj()["agents"][1], "checks", "tests en échec"))      # 4e : l'utilisateur est sollicité
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(proj()["tasks"][0]["status"], "en attente")
+        self.assertIn("contrôles automatiques en échec", [d for d in proj()["decisions"] if d["kind"] == "question"][0]["question"])
+        self.assertFalse(engine.task_resubmit("u", "p1", "t1", proj()["agents"][1], "checks", "x"))                    # plus « à vérifier » : sans objet
+
+
+class ChecksIntegration(Base):
+    """Contrôles sur le résultat de la fusion, avant tout push ; référence ; restauration."""
+
+    def work(self, who="a2", path="src/x.py", content="print(1)\n"):
+        self.act(who, "write_file", path=path, content=content)
+        self.act(who, "commit", message="travail")
+
+    def mid(self, who="a2"):
+        return next(m for m in reversed(proj()["mrs"]) if m["by_id"] == who)["id"]
+
+    def test_echec_a_l_integration_annule_la_fusion_et_renvoie_a_l_auteur(self):
+        add_check("tests", BAD_FILE_CMD, when="integration")
+        self.work(path="bad.txt", content="x\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        lg = engine.git_repo("u", "p1", proj())
+        before = lg.sha("develop")
+        calls = []
+        with mock.patch.object(engine, "spawn", lambda f, *a, **k: calls.append((f.__name__, a))):
+            r = engine.apply_mr_review("u", "p1", self.mid(), "Alice", "approved", "")
+        self.assertIn("contrôles automatiques en échec après intégration", r)
+        self.assertEqual(lg.sha("develop"), before)                                           # fusion annulée : cible comme avant
+        iw = os.path.join(lg.wt_dir, "_integration")
+        self.assertEqual(sh(iw, "status", "--porcelain").strip(), "")
+        self.assertEqual(sh(iw, "rev-parse", "HEAD").strip(), before)
+        m = proj()["mrs"][0]
+        self.assertEqual((m["status"], m["merge_tries"], m["conflict_files"]), ("conflit", 1, []))
+        ask = [c for c in calls if c[0] == "ask"]
+        self.assertEqual((len(ask), ask[0][1][2]), (1, "a2"))
+        self.assertIn("tests", ask[0][1][3])
+        self.assertEqual(proj()["check_runs"][-1]["when"], "integration")
+        os.remove(os.path.join(self.wt("Bob"), "bad.txt"))                                    # l'agent corrige…
+        self.act("a2", "commit", message="retire bad.txt")
+        self.assertEqual(engine.submit_mr("u", "p1", "a2", "Bob")[0], "submitted")           # …et la même MR repart en validation
+        self.assertEqual(len(proj()["mrs"]), 1)
+        self.assertIn("fusionnée dans develop", engine.apply_mr_review("u", "p1", self.mid(), "Alice", "approved", ""))
+        self.assertEqual(proj()["checks"][0]["baseline"], "green")
+
+    def test_premiere_integration_etablit_la_reference(self):
+        add_check("tests", OK_CMD, when="integration", baseline=None)
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mid(), "Alice", "approved", "")
+        self.assertEqual(proj()["checks"][0]["baseline"], "green")
+
+    def test_reference_non_verte_ne_bloque_pas_la_fusion(self):
+        add_check("tests", FAIL_CMD, when="integration", baseline=None)
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        r = engine.apply_mr_review("u", "p1", self.mid(), "Alice", "approved", "")
+        self.assertIn("fusionnée dans develop", r)
+        self.assertIn("contrôles informatifs en échec : tests", r)
+        self.assertEqual(proj()["checks"][0]["baseline"], None)
+
+    def test_trop_d_echecs_demande_une_intervention(self):
+        add_check("tests", BAD_FILE_CMD, when="integration")
+        self.work(path="bad.txt", content="x\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        for _ in range(3):
+            engine.merge_mr("u", "p1", self.mid())
+        self.assertIn("intervention manuelle", engine.merge_mr("u", "p1", self.mid()))
+
+    def test_retrait_et_restauration(self):
+        add_check("tests", OK_CMD, cid="c1")
+        engine.check_remove("u", "p1", "c1")
+        self.assertEqual(proj()["checks"], [])
+        h = proj()["check_history"][-1]
+        self.assertEqual((h["action"], h["old"]["command"]), ("retrait", OK_CMD))
+        engine.check_restore("u", "p1", h["id"])
+        c = proj()["checks"][0]
+        self.assertEqual((c["name"], c["command"], c["baseline"]), ("tests", OK_CMD, None))
+        self.assertEqual(proj()["check_history"][-1]["action"], "restauration")
+
+    def test_restauration_d_une_modification(self):
+        add_check("tests", OK_CMD, cid="c1")
+        d = {"byName": "Bob"}
+        pp = store.load("u")["projects"][0]
+        engine.checks_apply(pp, d, {"id": "c1", "name": "tests", "command": OK_CMD + " && " + OK_CMD, "when": "both", "blocking": True, "reason": "r"})
+        st = store.load("u")
+        st["projects"][0] = pp
+        store.wj(store.state_path("u"), st)
+        self.assertEqual(proj()["checks"][0]["ver"], 2)
+        engine.check_restore("u", "p1", proj()["check_history"][-1]["id"])
+        self.assertEqual(proj()["checks"][0]["command"], OK_CMD)
+        self.assertEqual(proj()["checks"][0]["ver"], 3)
+
+
+class ChecksRemote(RemoteBase):
+    def test_rien_n_est_pousse_si_les_controles_echouent(self):
+        add_check("tests", BAD_FILE_CMD, when="integration")
+        self.act("a2", "write_file", path="bad.txt", content="x\n")
+        self.act("a2", "commit", message="travail")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        refs = sh(self.tmp, "ls-remote", self.remote)
+        self.assertNotIn("refs/heads/develop", refs)
+        self.assertNotIn("refs/heads/agent/bob", refs)
+
+
 if __name__ == "__main__":
     unittest.main()

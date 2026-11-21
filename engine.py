@@ -13,6 +13,7 @@ from datetime import datetime
 
 import github
 import gitlocal
+import checks
 import locks
 import project_rules as prules
 import rights
@@ -58,6 +59,7 @@ RULES = [
     "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
     "Si tu travailles sur le RÉPERTOIRE LOCAL du projet (section « Dépôt et intégration »), il est partagé avec d’autres agents : verrouille chaque fichier AVANT de le lire pour le modifier (lock_file), modifie-le, puis libère-le dès que tu as fini (unlock_file). Si un fichier est verrouillé par un autre agent, la demande attend qu’il le libère ; ne le contourne jamais. Ne garde pas de verrou plus longtemps que nécessaire, et ne verrouille pas dans un ordre qui peut croiser celui d’un autre agent : demande tous tes fichiers d’un coup (lock_file accepte une liste). Il n’y a ni pull ni merge request sur le répertoire local.",
     "Si ta section « Dépôt et intégration » décrit un WORKTREE GIT LOCAL : il est à toi seul (pas de verrou), write_file et delete_file modifient seulement tes fichiers, et rien n’est enregistré tant que tu n’as pas fait commit. Tu ne lances jamais de commande git toi-même : tout passe par les actions status, commit, diff, search, sync, git_log, git_show.",
+    "Tu ne peux ni exécuter ni modifier une commande de contrôle automatique : tu peux seulement la PROPOSER (propose_check). L’utilisateur n’est pas technicien : ton explication doit tenir en quelques phrases simples, sans jargon, et dire ce que la commande vérifie, si elle modifie des fichiers et pourquoi tu la proposes. Chaque modification de la commande redemande son approbation. Les contrôles approuvés sont exécutés par l’application quand tu soumets ton travail ; en cas d’échec bloquant, tu reçois la fin de leur sortie et tu corriges.",
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
@@ -69,6 +71,7 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"get_locks"} : (répertoire local) fichiers verrouillés, par qui, et agents en attente (sans coût)',
     '{"do":"stop_agent","agent":"<prénom>","cancel":false,"reason":"..."} : (agent principal) arrêter le travail d’un agent et libérer tous ses verrous ; cancel=true annule aussi ses modifications sur les fichiers qu’il avait verrouillés (retour à l’état d’avant)',
     '{"do":"force_unlock","path":"<fichier>","reason":"..."} : (agent principal) libérer de force le verrou d’un fichier (détenteur inactif ou plantage) ; si le détenteur travaille encore, utilise stop_agent',
+    '{"do":"propose_check","name":"tests","command":"python -m unittest discover -s tests","when":"both","blocking":true,"explain":"<explication SIMPLE, sans jargon : ce que ça vérifie, ce que ça modifie, pourquoi>","reason":"<pourquoi maintenant>"} : proposer un contrôle automatique (tests, lint) exécuté par l’application à ta soumission (when : validation | integration | both) ; l’utilisateur l’approuve, rien ne s’exécute avant ; proposer le même name avec une autre commande = demander une modification',
     '{"do":"status"} : (git local) fichiers modifiés non commités de ton worktree',
     '{"do":"commit","message":"<message clair>"} : (git local) enregistrer tout ton worktree dans un commit (local)',
     '{"do":"diff"} : (git local) tes changements par rapport à la branche cible',
@@ -109,6 +112,9 @@ def local_agent(p, a):
 GIT_LOCK = threading.RLock()                           # initialisation du dépôt, création des worktrees : jamais deux en même temps
 GIT_OK = {}                                            # (utilisateur, projet, dossier, remote, base) -> dépôt validé (contrôles préalables passés)
 GIT_INTEGRATION = "develop"                            # branche d'intégration quand aucune release n'est ouverte
+INTEGRATION_LOCK = threading.RLock()                   # une intégration (merge, contrôles, push) à la fois, sans bloquer le travail des agents
+CHECK_TRIES = 2                                        # échecs bloquants à la soumission avant transmission au validateur
+MAX_CHECK_RUNS = 40
 GIT_KINDS = ("status", "diff", "commit", "search", "sync", "git_log", "git_show")
 
 
@@ -289,12 +295,23 @@ def teamwork_text(p, a):
     return "# Travail des autres agents (pour te coordonner)\n" + "\n".join("- %s : « %s » (%s)%s" % (who(t), t["title"], t["status"], dep(t)) for t in oth)
 
 
+def checks_prompt(p):
+    cs = [c for c in p.get("checks", []) if c.get("active", True)]
+    if not cs:
+        return "Aucun contrôle automatique n’est configuré : si le projet a des tests ou un lint, propose-les (propose_check).\n"
+    return "Contrôles automatiques actifs (exécutés par l’application à ta soumission) :\n" + "\n".join(
+        "- %s : %s (%s, %s%s)" % (c["name"], c["command"], {"validation": "à la validation", "integration": "à l’intégration", "both": "à la validation et à l’intégration"}[c.get("when", "both")],
+                                 "bloquant" if c.get("blocking") and c.get("baseline") == "green" else "informatif" + (" — pas encore bloquant" if c.get("blocking") else ""), ", modifiable par proposition")
+        for c in cs) + "\n"
+
+
 def repo_text(p, a):
     if git_agent(p, a):
         return ("Tu travailles dans un WORKTREE GIT LOCAL qui t’est personnel (branche %s, créée depuis %s) : aucun autre agent n’y écrit, donc AUCUN verrou.\n"
                 + ("Une branche est créée automatiquement pour chaque tâche (task/<prénom>/<tâche>) ; si tu as encore du travail non fusionné sur ton ancienne branche, tu la gardes jusqu’à sa fusion.\n" if git_strategy(p) == "task" else "") +
                 "Tes modifications ne sont enregistrées qu’avec l’action commit (message clair) ; elles restent locales. Utilise status, diff (contre %s), search, git_log, git_show.\n"
                 "Avant de commencer, et régulièrement, intègre les changements des autres avec sync (commit d’abord) ; en cas de conflit, résous-le dans les fichiers puis commit. "
+                + checks_prompt(p).replace("%", "%%") +
                 "Quand ton travail est prêt : task_status « à vérifier » (l’application fait le commit restant, se synchronise avec la cible et soumet la merge request, que l’agent principal valide) ou merge_request. "
                 "Si ta merge request entre en conflit avec la cible, elle te revient : sync, résous, commit, puis merge_request de nouveau.") % (
                     git_branch_hint(p, a), git_target(p), git_target(p))
@@ -708,6 +725,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return "", "[Réponse de %s] %s" % (t["name"], r or "(pas de réponse écrite)")
         if kind in ("list_files", "read_file", "write_file", "delete_file"):
             return repo_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
+        if kind == "propose_check":
+            return propose_check(u, pid, p, a, x, mn, ctx)
         if kind in GIT_KINDS:
             if not git_agent(p, a):
                 return refuse("L’action %s n’existe qu’en mode git local (répertoire local versionné, un worktree par agent)." % kind)
@@ -1073,6 +1092,17 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
             run_task(u, pid, tid, note="[Décision de l’utilisateur] Réponse à ta question « %s » : %s\nReprends la tâche en tenant compte de cette décision." % (title, full))
         elif ag:
             ask(u, pid, ag["id"], "Réponse de l’utilisateur à ta question « %s » : %s" % (title, full), "Vous")
+        return
+    if decision == "accept" and d["kind"] == "check":      # l'approbation porte sur le texte EXACT de la commande : aucun champ modifiable
+        pay = dict(d["payload"])
+
+        def gc(pp):
+            msg, cid = checks_apply(pp, d, pay)
+            by_id(pp["decisions"], did).update(status="acceptée", done=now(), n_done=rights.next_seq(pp))
+            return msg, cid
+        msg, cid = mp(u, pid, gc)
+        log(u, pid, "Système", d["byName"], "Proposition acceptée — %s" % msg)
+        spawn(check_baseline, u, pid, cid)
         return
     if decision == "accept":
         pay = dict(d["payload"])
@@ -1669,8 +1699,11 @@ def run_task(u, pid, tid, retry=False, note=""):
                 if local_agent(snap(u, pid), a) and not git_agent(snap(u, pid), a):
                     raise Err(0, "")                       # répertoire local sans git : pas de merge request
                 st, mm = submit_mr(u, pid, a["id"], "Tâche : %s" % t["title"], "", tid)
-                if st in ("submitted", "conflict"):
+                if st in ("submitted", "conflict", "checks"):
                     log(u, pid, "Système", a["name"], mm)
+                if st in ("conflict", "checks"):             # rien n'a été soumis : la tâche retourne à l'agent (borné), pas de vérification d'un travail non intégrable
+                    if task_resubmit(u, pid, tid, a, st, mm):
+                        return
             except Err as e:
                 if e.msg:
                     log(u, pid, "Système", a["name"], "Merge request non soumise : %s" % e.msg)
@@ -1725,6 +1758,26 @@ def run_task(u, pid, tid, retry=False, note=""):
             pass
 
 
+def task_resubmit(u, pid, tid, a, st, msg, max_tries=3):
+    """Une soumission refusée (conflit, contrôles en échec) renvoie la tâche à son agent ; au-delà de `max_tries`, l'utilisateur est sollicité.
+    Retourne True si la tâche a été renvoyée ou escaladée (pas de vérification)."""
+    def f(pp):
+        t = by_id(pp["tasks"], tid)
+        if not t or t["status"] != "à vérifier":
+            return False
+        n = t.get("submit_fail", 0) + 1
+        t["submit_fail"], t["touched"] = n, time.time()
+        if n > max_tries:
+            add_escalation(pp, t, "sa soumission a échoué %d fois (%s)." % (n - 1, "conflit de fusion" if st == "conflict" else "contrôles automatiques en échec"))
+            return True
+        t["status"] = "à faire"
+        return "retry"
+    r = mp(u, pid, f)
+    if r == "retry":
+        spawn(run_task, u, pid, tid, False, "[Soumission refusée] %s" % msg)
+    return bool(r)
+
+
 def add_escalation(pp, t, reason, review=False):
     """Question à l'utilisateur : tâche bloquée (relancer / pause / abandonner) ou validation de fin de tâche."""
     ag = by_id(pp["agents"], t.get("who")) or {}
@@ -1752,7 +1805,7 @@ def apply_review(u, pid, tid, by, verdict, comment):
         t["touched"] = time.time()
         if verdict == "accepted":
             t.update(status="terminée", reviewed={"by": by, "d": now(), "note": comment})
-            for k in ("review_note", "reviews", "relaunch_n", "fail", "retries", "review_fail", "review_asked", "review_err", "auto_n", "auto_escalated", "resume"):
+            for k in ("review_note", "reviews", "relaunch_n", "fail", "retries", "review_fail", "review_asked", "review_err", "auto_n", "auto_escalated", "resume", "submit_fail"):
                 t.pop(k, None)
             b = rights.on_task_done(pp, t)
             return "Tâche « %s » vérifiée par %s : terminée.%s" % (t["title"], by, (" Bug « %s » corrigé : à vérifier par le QA." % b["t"]) if b else ""), False
@@ -2619,6 +2672,186 @@ def after_conflict(u, pid, cid):
         spawn(run_task, u, pid, c["task"], False, "[Fusion] Le conflit de fusion est résolu et ta branche est à jour : reprends la tâche.")
 
 
+def propose_check(u, pid, p, a, x, mn, ctx):
+    """Un agent PROPOSE un contrôle automatique (jamais activé sans l'approbation de l'utilisateur, qui lit une explication non technique)."""
+    refuse = lambda m: (m, m)
+    ctx["n"] += 1
+    if ctx["n"] > MAX_CREATE:
+        return refuse("Trop de créations dans un même échange (maximum %d) : poursuis plus tard." % MAX_CREATE)
+    if rights.level(p, a, "check", mn) == rights.NO:
+        return refuse("Ton rôle ne t’autorise pas à proposer des contrôles automatiques.")
+    name, cmd, explain = str(x.get("name") or "").strip()[:60], str(x.get("command") or "").strip(), str(x.get("explain") or "").strip()
+    if not name or not cmd or len(explain) < 20:
+        return refuse("Proposition incomplète : name, command et explain sont obligatoires. explain = une explication SIMPLE, sans jargon, pour quelqu’un qui n’est pas technicien : "
+                      "ce que la commande vérifie, si elle modifie quelque chose, et pourquoi tu la proposes.")
+    when = x.get("when") if x.get("when") in checks.WHEN else "both"
+    risk = checks.analyze(cmd)
+    if risk["refused"]:
+        return refuse("Commande refusée d’office (%s). Propose une commande qui reste dans le dossier de travail du projet, sans privilèges ni accès réseau direct." % " ; ".join(risk["flags"]))
+    cur = next((c for c in p.get("checks", []) if c.get("active", True) and c["name"].strip().lower() == name.lower()), None)
+    pay = {"name": name, "command": cmd, "when": when, "blocking": bool(x.get("blocking")), "timeout": min(int(x.get("timeout") or checks.DEFAULT_TIMEOUT), checks.MAX_TIMEOUT)
+           if str(x.get("timeout") or "").isdigit() or not x.get("timeout") else checks.DEFAULT_TIMEOUT, "retry_once": bool(x.get("retry_once")), "explain": explain,
+           "reason": str(x.get("reason") or "").strip(), "why": str(x.get("reason") or "").strip(), "id": cur["id"] if cur else "", "prev": cur["command"] if cur else "",
+           "risk": {"level": risk["level"], "flags": risk["flags"]}}
+    if cur and all(cur.get(k) == pay[k] for k in ("command", "when", "blocking", "retry_once")):
+        return refuse("Ce contrôle est déjà actif avec cette commande : rien à proposer.")
+
+    def f(pp):
+        olds = [d for d in pp.get("decisions", []) if d["kind"] == "check" and d["status"] == "attente" and rights.norm(d["payload"].get("name")) == rights.norm(name)]
+        if any(d["payload"].get("command") == cmd and d["payload"].get("when") == when and d["payload"].get("blocking") == pay["blocking"] for d in olds):
+            return None
+        d = {"id": uid(), "n": rights.next_seq(pp), "kind": "check", "by": a["id"], "byName": a["name"], "d": now(), "status": "attente", "payload": pay, "why": pay["why"]}
+        for o in olds:                                       # une version révisée remplace la proposition en attente du même contrôle
+            o.update(status="remplacée", note="Remplacée par la décision n° %s." % d["n"], replaced_by=d["id"], done=now(), n_done=rights.next_seq(pp))
+        pp.setdefault("decisions", []).append(d)
+        return d
+    d = mp(u, pid, f)
+    if not d:
+        return "Proposition identique déjà en attente : %s" % name, None
+    return "Proposition de contrôle enregistrée dans « Décisions » : %s (vigilance %s)" % (name, risk["level"]), \
+           "Proposition enregistrée : l’utilisateur la lira (ton explication, la commande, le niveau de vigilance) et l’approuvera ou non ; rien ne s’exécute avant. Tu seras prévenu s’il la refuse."
+
+
+def checks_active(p, when):
+    return [c for c in p.get("checks", []) if c.get("active", True) and c.get("when", "both") in (when, "both")]
+
+
+def checks_summary(results):
+    return [{k: e.get(k) for k in ("name", "ok", "blocking", "declared_blocking", "flaky")} for e in results]
+
+
+def checks_text(summary):
+    """Résumé des contrôles pour le validateur (sans commandes ni sorties)."""
+    if not summary:
+        return "Contrôles automatiques : aucun contrôle configuré (aucune vérification automatique n’a été faite)."
+    L = []
+    for e in summary:
+        tag = "bloquant" if e.get("blocking") else "informatif" + (" — pas encore bloquant : l’état de référence n’est pas vert" if e.get("declared_blocking") else "")
+        L.append("  - %s %s (%s%s)" % ("✔" if e.get("ok") else "✖", e.get("name"), tag, ", instable : réussi au 2e essai" if e.get("flaky") else ""))
+    return "Contrôles automatiques :\n" + "\n".join(L)
+
+
+def checks_fail_text(results, only_blocking=True):
+    """Sorties (fin) des contrôles en échec, pour l'agent qui doit corriger."""
+    out, used = [], 0
+    for e in results:
+        if e["ok"] or (only_blocking and not e["blocking"]):
+            continue
+        t = checks.tail(e["tail"], 1200)
+        out.append("✖ %s (code %s%s) :\n%s" % (e["name"], e["rc"], ", délai dépassé" if e["timed_out"] else "", t))
+        used += len(t)
+        if used > 3500:
+            break
+    return "\n\n".join(out)
+
+
+def run_checks(u, pid, p, cwd, when, who=""):
+    """Exécute les contrôles actifs de `when` dans `cwd`. Un contrôle n'est BLOQUANT que s'il est déclaré bloquant ET que son état de référence est vert
+    (il a déjà réussi sur la cible). À l'intégration, une réussite établit l'état de référence. Retourne {results, blocking_failed, failed}."""
+    res = []
+    for c in checks_active(p, when):
+        r = checks.run(c["command"], cwd, c.get("timeout"))
+        flaky = False
+        if not r["ok"] and c.get("retry_once"):
+            r2 = checks.run(c["command"], cwd, c.get("timeout"))
+            flaky, r = r2["ok"], r2
+        res.append({"id": c["id"], "name": c["name"], "ok": r["ok"], "rc": r["rc"], "secs": r["secs"], "timed_out": r["timed_out"], "tail": r["tail"], "flaky": flaky,
+                    "declared_blocking": bool(c.get("blocking")), "blocking": bool(c.get("blocking")) and c.get("baseline") == "green", "when": when})
+
+    def f(pp):
+        runs = pp.setdefault("check_runs", [])
+        for e in res:
+            runs.append({"d": now(), "who": who, "when": when, "name": e["name"], "ok": e["ok"], "secs": e["secs"], "blocking": e["blocking"], "flaky": e["flaky"], "tail": e["tail"][-600:]})
+            cc = by_id(pp.get("checks", []), e["id"])
+            if cc and when == "integration" and e["ok"] and cc.get("baseline") != "green":
+                cc["baseline"] = "green"
+        del runs[:-MAX_CHECK_RUNS]
+    if res:
+        mp(u, pid, f)
+    return {"results": res, "blocking_failed": [e for e in res if not e["ok"] and e["blocking"]], "failed": [e for e in res if not e["ok"]]}
+
+
+def checks_apply(pp, d, pay):
+    """Applique une proposition de contrôle APPROUVÉE par l'utilisateur (texte exact de la commande approuvé). Retourne (message, id du contrôle)."""
+    cmd = str(pay["command"]).strip()
+    fields = {"name": str(pay["name"]).strip()[:60], "command": cmd, "when": pay.get("when") if pay.get("when") in checks.WHEN else "both",
+              "blocking": bool(pay.get("blocking")), "timeout": int(pay.get("timeout") or checks.DEFAULT_TIMEOUT), "retry_once": bool(pay.get("retry_once"))}
+    pp.setdefault("checks", [])
+    cur = by_id(pp["checks"], pay.get("id")) if pay.get("id") else None
+    hist = pp.setdefault("check_history", [])
+    if cur:
+        hist.append({"id": uid(), "check": cur["id"], "name": cur["name"], "action": "modification", "old": dict(cur), "new": cmd, "by": d["byName"], "approved": "Vous",
+                     "d": now(), "reason": pay.get("reason", "")})
+        if cur["command"] != cmd:
+            cur["baseline"] = None                           # commande différente : l'état de référence est à rétablir
+        cur.update(fields, active=True, ver=cur.get("ver", 1) + 1)
+        c = cur
+    else:
+        c = {"id": uid(), **fields, "baseline": None, "active": True, "ver": 1}
+        pp["checks"].append(c)
+        hist.append({"id": uid(), "check": c["id"], "name": c["name"], "action": "ajout", "old": None, "new": cmd, "by": d["byName"], "approved": "Vous", "d": now(),
+                     "reason": pay.get("reason", "")})
+    del hist[:-100]
+    return "Contrôle « %s » approuvé et activé (version %d)." % (c["name"], c["ver"]), c["id"]
+
+
+def check_baseline(u, pid, cid):
+    """Établit l'état de référence d'un contrôle : exécution sur la branche cible (worktree d'intégration). Vert = il pourra être bloquant."""
+    p = snap(u, pid)
+    c = by_id(p.get("checks", []), cid)
+    if not c or not git_mode(p):
+        return
+    tgt = git_target(p)
+    try:
+        lg = git_repo(u, pid, p)
+        with INTEGRATION_LOCK:
+            lg.ensure_local(tgt, GIT_INTEGRATION if tgt != GIT_INTEGRATION else lg.base)
+            r = checks.run(c["command"], lg.integration_path(tgt), c.get("timeout"))
+    except Err as e:
+        return log(u, pid, "Système", "Vous", "État de référence de « %s » non établi : %s" % (c["name"], e.msg))
+    mp(u, pid, lambda pp: (by_id(pp.get("checks", []), cid) or {}).update(baseline="green" if r["ok"] else "red"))
+    log(u, pid, "Système", "Vous", "Contrôle « %s » : état de référence %s sur %s.%s" % (
+        c["name"], "VERT" if r["ok"] else "ROUGE", tgt,
+        " Il pourra bloquer les soumissions." if r["ok"] and c.get("blocking") else "" if r["ok"] else " Il reste informatif (non bloquant) tant qu’il échoue sur la cible. Fin de la sortie :\n" + checks.tail(r["tail"], 600)))
+
+
+def _check_hist(pp, c, action, old, by="Vous", reason=""):
+    pp.setdefault("check_history", []).append({"id": uid(), "check": c["id"], "name": c["name"], "action": action, "old": old, "new": c.get("command"), "by": by, "approved": "Vous",
+                                                "d": now(), "reason": reason})
+    del pp["check_history"][:-100]
+
+
+def check_remove(u, pid, cid):
+    def f(pp):
+        c = by_id(pp.get("checks", []), cid)
+        if not c:
+            raise Err(404, "Contrôle introuvable")
+        _check_hist(pp, c, "retrait", dict(c))
+        pp["checks"] = [x for x in pp["checks"] if x["id"] != cid]
+        return c["name"]
+    log(u, pid, "Système", "Vous", "Contrôle « %s » retiré." % mp(u, pid, f))
+
+
+def check_restore(u, pid, hid):
+    """Restaure la version d'un contrôle avant une modification ou un retrait (l'utilisateur décide : pas de nouvelle approbation)."""
+    def f(pp):
+        h = by_id(pp.get("check_history", []), hid)
+        if not h or not h.get("old"):
+            raise Err(404, "Version précédente introuvable")
+        old = dict(h["old"], baseline=None)
+        cur = by_id(pp.setdefault("checks", []), old["id"])
+        if cur:
+            _check_hist(pp, cur, "restauration", dict(cur))
+            cur.update(old, active=True, ver=cur.get("ver", 1) + 1)
+        else:
+            pp["checks"].append(dict(old, active=True))
+            _check_hist(pp, old, "restauration", None)
+        return old["name"]
+    name = mp(u, pid, f)
+    log(u, pid, "Système", "Vous", "Contrôle « %s » restauré à sa version précédente." % name)
+    spawn(check_baseline, u, pid, [h for h in snap(u, pid)["check_history"] if h["id"] == hid][0]["check"])
+
+
 def git_submit(u, pid, aid, title="", body="", task=""):
     """Soumission d'un agent en mode git local (même retour que `submit_mr`) : commit programmatique du reste, synchronisation avec la cible
     (conflit = à résoudre dans son worktree), puis merge request interne validée par l'agent principal. 0 token jusqu'à la validation."""
@@ -2647,9 +2880,23 @@ def git_submit(u, pid, aid, title="", body="", task=""):
         record_commit(u, pid, a["name"], "sync : %s" % tgt, lg.sha("HEAD", cwd=wt) or "")
     if not lg.ahead_behind(br, tgt)["ahead"]:
         return "skip", "Rien à soumettre : ta branche n’a aucun commit en avance sur %s." % tgt
+    ck, escal = run_checks(u, pid, p, wt, "validation", a["name"]), ""   # contrôles automatiques approuvés, dans le worktree de l'agent (0 token)
+    if ck["blocking_failed"]:
+        def bump(pp):
+            tr = pp.setdefault("check_tries", {})
+            tr[br] = tr.get(br, 0) + 1
+            return tr[br]
+        n = mp(u, pid, bump)
+        if n <= CHECK_TRIES:
+            return "checks", "Contrôles automatiques en échec (tentative %d/%d) : corrige, fais commit, puis soumets à nouveau.\n\n%s" % (n, CHECK_TRIES, checks_fail_text(ck["results"]))
+        escal = "contrôles toujours en échec après %d tentatives : transmis au validateur tels quels." % CHECK_TRIES
+    else:
+        mp(u, pid, lambda pp: pp.get("check_tries", {}).pop(br, None))
+    csum = checks_summary(ck["results"])
     if ex:
         if ex["status"] == "conflit":                                # l'agent a résolu : la MR repart en validation
-            mp(u, pid, lambda pp: by_id(pp["mrs"], ex["id"]).update(status="ouverte", note="Reprise après résolution du conflit.", merge_tries=ex.get("merge_tries", 0), tip=lg.sha(br)))
+            mp(u, pid, lambda pp: by_id(pp["mrs"], ex["id"]).update(status="ouverte", note="Reprise après résolution du conflit.", merge_tries=ex.get("merge_tries", 0), tip=lg.sha(br),
+                                                                    checks=csum, checks_note=escal))
             spawn(review_mr, u, pid, ex["id"])
             return "submitted", "Merge request #%s reprise après résolution du conflit : l’agent principal va la valider." % ex["n"]
         return "exists", "Une merge request est déjà ouverte (#%s) : elle sera validée." % ex["n"]
@@ -2658,7 +2905,7 @@ def git_submit(u, pid, aid, title="", body="", task=""):
     def add(pp):
         n = 1 + max([m.get("n") or 0 for m in pp.get("mrs", [])] or [0])
         pp.setdefault("mrs", []).append({"id": mid, "n": n, "git": True, "from": br, "to": tgt, "t": "#%d %s" % (n, title), "title": title, "by": a["name"],
-                                          "by_id": aid, "task": task, "d": now(), "status": "ouverte", "note": "", "tip": lg.sha(br)})
+                                          "by_id": aid, "task": task, "d": now(), "status": "ouverte", "note": "", "tip": lg.sha(br), "checks": csum, "checks_note": escal})
         return n
     n = mp(u, pid, add)
     spawn(review_mr, u, pid, mid)
@@ -2695,7 +2942,10 @@ def git_push(u, pid, aid=None):
 def git_mr_view(u, pid, p, m):
     """(commits, fichiers, diff) d'une merge request git, pour le message du validateur."""
     c = git_repo(u, pid, p).compare(m["to"], m["from"], budget=15000)
-    return "\n".join("  - %s" % x for x in c["commits"][-15:]) or "  (aucun)", ", ".join(c["files"][:30]) or "(aucun)", c["diff"]
+    commits = "\n".join("  - %s" % x for x in c["commits"][-15:]) or "  (aucun)"
+    if "checks" in m:                                      # MR git : résultat des contrôles automatiques lancés par l'application à la soumission
+        commits += "\n" + checks_text(m.get("checks")) + (("\n  ⚠ " + m["checks_note"]) if m.get("checks_note") else "")
+    return commits, ", ".join(c["files"][:30]) or "(aucun)", c["diff"]
 
 
 def git_mr_state(u, pid, p, m):
@@ -2714,10 +2964,10 @@ def git_merge_mr(u, pid, mid):
     à son auteur (sync, résolution, nouvelle soumission) ; au-delà de 3 essais, intervention manuelle (bouton « Réessayer »)."""
     p = snap(u, pid)
     m = by_id(p.get("mrs", []), mid)
-    pre = []
+    pre, ckf = [], []
     try:
         lg = git_repo(u, pid, p)
-        with GIT_LOCK:
+        with INTEGRATION_LOCK:
             if not lg.has(m["from"]):
                 r = {"state": "closed"}
             else:
@@ -2729,12 +2979,28 @@ def git_merge_mr(u, pid, mid):
                             raise
                         pre.append("remote injoignable (%s)" % e.msg.splitlines()[0][:120])    # réseau : la fusion locale reste possible
                 lg.ensure_local(m["to"], GIT_INTEGRATION if m["to"] != GIT_INTEGRATION else lg.base)
+                before = lg.sha(m["to"])
                 r = lg.integrate(m["from"], m["to"], message="Merge %s dans %s (MR #%s : %s)" % (m["from"], m["to"], m["n"], m.get("title", "")))
+                if r["state"] == "merged" and checks_active(p, "integration"):          # contrôles sur le RÉSULTAT de la fusion, avant tout push
+                    ckr = run_checks(u, pid, p, lg.integration_path(m["to"]), "integration", m["by"])
+                    ckf = ckr["failed"]
+                    if ckr["blocking_failed"]:
+                        lg.rollback(m["to"], before)                                    # cible locale remise comme avant : rien n'est poussé
+                        r = {"state": "checks", "ck": ckr}
     except Err as e:
         return "Merge request #%s : fusion impossible pour le moment : %s" % (m["n"], e.msg)
     if r["state"] == "closed":
         ready = mp(u, pid, lambda pp: _close_mr_in(pp, mid, "annulée", "Branche %s introuvable." % m["from"]) if (by_id(pp["mrs"], mid) or {}).get("status") in MR_ACTIVE else None)
         return "Merge request #%s annulée : la branche %s n’existe plus." % (m["n"], m["from"])
+    if r["state"] == "checks":
+        tries = m.get("merge_tries", 0) + 1
+        csum = checks_summary(r["ck"]["results"])
+        mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(status="conflit", merge_tries=tries, conflict_files=[], note="Contrôles automatiques en échec après intégration.", checks=csum))
+        if tries > 3:
+            return "Merge request #%s : contrôles toujours en échec après %d essais ; intervention manuelle nécessaire (bouton « Réessayer »)." % (m["n"], tries - 1)
+        spawn(ask, u, pid, m["by_id"], "[Intégration] Les contrôles automatiques échouent sur le résultat de la fusion de ta merge request #%s avec %s (fusion annulée, rien n’est poussé). "
+              "Lance sync, corrige, fais commit, puis soumets à nouveau avec merge_request.\n\n%s" % (m["n"], m["to"], checks_fail_text(r["ck"]["results"])), "Intégration MR")
+        return "Merge request #%s : contrôles automatiques en échec après intégration (fusion annulée) : renvoyée à %s." % (m["n"], m["by"])
     if r["state"] == "conflict":
         tries = m.get("merge_tries", 0) + 1
         mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(status="conflit", merge_tries=tries, conflict_files=r["files"]))
@@ -2744,20 +3010,23 @@ def git_merge_mr(u, pid, mid):
               "résous-les en réécrivant chaque fichier COMPLET avec write_file, fais commit, puis soumets à nouveau avec merge_request." % (m["n"], m["to"], ", ".join(r["files"])), "Intégration MR")
         return "Merge request #%s en conflit avec %s (fichiers : %s) : renvoyée à %s pour résolution." % (m["n"], m["to"], ", ".join(r["files"]), m["by"])
     notes, pushed_from = list(pre), False
+    if ckf:
+        notes.append("contrôles informatifs en échec : %s" % ", ".join(e["name"] for e in ckf))
     if r.get("sha"):
         record_commit(u, pid, m["by"], "Merge MR #%s : %s" % (m["n"], m.get("title", "")), r["sha"])
-    if lg.remote:                                          # décision 2 : branche de l'agent poussée à la validation ; la cible l'est toujours
-        for what, fn in (("de la branche %s" % m["from"], lambda: lg.push(m["from"])), ("de %s" % m["to"], lambda: lg.push_target(m["to"]))):
-            try:
-                fn()
-                pushed_from = pushed_from or what.startswith("de la branche")
-            except Err as e:
-                notes.append("poussée %s impossible : %s" % (what, e.msg))
-        if pushed_from and m["from"].startswith("task/") and not p.get("keepbranches") and not [n for n in notes if "poussée de " + m["to"] in n]:
-            try:                                           # décision 2 : branche distante supprimée après fusion, sauf option « conserver »
-                lg.push(m["from"], delete=True)
-            except Err as e:
-                notes.append("suppression de la branche distante %s impossible : %s" % (m["from"], e.msg))
+    with INTEGRATION_LOCK:
+        if lg.remote:                                          # décision 2 : branche de l'agent poussée à la validation ; la cible l'est toujours
+            for what, fn in (("de la branche %s" % m["from"], lambda: lg.push(m["from"])), ("de %s" % m["to"], lambda: lg.push_target(m["to"]))):
+                try:
+                    fn()
+                    pushed_from = pushed_from or what.startswith("de la branche")
+                except Err as e:
+                    notes.append("poussée %s impossible : %s" % (what, e.msg))
+            if pushed_from and m["from"].startswith("task/") and not p.get("keepbranches") and not [n for n in notes if "poussée de " + m["to"] in n]:
+                try:                                           # décision 2 : branche distante supprimée après fusion, sauf option « conserver »
+                    lg.push(m["from"], delete=True)
+                except Err as e:
+                    notes.append("suppression de la branche distante %s impossible : %s" % (m["from"], e.msg))
     if m["from"].startswith("task/"):
         with GIT_LOCK:
             lg.delete_branch(m["from"])                    # sans effet tant que le worktree de l'agent l'occupe : nettoyée au changement de tâche
@@ -3070,6 +3339,9 @@ def start(u, j):
             "agent_stop": lambda: stop_agent(u, pid, j.get("agentId"), bool(j.get("cancel")), "Vous", str(j.get("reason", ""))[:300]),
             "localdir_check": lambda: localdir_check(u, pid),
             "git_push": lambda: git_push(u, pid, j.get("agentId") or None),
+            "check_remove": lambda: check_remove(u, pid, j.get("checkId")),
+            "check_restore": lambda: check_restore(u, pid, j.get("histId")),
+            "check_baseline": lambda: check_baseline(u, pid, j.get("checkId")),
             "mr_retry": lambda: mr_retry(u, pid, j.get("mrId")),
             "mr_done": lambda: mr_done(u, pid, j.get("mrId")),
             "mr_sync": lambda: mr_sync(u, pid),

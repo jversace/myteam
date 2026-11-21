@@ -445,6 +445,15 @@ class LocalGit:
             self.g("worktree", "add", path, target)
         return path
 
+    def integration_path(self, target):
+        """Chemin du worktree d'intégration, positionné sur `target` (à utiliser sous verrou d'intégration)."""
+        return self._integration_wt(target)
+
+    def rollback(self, target, sha):
+        """Remet `target` (locale, non poussée) sur `sha` depuis le worktree d'intégration : annule une intégration refusée a posteriori."""
+        wt = self._integration_wt(target)
+        self.g("reset", "--hard", sha, cwd=wt)
+
     def integrate(self, branch, target, message=None, squash=False):
         """Fusionne `branch` dans `target` depuis le worktree d'intégration (sérialiser les appels). {state, sha | files, info}.
         En cas de conflit : merge annulé, `info` = [{path, base, into, source}] (même forme que github.Repo.conflict_info)."""

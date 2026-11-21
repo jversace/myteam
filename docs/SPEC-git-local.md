@@ -94,7 +94,7 @@ Règle de cohérence : dans un projet dont le répertoire local **n'a pas de rem
 - Jamais de résolution automatique (`-X ours/theirs`).
 - Push refusé (non fast-forward) : `fetch`, nouveau merge, nombre de tentatives borné, puis alerte.
 
-## 6 bis. Contrôles automatiques (tests, lint, build)
+## 6 bis. Contrôles automatiques (tests, lint, build) — **implémenté (21 nov. 2026)**
 
 Liste de contrôles par projet ; chacun : nom, commande, délai maximal, **bloquant / informatif**, moment (`validation`, `intégration`).
 - **Avant la validation**, dans le worktree de l'agent : en cas d'échec, la tâche retourne **automatiquement** à l'agent avec la fin de la sortie (tronquée), sans solliciter le validateur IA ; tentatives bornées (2 par défaut), puis escalade.
@@ -105,7 +105,7 @@ Liste de contrôles par projet ; chacun : nom, commande, délai maximal, **bloqu
 - **Qui décide** : un agent ne peut **jamais activer** ni modifier une commande ; il peut seulement la **proposer** (§ 6 ter). Seule l'approbation de l'utilisateur connecté l'active.
 - Sans contrôle configuré : le validateur est informé (« aucun contrôle automatique »), sans que cela soit présenté comme un succès.
 
-## 6 ter. Proposition et approbation d'une commande de contrôle
+## 6 ter. Proposition et approbation d'une commande de contrôle — **implémenté (21 nov. 2026)**
 
 L'utilisateur n'a pas à connaître la commande : les agents la proposent, il approuve en langage courant.
 
@@ -185,3 +185,10 @@ Vrais dépôts git temporaires ; remote = dépôt nu local (`git init --bare`) ;
 4. **Mode sans git conservé** : case à cocher dans les paramètres du projet.
 5. **Dossier local non vide avec remote** : alerte, dossier inutilisable (pas de réconciliation assistée) ; mêmes contrôles préalables pour un `origin` différent ou des modifications non commitées (§ 2).
 6. **Contrôles automatiques** : liste de contrôles par projet, bloquants ou informatifs, avant validation et à l'intégration (§ 6 bis) ; **proposés par les agents avec explication non technique, activés uniquement par approbation de l'utilisateur** (§ 6 ter).
+
+## 16. Contrôles automatiques : écarts avec la spec d'origine (21 nov. 2026)
+
+- Limités au mode git local (ils s'exécutent dans les worktrees) ; en mode « sans git » ou GitHub, aucun contrôle n'est lancé.
+- La liste de contrôles n'est pas saisie par l'utilisateur dans l'interface : elle vient des propositions des agents (l'utilisateur peut retirer et restaurer).
+- La vigilance est une analyse de **texte** (garde-fou, pas une garantie) : la commande exacte reste visible sous « Détail technique ». Les chemins absolus et certains mots (`curl`, `rm`, `.env`…) relèvent le niveau ; sudo, téléchargement exécuté, `git push`, ssh… sont refusés d'office.
+- Reste à faire : modification par l'utilisateur d'un délai ou du caractère bloquant sans nouvelle proposition, exécution des contrôles lors de la clôture de release, journal complet des sorties.
