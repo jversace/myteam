@@ -947,5 +947,169 @@ class ChecksRemote(RemoteBase):
         self.assertNotIn("refs/heads/agent/bob", refs)
 
 
+class Releases(Base):
+    """Releases en mode git local : release/<version> depuis develop, fusion dans la base, tag annoté, retour dans develop."""
+
+    def work(self, who="a2", path="src/x.py", content="print(1)\n"):
+        self.act(who, "write_file", path=path, content=content)
+        self.act(who, "commit", message="travail")
+
+    def lg(self):
+        return engine.git_repo("u", "p1", proj())
+
+    def mid(self, who="a2"):
+        return next(m for m in reversed(proj()["mrs"]) if m["by_id"] == who and not m.get("note"))["id"]
+
+    def merged_in_release(self, content="print(1)\n", path="src/x.py"):
+        engine.cycle_start("u", "p1", "v1.0")
+        self.work(path=path, content=content)
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        return engine.apply_mr_review("u", "p1", self.mid(), "Alice", "approved", "")
+
+    def test_demarrage_cree_la_branche_et_redirige_les_mr_ouvertes(self):
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")                                              # ouverte, vers develop
+        self.assertEqual(proj()["mrs"][0]["to"], "develop")
+        engine.cycle_start("u", "p1", "v1.0")
+        p = proj()
+        self.assertEqual(p["cycle"]["branch"], "release/v1.0")
+        self.assertEqual(self.lg().sha("release/v1.0"), self.lg().sha("develop"))
+        self.assertEqual(p["mrs"][0]["to"], "release/v1.0")
+        self.assertIn("redirigée", self.logs())
+        engine.cycle_start("u", "p1", "v2")
+        self.assertIn("déjà en cours", self.logs())
+
+    def test_publication_complete(self):
+        self.assertIn("fusionnée dans release/v1.0", self.merged_in_release())
+        lg = self.lg()
+        self.assertNotEqual(gitlocal.git(["cat-file", "-e", "develop:src/x.py"], lg.root, check=False)[0], 0)     # develop n'a rien reçu pendant la release
+        engine.release("u", "p1", "v1.0", "Première version")
+        p = proj()
+        self.assertEqual(sh(lg.root, "show", "main:src/x.py"), "print(1)\n")
+        self.assertEqual(sh(lg.root, "cat-file", "-t", "v1.0").strip(), "tag")
+        self.assertIn("Première version", sh(lg.root, "tag", "-l", "-n99", "v1.0"))
+        self.assertEqual(sh(lg.root, "rev-parse", "v1.0^{commit}").strip(), lg.sha("main"))
+        self.assertEqual(lg.sha("develop"), lg.sha("main"))                                    # develop avancée jusqu'à main (avance rapide)
+        self.assertNotIn("cycle", p)
+        self.assertEqual((p["releases"][-1]["v"], p["releases"][-1]["git"]), ("v1.0", True))
+        self.assertEqual(p["mrs"][-1]["status"], "fusionnée")
+        self.assertEqual(lg.current_branch(lg.root), "main")                                   # dépôt racine remis sur la base, à jour
+        self.assertTrue(os.path.exists(os.path.join(self.root, "src", "x.py")))
+        self.assertIn("La release est terminée", self.logs())
+        self.assertFalse(p.get("releasing"))
+        self.assertEqual(sh(os.path.join(lg.wt_dir, "_integration"), "status", "--porcelain").strip(), "")
+
+    def test_apres_la_release_les_agents_repartent_de_develop(self):
+        self.merged_in_release()
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertEqual(engine.git_target(proj()), "develop")
+        self.act("a3", "write_file", path="c.txt", content="c\n")                              # un nouvel agent part de develop, qui contient la release
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Carl"), "src", "x.py")))
+
+    def test_refus_mr_ouverte_tache_a_verifier_tag_existant_sans_release(self):
+        engine.release("u", "p1", "v9", "n")
+        self.assertIn("Aucune release en cours", self.logs())
+        engine.cycle_start("u", "p1", "v1.0")
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertIn("encore ouverte", self.logs())
+        engine.apply_mr_review("u", "p1", self.mid(), "Alice", "approved", "")
+        set_tasks(task("t1", "a2", "À relire", "à vérifier"))
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertIn("tâche(s) encore à vérifier", self.logs())
+        set_tasks()
+        self.lg().tag("v1.0", "déjà là", self.lg().sha("main"))
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertIn("le tag v1.0 existe déjà", self.logs())
+        self.assertIn("cycle", proj())                                                          # la release reste en cours
+        self.assertEqual(self.lg().sha("main"), self.lg().sha("develop"))                      # rien n'a été fusionné dans main
+
+    def test_controles_a_la_cloture_echec_laisse_la_base_intacte(self):
+        self.merged_in_release(path="bad.txt", content="x\n")
+        add_check("tests", BAD_FILE_CMD, when="integration")                                    # activé après la fusion de la MR : n'échoue qu'à la clôture
+        lg = self.lg()
+        before = lg.sha("main")
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertEqual(lg.sha("main"), before)
+        self.assertFalse(lg.tag_exists("v1.0"))
+        self.assertIn("cycle", proj())
+        self.assertIn("contrôles automatiques en échec sur main", self.logs())
+        self.assertIn("la release reste en cours", self.logs())
+        self.assertFalse(proj().get("releasing"))
+
+    def test_retour_dans_develop_en_conflit_n_empeche_pas_la_publication(self):
+        with open(os.path.join(self.root, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("un\ndeux\n")
+        self.act("a3", "status")                                                                 # crée le dépôt (commit initial avec a.txt)
+        engine.cycle_start("u", "p1", "v1.0")
+        self.work(path="a.txt", content="un\nBOB\n")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mid(), "Alice", "approved", "")
+        lg = self.lg()
+        w = lg.worktree("zed", "task/zed/t1", "develop")                                        # develop a bougé pendant la release (changement conflictuel)
+        with open(os.path.join(w, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("un\nZED\n")
+        lg.commit(w, "zed", "Zed")
+        lg.integrate("task/zed/t1", "develop")
+        dev = lg.sha("develop")
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertNotIn("cycle", proj())                                                       # publiée malgré tout
+        self.assertTrue(lg.tag_exists("v1.0"))
+        self.assertEqual(lg.sha("develop"), dev)                                                # develop intacte
+        self.assertIn("en conflit : à traiter à la main", self.logs())
+
+
+class ReleasesRemote(RemoteBase):
+    def work(self, path="src/x.py", content="print(1)\n"):
+        self.act("a2", "write_file", path=path, content=content)
+        self.act("a2", "commit", message="travail")
+
+    def release_ready(self):
+        engine.cycle_start("u", "p1", "v1.0")
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+
+    def test_publication_poussee_sur_le_remote(self):
+        engine.cycle_start("u", "p1", "v1.0")
+        self.assertIn("refs/heads/release/v1.0", sh(self.tmp, "ls-remote", self.remote))        # la release est poussée dès son démarrage
+        self.work()
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        engine.release("u", "p1", "v1.0", "Notes")
+        refs = sh(self.tmp, "ls-remote", self.remote)
+        self.assertIn("refs/tags/v1.0", refs)
+        self.assertIn("refs/heads/develop", refs)
+        self.assertEqual(self.remote_show("main:src/x.py"), "print(1)\n")
+        self.assertEqual(self.remote_show("develop:src/x.py"), "print(1)\n")
+        self.assertEqual(gitlocal.git(["rev-parse", "v1.0^{commit}"], self.remote)[1].strip(), gitlocal.git(["rev-parse", "main"], self.remote)[1].strip())
+        self.assertIn("Branches et tag poussés", self.logs())
+        self.assertNotIn("cycle", proj())
+
+    def test_remote_injoignable_publie_en_local_avec_avertissement(self):
+        self.release_ready()
+        shutil.rmtree(self.remote)
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertNotIn("cycle", proj())
+        self.assertTrue(engine.git_repo("u", "p1", proj()).tag_exists("v1.0"))
+        self.assertIn("poussée", self.logs().split("Release v1.0")[-1])
+        self.assertIn("Attention", self.logs())
+
+    def test_remote_qui_a_avance_est_integre_avant_la_publication(self):
+        self.release_ready()
+        other = os.path.join(self.tmp, "other")
+        sh(self.tmp, "clone", self.remote, other)
+        sh(other, "checkout", "-B", "main", "origin/main")
+        with open(os.path.join(other, "externe.txt"), "w", encoding="utf-8") as f:
+            f.write("e\n")
+        sh(other, "add", "-A")
+        sh(other, "commit", "-m", "externe")
+        sh(other, "push", "origin", "main")
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertEqual(self.remote_show("main:externe.txt"), "e\n")                          # le travail du remote est conservé
+        self.assertEqual(self.remote_show("main:src/x.py"), "print(1)\n")
+
+
 if __name__ == "__main__":
     unittest.main()

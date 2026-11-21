@@ -2335,6 +2335,43 @@ def deps_unmet(p, t):
     return out
 
 
+def git_cycle_start(u, pid, p, version):
+    """Release en mode git local : `release/<version>` créée depuis `develop` (alignée sur le remote si possible) et poussée ; les merge requests git
+    ouvertes qui visaient `develop` sont redirigées vers la release."""
+    branch = "release/" + re.sub(r"[^\w.\-]+", "-", version)
+    note = ""
+    try:
+        lg = git_repo(u, pid, p)
+        with INTEGRATION_LOCK:
+            lg.ensure_local(GIT_INTEGRATION, lg.base)
+            if lg.remote:
+                try:
+                    lg.update_target(GIT_INTEGRATION)
+                except Err as e:
+                    if e.code == 409:
+                        raise
+                    note += " Remote injoignable : la release part de la branche locale."
+            lg.ensure_local(branch, GIT_INTEGRATION)
+            if lg.remote:
+                try:
+                    lg.push(branch)
+                except Err as e:
+                    note += " Poussée de %s impossible : %s" % (branch, e.msg)
+    except Err as e:
+        return log(u, pid, "Système", "Vous", "Impossible de démarrer la release : %s" % e.msg)
+
+    def f(pp):
+        pp["cycle"] = {"version": version, "branch": branch, "started": now()}
+        n = 0
+        for m in pp.get("mrs", []):
+            if m.get("git") and m.get("status") in MR_ACTIVE and m.get("to") == GIT_INTEGRATION:
+                m["to"], n = branch, n + 1
+        return n
+    n = mp(u, pid, f)
+    log(u, pid, "Système", "Vous", "Release %s démarrée (git local) : branche de travail %s créée depuis %s. Les agents s’y synchronisent (sync) et y soumettent leurs merge requests ; %s reste réservée à la release finale.%s%s" % (
+        version, branch, GIT_INTEGRATION, p.get("repo", {}).get("branch") or "main", (" %d merge request(s) ouverte(s) redirigée(s) vers la release." % n) if n else "", note))
+
+
 def cycle_start(u, pid, version):
     """Démarre une release : crée la branche de travail release/<version> depuis la branche de base."""
     p = snap(u, pid)
@@ -2343,6 +2380,8 @@ def cycle_start(u, pid, version):
         return log(u, pid, "Système", "Vous", "Version vide : release non démarrée.")
     if p.get("cycle"):
         return log(u, pid, "Système", "Vous", "Une release est déjà en cours (%s) : publiez-la d’abord." % p["cycle"]["version"])
+    if git_mode(p):
+        return git_cycle_start(u, pid, p, version)
     try:
         rp = github.Repo(p)
         branch = "release/" + re.sub(r"[^\w.\-]+", "-", version)
@@ -3273,12 +3312,122 @@ def mr_retry(u, pid, mid):
     log(u, pid, "Système", "Vous", merge_mr(u, pid, mid))
 
 
+def git_release(u, pid, p, version, notes):
+    """Publication d'une release en mode git local : la release est fusionnée dans la branche de base, le tag annoté est créé, la base est reportée dans
+    `develop`, puis tout est poussé si un remote est défini. Refusée tant qu'une MR est ouverte ou qu'une tâche est « à vérifier » ; contrôles
+    d'intégration sur la base avant le tag ; tout échec avant le tag laisse la base comme avant et la release en cours."""
+    mg = by_id(p["agents"], p.get("mainId"))
+    who, cy = (mg["name"] if mg else "Système"), p.get("cycle")
+    if not cy:
+        return log(u, pid, "Système", "Vous", "Aucune release en cours : démarrez-en une (« Démarrer une release ») avant de la publier.")
+    if not version:
+        return log(u, pid, "Système", "Vous", "Version vide : release non publiée.")
+    sync_mrs(u, pid, force=True)
+    p = snap(u, pid)
+    opn = [m for m in p.get("mrs", []) if m.get("status") in MR_ACTIVE]
+    if opn:
+        return log(u, pid, "Système", "Vous", "Publication impossible : %d merge request(s) encore ouverte(s) (%s). Validez-les ou refusez-les d’abord." % (len(opn), ", ".join("#%s" % m["n"] for m in opn)))
+    pend = [t for t in p.get("tasks", []) if t.get("status") == "à vérifier"]
+    if pend:
+        return log(u, pid, "Système", "Vous", "Publication impossible : %d tâche(s) encore à vérifier (%s)." % (len(pend), ", ".join("« %s »" % t["title"] for t in pend[:5])))
+    try:
+        lg = git_repo(u, pid, p)
+    except Err as e:
+        return log(u, pid, "Système", "Vous", "Publication impossible : %s" % e.msg)
+    if lg.tag_exists(version):
+        return log(u, pid, "Système", "Vous", "Publication impossible : le tag %s existe déjà. Choisissez une autre version." % version)
+    base, rel = lg.base, cy["branch"]
+    mp(u, pid, lambda pp: pp.__setitem__("releasing", True))
+    out, warn, ok, sha = [], [], False, ""
+    try:
+        try:
+            with INTEGRATION_LOCK:
+                if lg.remote:
+                    for b in (rel, base, GIT_INTEGRATION):
+                        try:
+                            lg.update_target(b)
+                        except Err as e:
+                            if e.code == 409:
+                                raise
+                            warn.append("remote injoignable (%s)" % e.msg.splitlines()[0][:100])
+                            break
+                before = lg.sha(base)
+                if lg.merged(rel, base):
+                    out.append("%s : rien à fusionner dans %s" % (rel, base))
+                else:
+                    r = lg.integrate(rel, base, message="Release %s" % version)
+                    if r["state"] == "conflict":
+                        raise Err(409, "conflit entre %s et %s (fichiers : %s)" % (rel, base, ", ".join(r["files"])))
+                    if checks_active(p, "integration"):                       # contrôles sur la base fusionnée, avant le tag
+                        ck = run_checks(u, pid, p, lg.integration_path(base), "integration", who)
+                        if ck["blocking_failed"]:
+                            lg.rollback(base, before)
+                            raise Err(409, "contrôles automatiques en échec sur %s après fusion de la release :\n%s" % (base, checks_fail_text(ck["results"])))
+                    out.append("%s fusionnée dans %s" % (rel, base))
+                sha = lg.sha(base)
+                try:
+                    lg.tag(version, "Release %s%s" % (version, ("\n\n" + notes.strip()) if notes.strip() else ""), sha)
+                except Err:
+                    if before and sha != before:
+                        lg.rollback(base, before)
+                    raise
+                out.append("Tag annoté %s créé sur %s." % (version, base))
+                try:                                                          # retour de la base dans develop (avance rapide si possible)
+                    if not lg.fast_forward(GIT_INTEGRATION, base):
+                        if lg.integrate(base, GIT_INTEGRATION, message="Retour de %s dans %s (release %s)" % (base, GIT_INTEGRATION, version))["state"] == "conflict":
+                            warn.append("le retour de %s dans %s est en conflit : à traiter à la main (develop est inchangée)" % (base, GIT_INTEGRATION))
+                        else:
+                            out.append("%s reportée dans %s." % (base, GIT_INTEGRATION))
+                    else:
+                        out.append("%s avancée jusqu’à %s." % (GIT_INTEGRATION, base))
+                except Err as e:
+                    warn.append("retour dans %s impossible : %s" % (GIT_INTEGRATION, e.msg))
+                if lg.remote:
+                    for what, fn in (("de %s" % base, lambda: lg.push_target(base)), ("du tag %s" % version, lambda: lg.push_tag(version)),
+                                     ("de %s" % GIT_INTEGRATION, lambda: lg.push_target(GIT_INTEGRATION)), ("de %s" % rel, lambda: lg.push(rel))):
+                        try:
+                            fn()
+                        except Err as e:
+                            warn.append("poussée %s impossible : %s" % (what, e.msg))
+                    if not [w for w in warn if w.startswith("poussée")]:
+                        out.append("Branches et tag poussés sur le remote.")
+                try:
+                    lg.restore_root(base)
+                except Err as e:
+                    warn.append("dépôt racine non remis sur %s : %s" % (base, e.msg))
+            ok = True
+        except Err as e:
+            out.append("ÉCHEC — %s (la release reste en cours)" % e.msg)
+        url = ""
+        if ok and lg.remote and not [w for w in warn if w.startswith("poussée")]:
+            try:                                                              # release GitHub (best-effort : sans jeton ou hors GitHub, le tag suffit)
+                url = github.Repo(p).release(version, "Release " + version, notes)
+            except Err:
+                pass
+        if ok:
+            def done(pp):
+                n = 1 + max([m.get("n") or 0 for m in pp.get("mrs", [])] or [0])
+                pp["mrs"].append({"id": uid(), "n": n, "git": True, "from": rel, "to": base, "t": "#%d release %s" % (n, version), "title": "Release %s" % version, "by": who,
+                                  "d": now(), "status": "fusionnée", "note": "Release finale", "tip": sha})
+                pp["releases"].append({"v": version, "n": notes, "d": now(), "url": url, "git": True, "sha": sha})
+                pp.pop("cycle", None)
+            mp(u, pid, done)
+            out.append("La release est terminée.")
+        if warn:
+            out.append("Attention : " + " ; ".join(warn) + ".")
+        log(u, pid, who, "Vous", "Release %s :\n%s" % (version, "\n".join(out)))
+    finally:
+        mp(u, pid, lambda pp: pp.__setitem__("releasing", False))
+
+
 def release(u, pid, version, notes):
     """Release finale : fusionne la branche de travail dans la branche de base, crée le tag, termine le cycle."""
     p = snap(u, pid)
     mg = by_id(p["agents"], p.get("mainId"))
     who, cy = (mg["name"] if mg else "Système"), p.get("cycle")
     version = version.strip() or (cy or {}).get("version", "")
+    if git_mode(p):
+        return git_release(u, pid, p, version, notes)
     try:
         rp = github.Repo(p)
     except Err:

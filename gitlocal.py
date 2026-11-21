@@ -513,6 +513,36 @@ class LocalGit:
                     raise
         return "none"
 
+    # -- releases
+    def tag_exists(self, name):
+        return self.has("refs/tags/" + name)
+
+    def tag(self, name, message, ref=None):
+        """Tag annoté `name` sur `ref` (par défaut HEAD du dépôt racine) ; Err 409 si le tag existe déjà, 400 si le nom est invalide."""
+        if self.g("check-ref-format", "refs/tags/" + name, check=False)[0] != 0:
+            raise Err(400, "Nom de tag invalide : %s" % name)
+        if self.tag_exists(name):
+            raise Err(409, "Le tag %s existe déjà." % name)
+        self.g("tag", "-a", name, "-m", message, *([ref] if ref else []))
+
+    def push_tag(self, name):
+        if not self.remote:
+            raise Err(400, "Aucun remote défini pour ce projet")
+        self.g("push", "origin", "--", "refs/tags/%s:refs/tags/%s" % (name, name))
+
+    def fast_forward(self, target, ref):
+        """Avance `target` jusqu'à `ref` si c'est une avance rapide (depuis le worktree d'intégration) ; False sinon."""
+        wt = self._integration_wt(target)
+        return self.g("merge", "--ff-only", ref, cwd=wt, check=False)[0] == 0
+
+    def restore_root(self, branch):
+        """Après une publication : libère la branche du worktree d'intégration et remet le dépôt racine sur `branch` (s'il y était avant)."""
+        iw = os.path.realpath(os.path.join(self.wt_dir, "_integration"))
+        if self.worktrees().get(iw) == branch:
+            self.g("checkout", "--detach", cwd=iw)
+        if self.current_branch(self.root) is None and not self.g("status", "--porcelain", "--untracked-files=no")[1].strip():
+            self.g("checkout", branch)
+
     # -- remote
     def push(self, branch, delete=False):
         if not self.remote:

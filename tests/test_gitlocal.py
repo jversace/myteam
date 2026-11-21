@@ -640,5 +640,46 @@ class Changement(Base):
         self.assertEqual(g.unmerged("task/x", "develop"), 1)                                            # branche présente seulement sur le remote
 
 
+class Publication(Base):
+    def test_tag_annote_et_erreurs(self):
+        g = self.seeded()
+        g.tag("v1.0", "Release v1.0\n\nPremières notes", g.sha("main"))
+        self.assertEqual(sh(g.root, "cat-file", "-t", "v1.0").strip(), "tag")                    # annoté, pas léger
+        self.assertIn("Premières notes", sh(g.root, "tag", "-l", "-n99", "v1.0"))
+        self.assertTrue(g.tag_exists("v1.0"))
+        with self.assertRaises(Err) as c:
+            g.tag("v1.0", "x")
+        self.assertEqual(c.exception.code, 409)
+        with self.assertRaises(Err) as c:
+            g.tag("mauvais..nom", "x")
+        self.assertEqual(c.exception.code, 400)
+        with self.assertRaises(Err):
+            g.push_tag("v1.0")                                                                    # pas de remote
+
+    def test_fast_forward_et_restore_root(self):
+        g = self.seeded()
+        w = g.worktree("alice", "task/alice/t1", "develop")
+        write(os.path.join(w, "n.txt"), "n\n")
+        g.commit(w, "n", "Alice")
+        g.integrate("task/alice/t1", "develop")
+        self.assertTrue(g.fast_forward("main", "develop"))                                        # main (occupée par le dépôt racine) avancée
+        self.assertEqual(g.sha("main"), g.sha("develop"))
+        self.assertIsNone(g.current_branch(g.root))                                               # la racine a été détachée pour libérer main
+        self.assertTrue(g.fast_forward("main", "develop"))                                        # déjà à jour : sans effet
+        write(os.path.join(w, "m.txt"), "m\n")
+        g.commit(w, "m", "Alice")                                                                 # task/alice/t1 : en avance sur develop
+        wb = g.worktree("bob", "task/bob/t1", "develop")
+        write(os.path.join(wb, "z.txt"), "z\n")
+        g.commit(wb, "z", "Bob")                                                                  # task/bob/t1 : en avance aussi, autre histoire
+        sh(g.root, "branch", "divergente", "task/bob/t1")
+        self.assertFalse(g.fast_forward("divergente", "task/alice/t1"))                           # divergence : refusée
+        sh(g.root, "branch", "retard", "develop~1")                                                # une branche en retard sur develop
+        self.assertTrue(g.fast_forward("retard", "develop"))                                      # avance rapide acceptée
+        self.assertEqual(g.sha("retard"), g.sha("develop"))
+        g.restore_root("main")
+        self.assertEqual(g.current_branch(g.root), "main")                                        # racine remise sur main, fichiers à jour
+        self.assertTrue(os.path.exists(os.path.join(g.root, "n.txt")))
+
+
 if __name__ == "__main__":
     unittest.main()
