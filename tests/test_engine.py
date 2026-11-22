@@ -2216,6 +2216,128 @@ class Chantier0(unittest.TestCase):
         self.assertIn("continue", self.logs())
 
 
+class Interruptions(unittest.TestCase):
+    """Un agent interrompu (utilisateur, workflow, autre agent) n'oublie pas sa tâche et la reprend sans qu'on la lui redemande."""
+    def setUp(self):
+        reset()
+        st = make_state()
+        st["projects"][0]["tasks"].append({"id": "t9", "title": "Écrire le module X", "desc": "CONSIGNE-ORIGINALE : le module X doit gérer les cas A et B.", "who": "a2",
+                                           "status": "en cours", "modules": [], "parent": "", "result": ""})
+        store.wj(store.state_path("u"), st)
+        self.spawned = []
+        self.sp = mock.patch.object(engine, "spawn", lambda fn, *a, **k: self.spawned.append((fn.__name__, a)))
+        self.sp.start()
+        engine.TIMERS.clear()
+
+    def tearDown(self):
+        self.sp.stop()
+
+    def task(self):
+        return next(t for t in proj()["tasks"] if t["id"] == "t9")
+
+    def logs(self):
+        return "\n".join(m["text"] for m in proj()["log"])
+
+    def test_la_consigne_de_la_tache_est_dans_le_prompt_meme_sans_historique(self):
+        p = proj()
+        a = engine.by_id(p["agents"], "a2")
+        a["history"] = []                                                        # historique perdu (borné à 30 messages, compacté, remis à zéro)
+        sp = engine.sys_prompt(p, a)
+        self.assertIn("CONSIGNE-ORIGINALE", sp.blocks[-1] if hasattr(sp, "blocks") else str(sp))
+        self.assertIn("Ta tâche en cours", sp.blocks[-1] if hasattr(sp, "blocks") else str(sp))
+        # un autre agent ne voit pas la consigne dans son bloc « tâche en cours »
+        other = engine.sys_prompt(p, engine.by_id(p["agents"], "a1"))
+        self.assertNotIn("Ta tâche en cours", other.blocks[-1] if hasattr(other, "blocks") else str(other))
+
+    def test_la_consigne_n_est_pas_dans_les_blocs_mis_en_cache(self):
+        p = proj()
+        sp = engine.sys_prompt(p, engine.by_id(p["agents"], "a2"))
+        for b in sp.blocks[:-1]:
+            self.assertNotIn("CONSIGNE-ORIGINALE", b)                            # sinon le cache du prompt serait perdu à chaque changement de tâche
+
+    def test_une_sollicitation_marque_la_tache_interrompue(self):
+        with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "Je réponds."):
+            engine.ask("u", "p1", "a2", "analyse seule", "Vous", fresh=True)      # appel sans mémoire : pas une interruption
+            self.assertNotIn("interrupted", self.task())
+            engine.ask("u", "p1", "a2", "où en es-tu ?", "Vous")
+        self.assertEqual(self.task()["interrupted"]["by"], "Vous")
+
+    def test_sans_interruption_pas_de_marque(self):
+        with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "ok"):
+            engine.ask("u", "p1", "a2", "continue", "Application")
+        self.assertNotIn("interrupted", self.task())
+
+    def test_dialogue_puis_reprise_automatique_de_la_tache(self):
+        with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "Voici où j'en suis."):
+            engine.say("u", "p1", "a2", "où en es-tu ?")
+        self.assertIn(("run_task", ("u", "p1", "t9", False, mock.ANY)), self.spawned)
+        note = next(a for n, a in self.spawned if n == "run_task")[4]
+        self.assertIn("CONSIGNE-ORIGINALE", note)                               # la consigne est redonnée à l'agent
+        self.assertIn("Reprise après interruption", note)
+        self.assertEqual(self.task()["resume_n"], 1)
+        self.assertIn("reprise automatique", self.logs())
+
+    def test_pas_de_reprise_si_une_decision_l_explique(self):
+        st = store.load("u")
+        st["projects"][0].setdefault("decisions", []).append({"id": "d1", "n": 1, "kind": "question", "status": "attente", "task": "t9", "question": "A ou B ?", "options": ["A", "B"], "byName": "Bob", "payload": {}})
+        store.wj(store.state_path("u"), st)
+        with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "Je pose la question."):
+            engine.say("u", "p1", "a2", "salut")
+        self.assertEqual([n for n, _ in self.spawned if n == "run_task"], [])
+
+    def test_pas_de_reprise_si_arretee_par_l_utilisateur(self):
+        with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "ok"):
+            engine.say("u", "p1", "a2", "salut")
+        self.spawned.clear()
+        engine.stop_agent("u", "p1", "a2")
+        engine.resume_interrupted("u", "p1")
+        self.assertEqual(self.spawned, [])
+
+    def test_reprise_bornee(self):
+        for _ in range(engine.MAX_RESUME + 2):
+            with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "ok"):
+                engine.say("u", "p1", "a2", "salut")
+            def f(pp):                                                           # la reprise « échoue » : la tâche reste en cours, non lancée
+                t = engine.by_id(pp["tasks"], "t9")
+                t["running"], t["status"] = False, "en cours"
+            engine.mp("u", "p1", f)
+        self.assertEqual(len([n for n, _ in self.spawned if n == "run_task"]), engine.MAX_RESUME)
+
+    def test_tache_mise_en_attente_par_l_agent_reprise_une_fois_la_decision_levee(self):
+        with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "ok"):
+            engine.say("u", "p1", "a2", "salut")
+        self.spawned.clear()
+        engine.mp("u", "p1", lambda pp: engine.by_id(pp["tasks"], "t9").update(status="en attente", running=False))
+        engine.resume_interrupted("u", "p1")
+        self.assertEqual([n for n, _ in self.spawned], ["run_task"])
+        self.assertEqual(self.task()["status"], "à faire")
+
+    def test_le_suivi_relance_une_tache_interrompue(self):
+        with mock.patch.object(engine, "call_ai", lambda s, system, msgs: "ok"):
+            engine.ask("u", "p1", "a2", "salut", "Vous")
+        engine.mp("u", "p1", lambda pp: engine.by_id(pp["tasks"], "t9").update(running=False))
+        with mock.patch.object(engine, "sync_mrs", lambda *a, **k: 0):
+            engine._tick("u", "p1")
+        self.assertIn("run_task", [n for n, _ in self.spawned])
+
+    def test_boucle_de_tache_rappelle_la_consigne_apres_interruption(self):
+        vus = []
+
+        def fake(s, system, msgs):
+            vus.append(msgs[-1]["content"])
+            if len(vus) == 1:                                                    # pendant le 1er tour de la tâche, l'utilisateur écrit à l'agent
+                engine.mark_interrupted("u", "p1", "a2", "Vous")
+                return '```action\n{"do":"list_files","path":""}\n```'
+            if len(vus) == 2:
+                return "Je continue."
+            return '```action\n{"do":"task_status","id":"t9","status":"à vérifier","note":"fait"}\n```'
+        with mock.patch.object(engine, "call_ai", fake), mock.patch.object(engine, "submit_mr", lambda *a, **k: ("none", "")):
+            engine.mp("u", "p1", lambda pp: engine.by_id(pp["tasks"], "t9").update(status="à faire"))
+            engine.run_task("u", "p1", "t9")
+        self.assertTrue(any("Reprise après interruption" in v and "CONSIGNE-ORIGINALE" in v for v in vus))
+        self.assertNotIn("interrupted", self.task())
+
+
 class LimitesGithub(unittest.TestCase):
     """github.call_status : nouvelles tentatives sur limite de débit et pannes temporaires (lecture seule pour les 5xx)."""
     def setUp(self):

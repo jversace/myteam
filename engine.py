@@ -35,6 +35,7 @@ MAX_ROUNDS, MAX_ROUND_STEPS, MAX_AUTO = 6, 8, 8   # tours par tâche, étapes pa
 NUDGE = ("Tu n’as pas déclaré la tâche terminée. Si le travail demandé est réellement fait, conclus avec task_status « à vérifier » et un compte rendu précis. "
          "Sinon poursuis-le maintenant avec les actions ; si tu es bloqué, écris à l’agent concerné (message) ou pose la question à l’utilisateur (ask_user). "
          "Ne t’arrête pas sur une erreur : analyse-la, corrige et continue.")
+MAX_RESUME = 3                                      # reprises automatiques d'une tâche après une interruption (message, workflow…) avant d'attendre l'utilisateur
 OPEN_CONFLICT, RECONCILE_EVERY = ("ouvert", "escalade", "pause"), 300   # statuts « actifs » d'un conflit ; délai entre deux vérifications (s)
 CONFLICT_OPTS = ["L’auteur de la branche résout", "L’agent principal résout", "Je m’en occupe (mettre en pause)"]
 MR_ACTIVE, MR_SYNC_EVERY = ("ouverte", "conflit"), 120   # statuts d'une MR qui bloque ; délai entre deux vérifications GitHub d'une même MR (s)
@@ -60,6 +61,7 @@ RULES = [
     "Si tu travailles sur le RÉPERTOIRE LOCAL du projet (section « Dépôt et intégration »), il est partagé avec d’autres agents : verrouille chaque fichier AVANT de le lire pour le modifier (lock_file), modifie-le, puis libère-le dès que tu as fini (unlock_file). Si un fichier est verrouillé par un autre agent, la demande attend qu’il le libère ; ne le contourne jamais. Ne garde pas de verrou plus longtemps que nécessaire, et ne verrouille pas dans un ordre qui peut croiser celui d’un autre agent : demande tous tes fichiers d’un coup (lock_file accepte une liste). Il n’y a ni pull ni merge request sur le répertoire local.",
     "Si ta section « Dépôt et intégration » décrit un WORKTREE GIT LOCAL : il est à toi seul (pas de verrou), write_file et delete_file modifient seulement tes fichiers, et rien n’est enregistré tant que tu n’as pas fait commit. Tu ne lances jamais de commande git toi-même : tout passe par les actions status, commit, diff, search, sync, git_log, git_show.",
     "Tu ne peux ni exécuter ni modifier une commande de contrôle automatique : tu peux seulement la PROPOSER (propose_check). L’utilisateur n’est pas technicien : ton explication doit tenir en quelques phrases simples, sans jargon, et dire ce que la commande vérifie, si elle modifie des fichiers et pourquoi tu la proposes. Chaque modification de la commande redemande son approbation. Les contrôles approuvés sont exécutés par l’application quand tu soumets ton travail ; en cas d’échec bloquant, tu reçois la fin de leur sortie et tu corriges.",
+    "Une interruption (message de l’utilisateur ou d’un agent, étape de workflow, suivi) ne remplace pas ta tâche en cours : réponds-y, puis reprends ta tâche là où tu t’étais arrêté, sans attendre qu’on te le redemande. Ta tâche en cours (consigne d’origine comprise) est rappelée dans la section « Ta tâche en cours » : ne dépends pas de ta mémoire de la conversation.",
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
@@ -374,12 +376,12 @@ def sys_prompt(p, a):
         ("# Bugs ouverts (id | titre | gravité | statut | modules)\n" + bs) if bs else "",
         ("# Décisions en attente de l’utilisateur\n" + "\n".join("- %s (%s)" % (d.get("question") or (d["payload"].get("title") or d["payload"].get("name")), d["byName"]) for d in pend)) if pend else "",
         ("# Spécifications actuelles\n" + p["spec"][:6000]) if p.get("spec") else "",
-        "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), ACTIONS]
+        "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), ACTIONS, focus_text(p, a)]
     # Blocs du plus stable au plus changeant (prompt caching Anthropic : les deux premiers sont mis en cache) :
     # 1) commun à tous les agents, 2) propre à l'agent mais rarement modifié, 3) change à presque chaque tour.
     shared = [parts[0], parts[18], parts[1], parts[11], parts[12], parts[16]]
     per_agent = [parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
-    volatile = [parts[5], parts[10], parts[13], parts[14], parts[15], parts[17]]
+    volatile = [parts[19], parts[5], parts[10], parts[13], parts[14], parts[15], parts[17]]
     return System.of(["\n\n".join(x for x in grp if x) for grp in (shared, per_agent, volatile)])
 
 
@@ -450,6 +452,8 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
     stats.update(actions=0, pending="")
     if relog:
         log(u, pid, frm, a["name"], text)
+    if not fresh and frm != "Application":
+        mark_interrupted(u, pid, aid, frm)
     work(u, pid, aid, 1)
     try:
         msg, final, ctx, overflow = "[%s] %s" % (frm, text), "", {"n": 0, "t0": time.time()}, 0
@@ -1563,6 +1567,7 @@ def say(u, pid, aid, text, attempt=0, relog=True):
         for t in snap(u, pid)["tasks"]:               # une tâche passée « à vérifier » pendant la conversation
             if t["status"] == "à vérifier" and not t.get("reviewing"):
                 spawn(review_task, u, pid, t["id"])
+        resume_interrupted(u, pid)                    # tâche interrompue par ce dialogue : reprise sans qu'il faille la redemander
     except Err as e:
         a = by_id(snap(u, pid)["agents"], aid) or {"name": "?"}
         if classify(e) in ("quota", "temp") and attempt < 3:
@@ -1638,6 +1643,82 @@ def coordination_hint(p, a):
             "(interface, contrat d’API, schéma de données, convention), écris-lui d’abord (message) pour convenir de l’approche, puis préviens-le quand tu modifies ce qu’il utilise.")
 
 
+def _task_tail(t, n=1500):
+    return ((t.get("desc") or "").strip()[:n]) or "(pas de description : voir le titre)"
+
+
+def focus_text(p, a):
+    """Section du prompt système (bloc changeant) : la ou les tâches EN COURS de l'agent avec leur consigne d'origine. L'historique envoyé à l'IA est
+    borné (30 messages) et peut perdre le message de départ de la tâche : ce rappel, reconstruit à chaque tour depuis l'état, ne dépend pas de lui."""
+    L = []
+    for t in p.get("tasks", []):
+        if t.get("who") != a["id"] or t.get("system") or not (t["status"] == "en cours" or (t.get("interrupted") and t["status"] == "en attente")):
+            continue
+        s = "- %s : « %s » (statut %s)\n  Consigne d’origine : %s" % (t["id"], t["title"], t["status"], _task_tail(t))
+        if t.get("modules"):
+            s += "\n  Modules : " + ", ".join(mod_names(p, t["modules"]))
+        if t.get("result") and not t.get("running"):
+            s += "\n  Dernier compte rendu : " + str(t["result"])[:500]
+        if t.get("interrupted"):
+            s += "\n  Tu as été interrompu par %s (%s) : réponds à cette sollicitation, puis REPRENDS cette tâche là où tu t’étais arrêté." % (t["interrupted"].get("by", "?"), t["interrupted"].get("d", ""))
+        L.append(s)
+    return ("# Ta tâche en cours (à reprendre après toute interruption)\n" + "\n".join(L)) if L else ""
+
+
+def mark_interrupted(u, pid, aid, frm):
+    """Une sollicitation (utilisateur, workflow, suivi, autre agent) arrive pendant que l'agent a une tâche en cours : on le note sur la tâche
+    pour qu'elle soit rappelée à l'agent (focus_text, boucle de run_task) et reprise automatiquement si plus rien ne la fait avancer."""
+    def f(pp):
+        for t in pp.get("tasks", []):
+            if t.get("who") == aid and t["status"] == "en cours" and not t.get("system"):
+                t["interrupted"] = {"by": frm, "d": now(), "ts": time.time()}
+    mp(u, pid, f)
+
+
+def resume_text(p, t, intr=None):
+    intr = intr or t.get("interrupted") or {}
+    return ("[Reprise après interruption] Tu as été sollicité par %s ; cette sollicitation est traitée. Reprends maintenant ta tâche « %s » (id %s) là où tu t’étais arrêté "
+            "(relis ton historique et l’état de ta branche).\nConsigne d’origine : %s\nQuand le travail demandé est réellement fait, conclus avec task_status « à vérifier » et un compte rendu précis ; "
+            "si tu es bloqué, pose la question avec ask_user.") % (intr.get("by", "?"), t["title"], t["id"], _task_tail(t))
+
+
+def resumable(p, t):
+    """Tâche interrompue que plus rien ne fait avancer : à relancer (bornée par MAX_RESUME ; jamais si une décision, un blocage, un arrêt ou un conflit l'explique)."""
+    if not t.get("interrupted") or t.get("running") or t.get("retry_at") or t.get("fail") or t.get("stopped") or t.get("blocked") or t.get("reviewing"):
+        return False
+    if t["status"] not in ("en cours", "en attente") or t.get("resume_n", 0) >= MAX_RESUME:
+        return False
+    if any(d["status"] == "attente" and d.get("task") == t["id"] for d in p.get("decisions", [])):
+        return False
+    a = by_id(p["agents"], t.get("who"))
+    return bool(a) and a.get("mode") != "manual" and not a.get("work") and not deps_unmet(p, t) and not open_conflict_for(p, a["id"])
+
+
+def resume_interrupted(u, pid):
+    """Relance les tâches interrompues qui n'avancent plus (appelée en fin de dialogue / d'étape de workflow et à chaque passage du suivi)."""
+    p = snap(u, pid)
+    if p.get("autopilot") == "off":
+        return 0
+    n, busy = 0, set()
+    for t in p.get("tasks", []):
+        if t.get("who") in busy or not resumable(p, t):
+            continue
+        busy.add(t["who"])
+        a = by_id(p["agents"], t["who"])
+        note = resume_text(p, t)
+
+        def f(pp, i=t["id"]):
+            tt = by_id(pp["tasks"], i)
+            tt["resume_n"] = tt.get("resume_n", 0) + 1
+            if tt["status"] == "en attente":
+                tt["status"] = "à faire"
+        mp(u, pid, f)
+        log(u, pid, "Système", a["name"], "Tâche « %s » interrompue par %s : reprise automatique (%d/%d)." % (t["title"], t["interrupted"].get("by", "?"), t.get("resume_n", 0) + 1, MAX_RESUME))
+        spawn(run_task, u, pid, t["id"], False, note)
+        n += 1
+    return n
+
+
 def run_task(u, pid, tid, retry=False, note=""):
     """Exécute une tâche en PLUSIEURS tours : l'agent est relancé tant qu'il n'a ni conclu, ni posé de question, ni signalé de blocage."""
     p = snap(u, pid)
@@ -1666,7 +1747,7 @@ def run_task(u, pid, tid, retry=False, note=""):
         if tt.get("running"):                              # déjà lancée par un autre passage
             return False
         tt.update(running=True, status="en cours", started=time.time(), touched=time.time())
-        for k in ("retry_at", "fail", "blocked", "waiting", "resume", "result_note", "stopped"):
+        for k in ("retry_at", "fail", "blocked", "waiting", "resume", "result_note", "stopped", "interrupted"):
             tt.pop(k, None)
         by_id(pp["agents"], a["id"])["state"] = "actif"
         return True
@@ -1713,7 +1794,12 @@ def run_task(u, pid, tid, retry=False, note=""):
             mp(u, pid, lambda pp: (by_id(pp["tasks"], tid) or {}).__setitem__("touched", time.time()))
             if tt["status"] != "en cours":                 # conclu (à vérifier), en attente d'une décision, etc.
                 break
-            if stats.get("pending"):                       # étapes épuisées en plein travail : on continue
+            intr = tt.get("interrupted")
+            if intr:                                       # sollicité pendant la tâche (utilisateur, workflow, autre agent) : on la lui rappelle, sans compter comme tour « sans action »
+                mp(u, pid, lambda pp: (by_id(pp["tasks"], tid) or {}).pop("interrupted", None))
+                back = (stats["pending"].removeprefix("[Application] ") + "\n\n") if stats.get("pending") else ""   # retour d'actions non traité : il n'est pas perdu
+                msg, idle = back + resume_text(snap(u, pid), tt, intr), 0
+            elif stats.get("pending"):                       # étapes épuisées en plein travail : on continue
                 msg, idle = stats["pending"].removeprefix("[Application] ") + "\nPoursuis ta tâche.", 0
             elif stats.get("actions"):
                 msg, idle = NUDGE, 0
@@ -1851,7 +1937,7 @@ def apply_review(u, pid, tid, by, verdict, comment):
         t["touched"] = time.time()
         if verdict == "accepted":
             t.update(status="terminée", reviewed={"by": by, "d": now(), "note": comment})
-            for k in ("review_note", "reviews", "relaunch_n", "fail", "retries", "review_fail", "review_asked", "review_err", "auto_n", "auto_escalated", "resume", "submit_fail"):
+            for k in ("review_note", "reviews", "relaunch_n", "fail", "retries", "review_fail", "review_asked", "review_err", "auto_n", "auto_escalated", "resume", "submit_fail", "interrupted", "resume_n"):
                 t.pop(k, None)
             b = rights.on_task_done(pp, t)
             return "Tâche « %s » vérifiée par %s : terminée.%s" % (t["title"], by, (" Bug « %s » corrigé : à vérifier par le QA." % b["t"]) if b else ""), False
@@ -2182,6 +2268,10 @@ def wf_do_step(u, pid, p, wf, run, i, st):
         return "ok", "sans verdict explicite de l’agent", False
     finally:
         mp(u, pid, lambda pp: (by_id(pp["agents"], a["id"]) or {}).pop("wf_ctx", None))
+        try:
+            resume_interrupted(u, pid)                     # l'étape de workflow a interrompu une tâche en cours de cet agent : reprise
+        except Exception as ex:
+            print("Erreur de reprise après étape de workflow (%s/%s) : %s" % (u, pid, ex), flush=True)
 
 
 def wf_continue(u, pid, rid):
@@ -2309,6 +2399,8 @@ def _tick(u, pid):
             spawn(review_task, u, pid, t["id"])
     if any(c["status"] in OPEN_CONFLICT for c in p.get("conflicts", [])):
         reconcile_conflicts(u, pid)                        # un conflit levé entre-temps ne doit pas bloquer les agents
+    resume_interrupted(u, pid)                             # tâches interrompues (message, workflow, suivi) que plus rien ne fait avancer
+    p = snap(u, pid)
     dispatch(u, pid, p, t0)
     mg = by_id(p["agents"], p.get("mainId"))
     can_ask = bool(mg) and mg.get("mode") != "manual"
