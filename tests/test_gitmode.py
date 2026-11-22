@@ -217,6 +217,13 @@ class DossierVideSansRemote(Base):
         self.assertIn("utilisable", self.logs())
 
 
+def set_policy(pol):
+    st = store.load("u")
+    st["projects"][0]["conflict_policy"] = pol
+    store.wj(store.state_path("u"), st)
+
+
+
 class Mr(Base):
     """Merge requests internes : soumission, validation, intégration programmatique, conflits, état déduit de git, push."""
 
@@ -280,6 +287,7 @@ class Mr(Base):
         self.assertEqual(sh(self.root, "show", "develop:a.txt"), "un\nBOB+CARL\ntrois\n")
 
     def test_conflit_a_l_integration_renvoye_a_l_auteur_puis_repris(self):
+        set_policy("author")                                                                      # règle du projet : l'auteur résout (défaut : « ask »)
         self.base_file()
         self.work("a2", "a.txt", "un\nBOB\ntrois\n")
         self.work("a3", "a.txt", "un\nCARL\ntrois\n")
@@ -289,12 +297,16 @@ class Mr(Base):
         calls = []
         with mock.patch.object(engine, "spawn", lambda f, *a, **k: calls.append((f.__name__, a))):
             r = engine.apply_mr_review("u", "p1", self.mr("a3")["id"], "Alice", "approved", "")
-        self.assertIn("renvoyée à Carl", r)
+        self.assertIn("confiée à Carl (auteur)", r)
         m = self.mr("a3")
         self.assertEqual((m["status"], m["merge_tries"], m["conflict_files"]), ("conflit", 1, ["a.txt"]))
-        ask = [c for c in calls if c[0] == "ask"]
-        self.assertEqual(len(ask), 1)
-        self.assertEqual(ask[0][1][2], "a3")                                                      # l'auteur est prévenu
+        rc = [c for c in calls if c[0] == "resolve_conflict"]
+        self.assertEqual((len(rc), rc[0][1][3]), (1, "a3"))                                       # la règle « auteur » confie la résolution à Carl
+        calls2 = []
+        with mock.patch.object(engine, "spawn", lambda f, *a, **k: calls2.append((f.__name__, a))):
+            engine.resolve_conflict("u", "p1", rc[0][1][2], "a3")
+        ask = [c for c in calls2 if c[0] == "ask"]
+        self.assertEqual((len(ask), ask[0][1][2]), (1, "a3"))                                     # l'auteur est prévenu
         self.assertIn("sync", ask[0][1][3])
         self.assertEqual(sh(self.root, "show", "develop:a.txt"), "un\nBOB\ntrois\n")           # la cible n'a pas été touchée
         self.assertIn("conflit", str(self.act("a3", "sync")).lower())
@@ -1109,6 +1121,194 @@ class ReleasesRemote(RemoteBase):
         engine.release("u", "p1", "v1.0", "n")
         self.assertEqual(self.remote_show("main:externe.txt"), "e\n")                          # le travail du remote est conservé
         self.assertEqual(self.remote_show("main:src/x.py"), "print(1)\n")
+
+
+class ConflitsRegle(Base):
+    """Règle de conflit du projet appliquée aux conflits d'intégration git : auteur, agent désigné, décision de l'utilisateur."""
+    RESOLU = "un\nBOB+CARL\ntrois\n"
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.root, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("un\ndeux\ntrois\n")
+
+    def work(self, who, content):
+        self.act(who, "write_file", path="a.txt", content=content)
+        self.act(who, "commit", message="travail")
+
+    def mr(self, who):
+        return next(m for m in reversed(proj()["mrs"]) if m["by_id"] == who)
+
+    def conflict_setup(self):
+        """Bob et Carl modifient la même ligne ; les deux MR sont soumises avant toute intégration, celle de Bob est fusionnée : celle de Carl entre en conflit."""
+        self.work("a2", "un\nBOB\ntrois\n")
+        self.work("a3", "un\nCARL\ntrois\n")
+        engine.submit_mr("u", "p1", "a3", "Carl")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mr("a2")["id"], "Alice", "approved", "")
+
+    def approve_carl(self, sync_funcs=()):
+        calls = []
+
+        def sp(f, *a, **k):
+            calls.append((f.__name__, a))
+            if f.__name__ in sync_funcs:
+                f(*a, **k)
+        with mock.patch.object(engine, "spawn", sp):
+            r = engine.apply_mr_review("u", "p1", self.mr("a3")["id"], "Alice", "approved", "")
+        return r, calls
+
+    def conflicts(self):
+        return proj().get("conflicts", [])
+
+    def resolver_answers(self, content=None, files=None):
+        """Simule l'agent désigné : il répond au message de conflit par l'action resolve_merge."""
+        got = []
+
+        def fake_ask(u, pid, rid, msg, frm, **k):
+            got.append((rid, msg))
+            c = self.conflicts()[-1]
+            res = engine.do_act("u", "p1", rid, {"do": "resolve_merge", "conflict": c["id"], "message": "résolution",
+                                                 "files": files if files is not None else [{"path": "a.txt", "content": content or self.RESOLU}]}, 0, {"n": 0, "t0": time.time()})
+            got.append(res)
+        return fake_ask, got
+
+    def test_auteur_resout_dans_son_worktree_et_le_conflit_est_clos_a_la_resoumission(self):
+        set_policy("author")
+        self.conflict_setup()
+        r, calls = self.approve_carl()
+        c = self.conflicts()[0]
+        self.assertIn("confiée à Carl (auteur)", r)
+        self.assertEqual((c["git"], c["mode"], c["resolver"], c["status"], c["files"], c["branch"], c["target"]), (True, "", "", "ouvert", ["a.txt"], "agent/carl", "develop"))
+        engine.resolve_conflict("u", "p1", c["id"], "a3")                                         # lancé en arrière-plan par la règle (spawn)
+        c = self.conflicts()[0]
+        self.assertEqual((c["mode"], c["resolver"]), ("worktree", "a3"))
+        self.assertEqual(self.mr("a3")["status"], "conflit")
+        self.assertIn("conflit", str(self.act("a3", "sync")).lower())
+        self.work("a3", self.RESOLU)
+        with mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            self.assertEqual(engine.reconcile_conflicts("u", "p1", force=True), [])               # l'auteur a résolu mais pas encore resoumis : pas de fusion sans nouvelle validation
+        self.assertEqual((self.conflicts()[0]["status"], self.mr("a3")["status"]), ("ouvert", "conflit"))
+        self.assertEqual(engine.submit_mr("u", "p1", "a3", "Carl")[0], "submitted")
+        self.assertEqual(self.conflicts()[0]["status"], "résolu")                                 # clos par la nouvelle soumission
+        self.assertEqual(engine.reconcile_conflicts("u", "p1", force=True), [])                  # la revérification n'y touche pas
+        self.assertIn("fusionnée", engine.apply_mr_review("u", "p1", self.mr("a3")["id"], "Alice", "approved", ""))
+        self.assertEqual(sh(self.root, "show", "develop:a.txt"), self.RESOLU)
+
+    def test_agent_designe_fournit_la_resolution_que_l_application_applique(self):
+        set_policy("agent:a1")
+        self.conflict_setup()
+        fake_ask, got = self.resolver_answers()
+        with mock.patch.object(engine, "ask", fake_ask):
+            r, calls = self.approve_carl(sync_funcs=("resolve_conflict",))
+        c = self.conflicts()[0]
+        self.assertIn("confiée à Alice", r)
+        self.assertEqual((c["mode"], c["resolver"], c["status"], c["resolved_by"]), ("direct", "a1", "résolu", "Alice"))
+        self.assertIn("Version de la branche cible (develop)", got[0][1])                        # le résolveur reçoit les trois versions
+        self.assertIn("BOB", got[0][1])
+        self.assertIn("CARL", got[0][1])
+        self.assertIn("l’application fusionne", got[1][0])
+        m = self.mr("a3")
+        self.assertEqual(m["resolution"], {"a.txt": self.RESOLU})                                 # résolution portée par la MR, appliquée à la fusion
+        before = engine.git_repo("u", "p1", proj()).sha("develop")
+        with mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            engine.after_conflict("u", "p1", c["id"])
+        lg = engine.git_repo("u", "p1", proj())
+        self.assertNotEqual(lg.sha("develop"), before)
+        self.assertEqual(sh(lg.root, "show", "develop:a.txt"), self.RESOLU)
+        self.assertEqual(len(sh(lg.root, "rev-list", "--parents", "-1", "develop").split()), 3)   # vrai commit de fusion
+        self.assertEqual(self.mr("a3")["status"], "fusionnée")
+        self.assertNotIn("resolution", self.mr("a3"))
+
+    def test_resolution_incomplete_ou_avec_marqueurs_refusee(self):
+        set_policy("agent:a1")
+        self.conflict_setup()
+        fake_ask, got = self.resolver_answers(files=[{"path": "autre.txt", "content": "x"}])
+        with mock.patch.object(engine, "ask", fake_ask):
+            self.approve_carl(sync_funcs=("resolve_conflict",))
+        self.assertIn("Résolution incomplète : il manque a.txt", got[1][0])
+        fake_ask2, got2 = self.resolver_answers(content="<<<<<<< x\nun\n=======\ndeux\n>>>>>>> y\n")
+        with mock.patch.object(engine, "ask", fake_ask2):
+            engine.resolve_conflict("u", "p1", self.conflicts()[0]["id"], "a1")
+        self.assertIn("marqueurs de conflit", got2[1][0])
+        self.assertEqual(self.conflicts()[0]["status"], "escalade")                               # deux échecs : l'utilisateur décide
+        self.assertTrue([d for d in proj()["decisions"] if d["kind"] == "question"])
+
+    def test_regle_ask_pose_une_question_puis_applique_le_choix(self):
+        self.conflict_setup()                                                                     # politique par défaut : « ask »
+        r, calls = self.approve_carl()
+        self.assertIn("une décision est demandée", r)
+        self.assertEqual([c[0] for c in calls if c[0] == "resolve_conflict"], [])
+        q = next(d for d in proj()["decisions"] if d.get("conflict"))
+        self.assertEqual((q["kind"], q["options"]), ("question", engine.CONFLICT_OPTS))
+        self.assertIn("a.txt", q["question"])
+        fake_ask, got = self.resolver_answers()                                                    # choix 2 : l'agent principal résout
+        with mock.patch.object(engine, "ask", fake_ask), mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            engine.decide("u", "p1", q["id"], "accept", answer=engine.CONFLICT_OPTS[1])
+        c = self.conflicts()[0]
+        self.assertEqual((c["mode"], c["resolver"], c["status"]), ("direct", "a1", "résolu"))
+        self.assertEqual(self.mr("a3")["resolution"], {"a.txt": self.RESOLU})
+
+    def test_je_m_en_occupe_conflit_en_pause_puis_leve_par_la_verification(self):
+        self.conflict_setup()
+        self.approve_carl()
+        q = next(d for d in proj()["decisions"] if d.get("conflict"))
+        engine.decide("u", "p1", q["id"], "accept", answer=engine.CONFLICT_OPTS[2])
+        c = self.conflicts()[0]
+        self.assertEqual((c["status"], c["mode"]), ("pause", "manual"))
+        self.assertIn("dépôt local", self.logs())
+        engine.conflict_action("u", "p1", c["id"], "check")
+        self.assertEqual(self.conflicts()[0]["status"], "pause")                                  # toujours en conflit
+        self.assertIn("toujours présent", self.logs())
+        self.assertIn("en pause", engine.merge_mr("u", "p1", self.mr("a3")["id"]))               # « Réessayer » : toujours en pause, pas de nouvelle question
+        self.assertEqual(len(self.conflicts()), 1)
+        self.act("a3", "sync")                                                                    # l'utilisateur (ici via l'agent) fusionne la cible dans la branche…
+        self.work("a3", self.RESOLU)
+        with mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            engine.conflict_action("u", "p1", c["id"], "check")                                   # …puis vérifie : le conflit est levé et la fusion reprend
+        self.assertEqual(self.conflicts()[0]["status"], "résolu")
+        self.assertEqual(self.mr("a3")["status"], "fusionnée")
+        self.assertEqual(sh(self.root, "show", "develop:a.txt"), self.RESOLU)
+
+    def test_trop_d_essais_escalade_vers_l_utilisateur(self):
+        set_policy("author")
+        self.conflict_setup()
+        self.approve_carl()
+        mid = self.mr("a3")["id"]
+        with mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            for _ in range(2):
+                engine.merge_mr("u", "p1", mid)
+            r = engine.merge_mr("u", "p1", mid)
+        self.assertIn("intervention manuelle", r)
+        c = self.conflicts()[0]
+        self.assertEqual((c["status"], len(self.conflicts())), ("escalade", 1))                   # un seul conflit suivi pour la MR
+        self.assertTrue([d for d in proj()["decisions"] if d.get("conflict") == c["id"] and d["status"] == "attente"])
+
+    def test_mr_close_ferme_le_conflit(self):
+        set_policy("author")
+        self.conflict_setup()
+        self.approve_carl()
+        mp = lambda pp: by_id(pp["mrs"], self.mr("a3")["id"]).update(status="annulée")
+        pp = store.load("u")
+        next(m for m in pp["projects"][0]["mrs"] if m["by_id"] == "a3")["status"] = "annulée"
+        store.wj(store.state_path("u"), pp)
+        engine.reconcile_conflicts("u", "p1", force=True)
+        self.assertEqual(self.conflicts()[0]["status"], "abandonné")
+
+    def test_gitlocal_conflicts_ne_modifie_rien(self):
+        set_policy("author")
+        self.conflict_setup()
+        lg = engine.git_repo("u", "p1", proj())
+        before = lg.sha("develop")
+        info = lg.conflicts("agent/carl", "develop")
+        self.assertEqual([i["path"] for i in info], ["a.txt"])
+        self.assertEqual((info[0]["into"], info[0]["source"]), ("un\nBOB\ntrois\n", "un\nCARL\ntrois\n"))
+        self.assertEqual((lg.sha("develop"), sh(os.path.join(lg.wt_dir, "_integration"), "status", "--porcelain").strip()), (before, ""))
+        self.assertEqual(lg.conflicts("agent/bob", "develop"), [])                                # déjà fusionnée : aucun conflit
+
+
+def by_id(items, i):
+    return next((x for x in items if x["id"] == i), None)
 
 
 if __name__ == "__main__":

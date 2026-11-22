@@ -901,6 +901,22 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             for f in x.get("files") or []:
                 if isinstance(f, dict) and isinstance(f.get("path"), str) and (f.get("content") is None or isinstance(f.get("content"), str)):
                     res[safe_path(f["path"])] = f.get("content")
+            if c.get("git"):                                # git local : on enregistre la résolution, c'est l'application qui fusionne (contrôles compris)
+                m = by_id(p.get("mrs", []), c.get("mr"))
+                if not m or m["status"] not in MR_ACTIVE:
+                    return refuse("La merge request de ce conflit n’est plus ouverte.")
+                with INTEGRATION_LOCK:
+                    info = git_repo(u, pid, p).conflicts(m["from"], m["to"])
+                missing = [i["path"] for i in info if i["path"] not in res]
+                if missing:
+                    return refuse("Résolution incomplète : il manque %s." % ", ".join(missing))
+                if any("<<<<<<<" in (v or "") or ">>>>>>>" in (v or "") for v in res.values()):
+                    return refuse("Ne laisse pas de marqueurs de conflit (<<<<<<<) dans les fichiers.")
+                msg = str(x.get("message") or "Résolution du conflit avec %s" % m["to"])[:300]
+                mp(u, pid, lambda pp: (by_id(pp["mrs"], m["id"]).update(resolution=res, resolution_msg=msg, resolution_by=a["name"]),
+                                       by_id(pp["conflicts"], c["id"]).update(status="résolu", resolved_by=a["name"], done=now())))
+                spawn(after_conflict, u, pid, c["id"])
+                return "Conflit résolu : l’application fusionne la merge request #%s avec ta résolution (contrôles compris)." % m["n"], None
             owner, rp = by_id(p["agents"], c["agent"]), github.Repo(p)
             missing = [i["path"] for i in rp.conflict_info(owner["branch"], rp.work) if i["path"] not in res]
             if missing:
@@ -1072,8 +1088,10 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
             cid = d["conflict"]
             if by_id(snap(u, pid).get("conflicts", []), cid):
                 if ans == opts[2]:
-                    mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).__setitem__("status", "pause"))
-                    log(u, pid, "Système", "Vous", "Conflit mis en pause : résolvez-le sur GitHub puis utilisez « Réessayer » sur la merge request.")
+                    gitc = bool(by_id(snap(u, pid)["conflicts"], cid).get("git"))
+                    mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).update(status="pause", **({"mode": "manual"} if gitc else {})))
+                    log(u, pid, "Système", "Vous", ("Conflit mis en pause : résolvez-le dans le dépôt local (fusionnez la cible dans la branche de l’auteur, ou fusionnez la merge request vous-même) puis utilisez « Vérifier » sur le conflit."
+                                                    if gitc else "Conflit mis en pause : résolvez-le sur GitHub puis utilisez « Réessayer » sur la merge request."))
                 else:
                     mgr = by_id(p["agents"], p.get("mainId"))
                     c = by_id(snap(u, pid)["conflicts"], cid)
@@ -2456,7 +2474,7 @@ def reconcile_conflicts(u, pid, aid=None, force=False, only=None):
     try:
         rp = github.Repo(p)
     except Err:
-        return []
+        rp = None                                          # pas de GitHub : seuls les conflits git (locaux) peuvent être revérifiés
     healed = []
     for c in p.get("conflicts", []):
         if c["status"] not in OPEN_CONFLICT or (aid and c["agent"] != aid) or (only and c["id"] != only):
@@ -2467,6 +2485,17 @@ def reconcile_conflicts(u, pid, aid=None, force=False, only=None):
         owner = by_id(p["agents"], c["agent"])
         if not owner:
             close_conflict(u, pid, c["id"], "abandonné", "agent supprimé")
+            continue
+        if c.get("git"):
+            m = by_id(p.get("mrs", []), c.get("mr"))
+            if not m or m["status"] not in MR_ACTIVE:
+                close_conflict(u, pid, c["id"], "abandonné", "merge request close")
+            elif c.get("mode") != "worktree" and git_conflict_healed(u, pid, p, c):    # l'auteur, lui, clôt le conflit en soumettant à nouveau
+                close_conflict(u, pid, c["id"], "résolu", "levé automatiquement : plus aucun fichier en conflit")
+                healed.append(c["id"])
+                after_conflict(u, pid, c["id"])
+            continue
+        if rp is None:
             continue
         try:
             if rp.conflict_info(owner["branch"], rp.work):
@@ -2672,6 +2701,8 @@ def resolve_conflict(u, pid, cid, rid):
     c = by_id(p.get("conflicts", []), cid)
     if not c or c["status"] not in ("ouvert", "escalade", "pause"):
         return
+    if c.get("git"):
+        return git_resolve_conflict(u, pid, cid, rid)
     owner, rp = by_id(p["agents"], c["agent"]), github.Repo(p)
     for attempt in range(2):
         info = rp.conflict_info(owner["branch"], rp.work)
@@ -2936,6 +2967,9 @@ def git_submit(u, pid, aid, title="", body="", task=""):
         if ex["status"] == "conflit":                                # l'agent a résolu : la MR repart en validation
             mp(u, pid, lambda pp: by_id(pp["mrs"], ex["id"]).update(status="ouverte", note="Reprise après résolution du conflit.", merge_tries=ex.get("merge_tries", 0), tip=lg.sha(br),
                                                                     checks=csum, checks_note=escal))
+            for c in p.get("conflicts", []):                 # l'auteur a résolu dans son worktree : le conflit suivi est clos
+                if c.get("mr") == ex["id"] and c["status"] in OPEN_CONFLICT:
+                    close_conflict(u, pid, c["id"], "résolu", "l’auteur a résolu le conflit et soumis à nouveau")
             spawn(review_mr, u, pid, ex["id"])
             return "submitted", "Merge request #%s reprise après résolution du conflit : l’agent principal va la valider." % ex["n"]
         return "exists", "Une merge request est déjà ouverte (#%s) : elle sera validée." % ex["n"]
@@ -2976,6 +3010,98 @@ def git_push(u, pid, aid=None):
         except Err as e:
             out.append("%s : échec pour %s (%s)" % (a["name"], br, e.msg))
     log(u, pid, "Système", "Vous", "Poussée des branches des agents : " + (" ; ".join(out) if out else "aucune branche à pousser."))
+
+
+def open_git_conflict(u, pid, m, files):
+    """Conflit d'intégration d'une MR git : enregistré dans `conflicts` et traité selon la RÈGLE DU PROJET (`conflict_policy`) :
+    `author` = l'auteur résout dans son worktree (sync, résolution, nouvelle soumission) ; `agent:<id>` = l'agent désigné fournit la résolution
+    (action resolve_merge) que l'application applique ; `ask` = une décision est demandée à l'utilisateur. Au-delà de 3 essais : décision de l'utilisateur."""
+    p = snap(u, pid)
+    owner = by_id(p["agents"], m["by_id"]) or {"id": m["by_id"], "name": m.get("by", "?")}
+    tries = m.get("merge_tries", 0) + 1
+    resolver = pick_resolver(p, owner) if files else None
+
+    def f(pp):
+        mm = by_id(pp["mrs"], m["id"])
+        mm.update(status="conflit", merge_tries=tries, conflict_files=files)
+        mm.pop("resolution", None)
+        c = next((x for x in pp.get("conflicts", []) if x.get("mr") == m["id"] and x["status"] in OPEN_CONFLICT), None)
+        if c:
+            c["files"] = files
+            return c["id"], False
+        c = {"id": uid(), "n": rights.next_seq(pp), "agent": m["by_id"], "branch": m["from"], "target": m["to"], "files": files, "origin": "mr", "mr": m["id"],
+             "task": m.get("task", ""), "title": m.get("title", ""), "body": "", "status": "ouvert", "resolver": "", "tries": 0, "d": now(), "git": True, "mode": ""}
+        pp.setdefault("conflicts", []).append(c)
+        return c["id"], True
+    cid, new = mp(u, pid, f)
+    where = "Merge request #%s en conflit avec %s (fichiers : %s)" % (m["n"], m["to"], ", ".join(files) or "non détaillés")
+    if tries > 3:
+        escalate_conflict(u, pid, cid, "La merge request #%s est toujours en conflit après %d essais." % (m["n"], tries - 1))
+        return "%s : toujours en conflit après %d essais ; intervention manuelle nécessaire, votre décision est demandée (onglet Décisions)." % (where, tries - 1)
+    c = by_id(snap(u, pid)["conflicts"], cid)
+    if not new and c["status"] == "pause":
+        return "%s : conflit en pause, à traiter manuellement (puis « Vérifier » sur le conflit)." % where
+    if not new and c["status"] == "escalade":
+        return "%s : en attente de la décision de l’utilisateur (onglet Décisions)." % where
+    if resolver:
+        spawn(resolve_conflict, u, pid, cid, resolver["id"])
+        return "%s : la résolution est confiée à %s (règle du projet)." % (where, resolver["name"] if resolver["id"] != m["by_id"] else m["by"] + " (auteur)")
+    if new:
+        mp(u, pid, lambda pp: conflict_decision(pp, by_id(pp["conflicts"], cid), ""))
+    return "%s : une décision est demandée à l’utilisateur (onglet Décisions)." % where
+
+
+def git_resolve_conflict(u, pid, cid, rid):
+    """Résolution d'un conflit d'intégration git confiée à `rid`. L'auteur résout dans SON worktree (asynchrone : sa nouvelle soumission clôt le conflit) ;
+    tout autre agent fournit la résolution (resolve_merge), appliquée ensuite par l'application sous contrôles d'intégration."""
+    p = snap(u, pid)
+    c = by_id(p.get("conflicts", []), cid)
+    if not c or c["status"] not in OPEN_CONFLICT:
+        return
+    m = by_id(p.get("mrs", []), c.get("mr"))
+    if not m or m["status"] not in MR_ACTIVE:
+        return close_conflict(u, pid, cid, "abandonné", "merge request close")
+    if rid == c["agent"]:
+        mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).update(resolver=rid, status="ouvert", mode="worktree", tries=1))
+        spawn(ask, u, pid, rid, "[Intégration] Ta merge request #%s est en conflit avec %s sur : %s. Lance sync (les marqueurs apparaissent dans les fichiers), "
+              "résous-les en réécrivant chaque fichier COMPLET avec write_file, fais commit, puis soumets à nouveau avec merge_request." % (m["n"], m["to"], ", ".join(c["files"])), "Intégration MR")
+        return
+    lg = git_repo(u, pid, p)
+    owner = by_id(p["agents"], c["agent"]) or {"name": m.get("by", "?")}
+    for attempt in range(2):
+        with INTEGRATION_LOCK:
+            info = lg.conflicts(m["from"], m["to"])
+        if not info:                                       # plus aucun vrai conflit : la fusion peut reprendre
+            close_conflict(u, pid, cid, "résolu", "levé : plus aucun fichier en conflit")
+            return after_conflict(u, pid, cid)
+        if len(info) > 8 or sum(len(i[k] or "") for i in info for k in ("base", "into", "source")) > 60000:
+            return escalate_conflict(u, pid, cid, "Le conflit est trop volumineux pour une résolution automatique.")
+        mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).update(resolver=rid, status="ouvert", mode="direct", tries=attempt + 1))
+        show = lambda v: ("```\n%s\n```" % v) if v is not None else "(absent)"
+        material = "\n\n".join("### %s\n- Version commune (base) :\n%s\n- Version de la branche cible (%s) :\n%s\n- Version de la branche de %s (%s) :\n%s" % (
+            i["path"], show(i["base"]), m["to"], show(i["into"]), owner["name"], m["from"], show(i["source"])) for i in info)
+        msg = ("[Conflit de fusion] La merge request #%s (branche %s, agent %s) ne peut pas être fusionnée dans %s : conflit (id %s) sur %d fichier(s). "
+               "Fusionne intelligemment les deux versions de chaque fichier, sans marqueur de conflit, puis réponds par UNE action resolve_merge "
+               "{\"conflict\":\"%s\",\"files\":[{\"path\":...,\"content\":<contenu final complet>}],\"message\":...} qui couvre tous les fichiers.\n\n%s") % (
+            m["n"], m["from"], owner["name"], m["to"], cid, len(info), cid, material)
+        try:
+            ask(u, pid, rid, msg, "Conflit")
+        except Err as e:
+            return escalate_conflict(u, pid, cid, "Le résolveur n’a pas pu être sollicité (%s)." % e.msg)
+        if by_id(snap(u, pid)["conflicts"], cid)["status"] == "résolu":
+            return
+    escalate_conflict(u, pid, cid, "La résolution automatique a échoué à deux reprises.")
+
+
+def git_conflict_healed(u, pid, p, c):
+    """Vrai si le conflit d'une MR git n'existe plus (fusion de nouveau possible) ; l'état est lu dans git, sans IA."""
+    m = by_id(p.get("mrs", []), c.get("mr"))
+    try:
+        lg = git_repo(u, pid, p)
+        with INTEGRATION_LOCK:
+            return bool(m) and not lg.conflicts(m["from"], m["to"])
+    except Err:
+        return False
 
 
 def git_mr_view(u, pid, p, m):
@@ -3019,7 +3145,8 @@ def git_merge_mr(u, pid, mid):
                         pre.append("remote injoignable (%s)" % e.msg.splitlines()[0][:120])    # réseau : la fusion locale reste possible
                 lg.ensure_local(m["to"], GIT_INTEGRATION if m["to"] != GIT_INTEGRATION else lg.base)
                 before = lg.sha(m["to"])
-                r = lg.integrate(m["from"], m["to"], message="Merge %s dans %s (MR #%s : %s)" % (m["from"], m["to"], m["n"], m.get("title", "")))
+                r = lg.integrate(m["from"], m["to"], message=m.get("resolution_msg") or "Merge %s dans %s (MR #%s : %s)" % (m["from"], m["to"], m["n"], m.get("title", "")),
+                                 resolutions=m.get("resolution"))
                 if r["state"] == "merged" and checks_active(p, "integration"):          # contrôles sur le RÉSULTAT de la fusion, avant tout push
                     ckr = run_checks(u, pid, p, lg.integration_path(m["to"]), "integration", m["by"])
                     ckf = ckr["failed"]
@@ -3040,14 +3167,10 @@ def git_merge_mr(u, pid, mid):
         spawn(ask, u, pid, m["by_id"], "[Intégration] Les contrôles automatiques échouent sur le résultat de la fusion de ta merge request #%s avec %s (fusion annulée, rien n’est poussé). "
               "Lance sync, corrige, fais commit, puis soumets à nouveau avec merge_request.\n\n%s" % (m["n"], m["to"], checks_fail_text(r["ck"]["results"])), "Intégration MR")
         return "Merge request #%s : contrôles automatiques en échec après intégration (fusion annulée) : renvoyée à %s." % (m["n"], m["by"])
+    if m.get("resolution"):                                # la résolution fournie a servi (ou ne couvre plus le conflit) : on ne la rejoue pas
+        mp(u, pid, lambda pp: (by_id(pp["mrs"], mid) or {}).pop("resolution", None))
     if r["state"] == "conflict":
-        tries = m.get("merge_tries", 0) + 1
-        mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(status="conflit", merge_tries=tries, conflict_files=r["files"]))
-        if tries > 3:
-            return "Merge request #%s : toujours en conflit après %d essais ; intervention manuelle nécessaire (bouton « Réessayer »)." % (m["n"], tries - 1)
-        spawn(ask, u, pid, m["by_id"], "[Intégration] Ta merge request #%s est en conflit avec %s sur : %s. Lance sync (les marqueurs apparaissent dans les fichiers), "
-              "résous-les en réécrivant chaque fichier COMPLET avec write_file, fais commit, puis soumets à nouveau avec merge_request." % (m["n"], m["to"], ", ".join(r["files"])), "Intégration MR")
-        return "Merge request #%s en conflit avec %s (fichiers : %s) : renvoyée à %s pour résolution." % (m["n"], m["to"], ", ".join(r["files"]), m["by"])
+        return open_git_conflict(u, pid, m, r["files"])
     notes, pushed_from = list(pre), False
     if ckf:
         notes.append("contrôles informatifs en échec : %s" % ", ".join(e["name"] for e in ckf))

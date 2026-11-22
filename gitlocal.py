@@ -454,7 +454,7 @@ class LocalGit:
         wt = self._integration_wt(target)
         self.g("reset", "--hard", sha, cwd=wt)
 
-    def integrate(self, branch, target, message=None, squash=False):
+    def integrate(self, branch, target, message=None, squash=False, resolutions=None):
         """Fusionne `branch` dans `target` depuis le worktree d'intégration (sérialiser les appels). {state, sha | files, info}.
         En cas de conflit : merge annulé, `info` = [{path, base, into, source}] (même forme que github.Repo.conflict_info)."""
         wt = self._integration_wt(target)
@@ -467,11 +467,37 @@ class LocalGit:
                 self.g("commit", "-m", msg, cwd=wt)
             return {"state": "merged", "sha": self.sha("HEAD", cwd=wt)}
         files = self.g("diff", "--name-only", "--diff-filter=U", cwd=wt)[1].split()
+        if resolutions and files and not squash and all(f in resolutions for f in files):      # conflit couvert par une résolution fournie : commit de fusion
+            for f in files:
+                if resolutions[f] is None:
+                    self.g("rm", "-f", "--", f, cwd=wt)
+                else:
+                    full = safe_join(wt, f)
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    with open(full, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(resolutions[f])
+                    self.g("add", "--", f, cwd=wt)
+            self.g("commit", "-m", msg, cwd=wt)
+            return {"state": "merged", "sha": self.sha("HEAD", cwd=wt), "resolved": files}
         info = [{"path": f, "base": self._blob(wt, ":1:", f), "into": self._blob(wt, ":2:", f), "source": self._blob(wt, ":3:", f)} for f in files]
         self.g("reset", "--hard", "HEAD", cwd=wt) if squash else self.abort(wt)
         if not files:
             raise Err(409, "git merge a échoué : %s" % o[-300:])
         return {"state": "conflict", "files": files, "info": info}
+
+    def conflicts(self, branch, target):
+        """Conflits qu'aurait la fusion de `branch` dans `target`, SANS rien modifier : [{path, base, into, source}] (vide = fusion possible)."""
+        wt = self._integration_wt(target)
+        if self.g("merge-base", "--is-ancestor", branch, target, cwd=wt, check=False)[0] == 0:
+            return []
+        rc, _ = self.g("merge", "--no-commit", "--no-ff", branch, cwd=wt, check=False)
+        if rc == 0:
+            self.abort(wt)
+            return []
+        files = self.g("diff", "--name-only", "--diff-filter=U", cwd=wt)[1].split()
+        info = [{"path": f, "base": self._blob(wt, ":1:", f), "into": self._blob(wt, ":2:", f), "source": self._blob(wt, ":3:", f)} for f in files]
+        self.abort(wt)
+        return info
 
     def _blob(self, wt, stage, path):
         rc, o = self.g("show", stage + path, cwd=wt, check=False)
