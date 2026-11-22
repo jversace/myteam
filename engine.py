@@ -156,7 +156,7 @@ def git_branch_hint(p, a):
     return gitlocal.task_branch(a["name"], t["id"], t["title"]) if t else "task/%s/<tâche> (créée automatiquement à chaque tâche)" % gitlocal.slug(a["name"], "agent", 20)
 
 
-def git_branch(lg, p, a, tgt):
+def git_branch(lg, p, a, tgt, notes=None):
     """Branche voulue pour l'agent, ou None = garder celle de son worktree.
     - « agent » : sa branche historique ;
     - « task » : tant que son ancienne branche (a["branch"]) porte du travail non fusionné dans la cible, il la garde (branche HÉRITÉE : elle doit être
@@ -166,6 +166,14 @@ def git_branch(lg, p, a, tgt):
     old = (a.get("branch") or "").strip()
     if old and old not in (lg.base, tgt, GIT_INTEGRATION) and lg.unmerged(old, tgt):
         lg.ensure_local(old, tgt)
+        ts = [t for t in p.get("tasks", []) if t.get("who") == a["id"] and t.get("status") == "en cours"]
+        if len(ts) == 1 and not any(m.get("from") == old and m.get("status") in MR_ACTIVE for m in p.get("mrs", [])):
+            new = gitlocal.task_branch(a["name"], ts[0]["id"], ts[0]["title"])        # une seule tâche en cours, aucune MR ouverte : l'ancienne branche devient sa branche
+            if not lg.branch_exists(new):
+                lg.rename_branch(old, new)
+                if notes is not None:
+                    notes.append("Branche héritée %s renommée en %s (une seule tâche en cours : son travail non fusionné lui appartient)." % (old, new))
+                return new
         return old
     t = git_task_of(p, a)
     return gitlocal.task_branch(a["name"], t["id"], t["title"]) if t else None
@@ -192,16 +200,18 @@ def git_workspace(u, pid, p, a):
     nouvelle tâche démarre, il change de branche (travail non commité enregistré en « WIP », ancienne branche supprimée si elle est fusionnée).
     Sans tâche en cours, il reste sur sa branche ; sans worktree, il prend la branche libre `task/<prénom>/libre`."""
     lg = git_repo(u, pid, p)
-    tgt = git_target(p)
+    tgt, notes = git_target(p), []
     with GIT_LOCK:
         lg.ensure_local(tgt, GIT_INTEGRATION if tgt != GIT_INTEGRATION else lg.base)
         cur = lg.worktrees().get(os.path.realpath(lg._wt_path(a["name"])))
-        br = git_branch(lg, p, a, tgt) or cur or gitlocal.task_branch(a["name"], "libre")
+        br = git_branch(lg, p, a, tgt, notes) or cur or gitlocal.task_branch(a["name"], "libre")
         if br in (lg.base, tgt, GIT_INTEGRATION):
             raise Err(403, "Ta branche (%s) est une branche de base ou de travail : l'écriture y est interdite." % br)
         path, prev = lg.switch(a["name"], br, tgt, agent=a["name"])
         if prev and prev.startswith("task/") and prev != br and lg.merged(prev, tgt):
             lg.delete_branch(prev)
+    for n in notes:
+        log(u, pid, "Système", a["name"], n)
     return lg, path
 
 
@@ -1389,6 +1399,23 @@ def lock_act(u, pid, p, a, x, kind, mn, t0=0):
     return m, m
 
 
+def git_stop_note(u, pid, p, a, cancel):
+    """Arrêt d'un agent en mode git : l'annulation écarte ses modifications NON commitées (ses commits restent) ; un simple arrêt les conserve."""
+    try:
+        lg = git_repo(u, pid, p)
+        with GIT_LOCK:
+            wt = lg._wt_path(a["name"])
+            if os.path.realpath(wt) not in lg.worktrees():
+                return ""
+            if cancel:
+                files = lg.discard(wt)
+                return " Worktree git remis à son dernier commit (%d fichier(s) non commité(s) écarté(s)%s)." % (len(files), (" : " + ", ".join(files[:8])) if files else "")
+            st = lg.status(wt)
+            return (" Modifications non commitées conservées dans son worktree (%d fichier(s)) : enregistrées en « WIP » au prochain changement de tâche, ou commitées à sa reprise." % len(st)) if st else ""
+    except Err as e:
+        return " Worktree git non traité : %s." % e.msg
+
+
 def stop_agent(u, pid, aid, cancel=False, by="Vous", reason=""):
     """Arrête le travail d'un agent : ses actions suivantes sont refusées, ses verrous sont libérés ; avec `cancel`, les fichiers qu'il avait
     verrouillés sont remis dans leur état d'avant. Sa tâche passe « en attente » (à relancer). Un appel IA déjà parti n'est pas interrompu,
@@ -1404,6 +1431,7 @@ def stop_agent(u, pid, aid, cancel=False, by="Vous", reason=""):
         if pe["agent"] == aid and w and w["u"] == u:
             w["ev"].set()
     freed, restored, lost = locks.release_agent(u, pid, aid, restore=cancel)
+    gnote = git_stop_note(u, pid, p, a, cancel) if git_agent(p, a) else ""
 
     def f(pp):
         ag = by_id(pp["agents"], aid)
@@ -1421,7 +1449,7 @@ def stop_agent(u, pid, aid, cancel=False, by="Vous", reason=""):
     txt = "%s %s par %s (%s). Verrous libérés : %s.%s%s" % (
         a["name"], "annulé (travail défait)" if cancel else "arrêté", by, reason, ", ".join(freed) or "aucun",
         (" Fichiers remis dans leur état d’avant : %s." % ", ".join(restored)) if restored else "",
-        (" Non restaurables (pas de sauvegarde) : %s." % ", ".join(lost)) if lost else "")
+        (" Non restaurables (pas de sauvegarde) : %s." % ", ".join(lost)) if lost else "") + gnote
     log(u, pid, "Système", "Vous", txt + " Sa tâche est « en attente » : relancez-la quand vous voulez.")
     log(u, pid, "Système", a["name"], "Tu as été %s : %s. Tes verrous ont été libérés ; attends une nouvelle consigne." % ("arrêté, ton travail est annulé" if cancel else "arrêté", reason))
     return txt
@@ -3104,6 +3132,35 @@ def git_conflict_healed(u, pid, p, c):
         return False
 
 
+def git_push_release(u, pid):
+    """À la demande : pousse la base, `develop`, la branche de la release en cours et les tags (échec de la poussée à la publication, remote revenu…).
+    Chaque branche est réalignée sur le remote (fusion, jamais de force) avant d'être poussée."""
+    p = snap(u, pid)
+    if not git_mode(p):
+        return log(u, pid, "Système", "Vous", "Mode git local non activé : rien à pousser.")
+    try:
+        lg = git_repo(u, pid, p)
+    except Err as e:
+        return log(u, pid, "Système", "Vous", "Poussée impossible : %s" % e.msg)
+    if not lg.remote:
+        return log(u, pid, "Système", "Vous", "Aucun remote défini pour le projet : rien à pousser.")
+    out = []
+    with INTEGRATION_LOCK:
+        for b in [lg.base, GIT_INTEGRATION] + ([p["cycle"]["branch"]] if p.get("cycle") else []):
+            if not lg.has("refs/heads/" + b):
+                continue
+            try:
+                out.append("%s %s" % (b, "poussée" if lg.push_target(b) == "pushed" else "à jour"))
+            except Err as e:
+                out.append("%s : échec (%s)" % (b, e.msg))
+        try:
+            lg.push_tags()
+            out.append("tags poussés")
+        except Err as e:
+            out.append("tags : échec (%s)" % e.msg)
+    log(u, pid, "Système", "Vous", "Poussée de la base, de develop et des tags : " + " ; ".join(out) + ".")
+
+
 def git_mr_view(u, pid, p, m):
     """(commits, fichiers, diff) d'une merge request git, pour le message du validateur."""
     c = git_repo(u, pid, p).compare(m["to"], m["from"], budget=15000)
@@ -3611,6 +3668,7 @@ def start(u, j):
             "agent_stop": lambda: stop_agent(u, pid, j.get("agentId"), bool(j.get("cancel")), "Vous", str(j.get("reason", ""))[:300]),
             "localdir_check": lambda: localdir_check(u, pid),
             "git_push": lambda: git_push(u, pid, j.get("agentId") or None),
+            "git_push_release": lambda: git_push_release(u, pid),
             "check_remove": lambda: check_remove(u, pid, j.get("checkId")),
             "check_restore": lambda: check_restore(u, pid, j.get("histId")),
             "check_baseline": lambda: check_baseline(u, pid, j.get("checkId")),

@@ -546,7 +546,7 @@ class ParTache(Base):
         st = store.load("u")
         del st["projects"][0]["branches"]                                                          # bascule vers une branche par tâche
         store.wj(store.state_path("u"), st)
-        set_tasks(task("t1", "a2", "Nouvelle"))
+        set_tasks(task("t1", "a2", "Nouvelle"), task("t2", "a2", "Autre", started=2))             # deux tâches en cours : pas de renommage automatique
         self.act("a2", "status")
         self.assertEqual(self.branch(), "agent/bob")                                               # travail non fusionné : branche héritée conservée
         self.assertIn("task/bob/", engine.repo_text(proj(), proj()["agents"][1]))
@@ -555,7 +555,7 @@ class ParTache(Base):
         self.assertEqual(m["from"], "agent/bob")
         engine.apply_mr_review("u", "p1", m["id"], "Alice", "approved", "")
         self.act("a2", "status")
-        self.assertEqual(self.branch(), "task/bob/t1-nouvelle")                                    # héritée fusionnée : passage aux branches par tâche
+        self.assertEqual(self.branch(), "task/bob/t2-autre")                                       # héritée fusionnée : passage aux branches par tâche
         self.assertTrue(self.lg().branch_exists("agent/bob"))                                      # l'ancienne branche n'est pas supprimée
         self.assertTrue(os.path.exists(os.path.join(self.wt("Bob"), "ancien.txt")))
 
@@ -1309,6 +1309,120 @@ class ConflitsRegle(Base):
 
 def by_id(items, i):
     return next((x for x in items if x["id"] == i), None)
+
+
+class FinDeChantier(Base):
+    """Branche héritée renommée, annulation d'un agent (modifications non commitées), poussée de la release à la demande."""
+    BRANCHES = "task"
+
+    def lg(self):
+        return engine.git_repo("u", "p1", proj())
+
+    def legacy(self):
+        st = store.load("u")
+        st["projects"][0]["branches"] = "agent"                                                    # ancien fonctionnement : une branche par agent
+        store.wj(store.state_path("u"), st)
+        self.act("a2", "write_file", path="ancien.txt", content="a\n")
+        self.act("a2", "commit", message="avant la bascule")
+        st = store.load("u")
+        del st["projects"][0]["branches"]
+        store.wj(store.state_path("u"), st)
+
+    def test_branche_heritee_renommee_si_une_seule_tache_en_cours(self):
+        self.legacy()
+        set_tasks(task("t1", "a2", "Nouvelle"))
+        self.act("a2", "status")
+        lg = self.lg()
+        self.assertEqual(lg.current_branch(self.wt("Bob")), "task/bob/t1-nouvelle")
+        self.assertFalse(lg.branch_exists("agent/bob"))                                            # renommée, pas dupliquée
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Bob"), "ancien.txt")))                # son travail non fusionné est conservé
+        self.assertIn("agent/bob renommée en task/bob/t1-nouvelle", self.logs())
+        self.act("a2", "status")                                                                   # idempotent
+        self.assertEqual(lg.current_branch(self.wt("Bob")), "task/bob/t1-nouvelle")
+
+    def test_pas_de_renommage_avec_une_mr_ouverte_sur_l_ancienne_branche(self):
+        self.legacy()
+        st = store.load("u")
+        st["projects"][0]["branches"] = "agent"
+        store.wj(store.state_path("u"), st)
+        engine.submit_mr("u", "p1", "a2", "Ancien travail")                                         # MR ouverte depuis agent/bob
+        st = store.load("u")
+        del st["projects"][0]["branches"]
+        store.wj(store.state_path("u"), st)
+        set_tasks(task("t1", "a2", "Nouvelle"))
+        self.act("a2", "status")
+        self.assertEqual(self.lg().current_branch(self.wt("Bob")), "agent/bob")                    # la MR garde son nom de branche
+
+    def test_annulation_ecarte_les_modifications_non_commitees_seulement(self):
+        self.act("a2", "write_file", path="garde.txt", content="v1\n")
+        self.act("a2", "commit", message="premier")
+        self.act("a2", "write_file", path="garde.txt", content="v2 non commitée\n")
+        self.act("a2", "write_file", path="neuf.txt", content="x\n")
+        txt = engine.stop_agent("u", "p1", "a2", cancel=True)
+        self.assertIn("2 fichier(s) non commité(s) écarté(s)", txt)
+        self.assertIn("garde.txt", txt)
+        wt = self.wt("Bob")
+        self.assertEqual(self.lg().status(wt), [])
+        with open(os.path.join(wt, "garde.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "v1\n")                                                     # le commit est conservé
+        self.assertFalse(os.path.exists(os.path.join(wt, "neuf.txt")))
+        self.assertEqual(len(sh(wt, "log", "--format=%s").split("\n")) >= 2, True)
+
+    def test_simple_arret_conserve_les_modifications(self):
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        txt = engine.stop_agent("u", "p1", "a2", cancel=False)
+        self.assertIn("conservées", txt)
+        self.assertTrue(os.path.exists(os.path.join(self.wt("Bob"), "x.txt")))
+        locks.STOP.clear()
+        set_tasks(task("t2", "a2", "Suite"))
+        self.act("a2", "status")                                                                   # changement de tâche : enregistrées en WIP, rien de perdu
+        self.assertIn("WIP", sh(self.root, "log", "-1", "--format=%s", "task/bob/libre"))
+
+    def test_annulation_pendant_une_synchronisation_en_conflit(self):
+        with open(os.path.join(self.root, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("un\ndeux\n")
+        for who, txt in (("a2", "un\nBOB\n"), ("a3", "un\nCARL\n")):
+            self.act(who, "write_file", path="a.txt", content=txt)
+            self.act(who, "commit", message=who)
+        self.lg().integrate("task/bob/libre", "develop")
+        self.assertIn("conflit", str(self.act("a3", "sync")).lower())
+        with open(os.path.join(self.wt("Carl"), "a.txt"), encoding="utf-8") as f:
+            self.assertIn("<<<<<<<", f.read())
+        engine.stop_agent("u", "p1", "a3", cancel=True)
+        locks.STOP.clear()
+        self.assertEqual(self.lg().status(self.wt("Carl")), [])
+        with open(os.path.join(self.wt("Carl"), "a.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "un\nCARL\n")                                               # retour à son dernier commit
+        self.assertIn("Synchronisation", str(self.act("a3", "sync")))                              # le worktree est de nouveau utilisable
+
+
+class PousseeRelease(RemoteBase):
+    def test_reprise_de_la_poussee_apres_un_echec(self):
+        engine.cycle_start("u", "p1", "v1.0")
+        self.act("a2", "write_file", path="x.txt", content="x\n")
+        self.act("a2", "commit", message="x")
+        engine.submit_mr("u", "p1", "a2", "Bob")
+        engine.apply_mr_review("u", "p1", self.mid("a2"), "Alice", "approved", "")
+        shutil.rmtree(self.remote)                                                                 # remote injoignable à la publication
+        engine.release("u", "p1", "v1.0", "n")
+        self.assertIn("Attention", self.logs())
+        sh(self.tmp, "init", "--bare", "-b", "main", self.remote)                                  # le remote est revenu (vide)
+        engine.git_push_release("u", "p1")
+        refs = sh(self.tmp, "ls-remote", self.remote)
+        for r in ("refs/heads/main", "refs/heads/develop", "refs/tags/v1.0"):
+            self.assertIn(r, refs)
+        self.assertEqual(self.remote_show("main:x.txt"), "x\n")
+        self.assertIn("tags poussés", self.logs())
+
+    def test_sans_remote(self):
+        st = store.load("u")
+        st["projects"][0]["repo"]["url"] = ""
+        store.wj(store.state_path("u"), st)
+        engine.GIT_OK.clear()
+        shutil.rmtree(self.root)
+        os.makedirs(self.root)
+        engine.git_push_release("u", "p1")
+        self.assertIn("Aucun remote", self.logs())
 
 
 if __name__ == "__main__":

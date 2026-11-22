@@ -19,7 +19,7 @@ from store import Err
 
 ALLOWED = {"init", "clone", "fetch", "push", "ls-remote", "remote", "worktree", "branch", "checkout", "add", "rm", "commit",
            "status", "diff", "log", "show", "grep", "merge", "merge-base", "rev-parse", "rev-list", "for-each-ref", "ls-files",
-           "symbolic-ref", "update-ref", "reset", "cat-file", "check-ref-format", "tag", "--version"}
+           "symbolic-ref", "update-ref", "reset", "cat-file", "check-ref-format", "tag", "clean", "--version"}
 NETWORK = {"clone", "fetch", "push", "ls-remote"}
 KEEP_ENV = ("PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT", "SystemDrive", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR",
             "APPDATA", "LOCALAPPDATA", "SSH_AUTH_SOCK", "SSH_ASKPASS")
@@ -315,6 +315,24 @@ class LocalGit:
                 raise Err(404, "Branche source « %s » introuvable" % src)
             self.g("checkout", "-b", branch, src, cwd=path)
         return path, prev
+
+    def rename_branch(self, old, new):
+        """Renomme une branche locale (un worktree qui l'occupe la suit)."""
+        self.check_branch(new)
+        if not self.branch_exists(old):
+            raise Err(404, "Branche %s introuvable" % old)
+        if self.branch_exists(new):
+            raise Err(409, "La branche %s existe déjà" % new)
+        self.g("branch", "-m", old, new)
+
+    def discard(self, wt):
+        """Annulation : écarte tout travail non commité du worktree (merge en cours annulé, fichiers suivis remis au dernier commit, fichiers non suivis
+        et non ignorés supprimés). Retourne la liste des chemins écartés. Les commits déjà faits ne sont pas touchés."""
+        files = [i["path"] for i in self.status(wt)]
+        self.abort(wt)
+        self.g("reset", "--hard", "HEAD", cwd=wt)
+        self.g("clean", "-fd", cwd=wt)
+        return files
 
     def unmerged(self, branch, target):
         """Nombre de commits de `branch` (locale, sinon `origin/<branch>`) absents de `target` ; 0 si la branche n'existe pas."""
