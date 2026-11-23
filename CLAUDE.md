@@ -171,6 +171,7 @@ Cause des « agents qui s'arrêtent » corrigée ici : avant, rien ne lançait l
 
 ## Conventions de travail
 - **Champs de dialogue** (`chatInput`, ids `ci` onglet agent et `gi` vue globale) : `<textarea>` multiligne à hauteur auto (max 260 px, redimensionnable) ; Entrée envoie, Maj+Entrée insère un retour à la ligne (la saisie IME n'envoie pas). Le motif de refus d'une décision (`dn-`) est aussi un `<textarea>`.
+- **Pièces jointes** (champs `ci`/`gi`) : fichiers texte glissés, collés ou choisis via « 📎 Joindre » ; lus côté navigateur (`addFiles`, état `ATT`, hors `data-keep`) puis ajoutés au message par `withAtt` sous forme de blocs `[Fichier joint : nom]` entourés d'une clôture de backticks adaptée. Aucun changement serveur : le job `say` reçoit un simple texte (le journal affiche donc le contenu joint). Limites : 200 Ko par fichier, 500 Ko au total ; les fichiers binaires (images, PDF…) sont refusés avec une alerte.
 - Modifier `static/index.html` par remplacements ciblés ; vérifier la syntaxe JS (extraire le `<script>` et `node --check`).
 - Lancer `python -m unittest discover -s tests` avant tout commit. Les tests n'utilisent ni réseau ni clé (faux GitHub, IA scriptée).
 - Ne jamais committer `data/`, de token ni de clé API. Ne jamais tester sur le vrai dépôt sans supprimer ensuite les branches créées.
