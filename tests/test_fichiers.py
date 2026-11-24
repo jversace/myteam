@@ -162,6 +162,43 @@ class Edition(unittest.TestCase):
         self.act("a2", "write_chunk", path="d.py", index=1, total=2, content="y")
         self.assertEqual(len(engine.CHUNK_BUF), 1)                                  # le lot orphelin est purgé
 
+    def test_edit_file_tient_le_verrou_pendant_toute_l_operation(self):
+        vus = []
+        vrai = engine.raw_read
+
+        def espion(u, pid, p, a, path, t0):
+            vus.append([(l["by"], l["path"]) for l in proj().get("locks", [])])
+            return vrai(u, pid, p, a, path, t0)
+        with mock.patch.object(engine, "raw_read", espion):
+            note, back = self.act("a2", "edit_file", path="big.py", edits=[{"old": "ligne 001", "new": "Z"}])
+        self.assertIsNone(back)
+        self.assertEqual(vus, [[("a2", "big.py")]])                              # verrou déjà pris au moment de la lecture
+        self.assertEqual(proj()["locks"], [])                                    # rendu ensuite
+        self.assertNotIn("verrou conservé", note)
+
+    def test_edit_file_rend_le_verrou_meme_en_cas_de_refus(self):
+        self.act("a2", "edit_file", path="big.py", edits=[{"old": "introuvable", "new": "Z"}])
+        self.assertEqual(proj()["locks"], [])
+
+    def test_edit_file_conserve_un_verrou_deja_tenu(self):
+        import locks
+        ok, _ = locks.acquire("u", "p1", "a2", ["big.py"])
+        note, back = self.act("a2", "edit_file", path="big.py", edits=[{"old": "ligne 001", "new": "Z"}])
+        self.assertIn("verrou conservé", note)
+        self.assertEqual([l["by"] for l in proj()["locks"]], ["a2"])
+
+    def test_garde_fou_aussi_sous_verrou(self):
+        vus = []
+        vrai = engine.raw_read
+
+        def espion(u, pid, p, a, path, t0):
+            vus.append(len(proj().get("locks", [])))
+            return vrai(u, pid, p, a, path, t0)
+        with mock.patch.object(engine, "raw_read", espion):
+            self.act("a2", "write_file", path="big.py", content=BIG[:3000])
+        self.assertEqual(vus, [1])
+        self.assertEqual(proj()["locks"], [])
+
     def test_write_chunk_agents_separes(self):
         self.act("a2", "write_chunk", path="c.py", index=1, total=2, content="A")
         self.act("a3", "write_chunk", path="c.py", index=2, total=2, content="B")

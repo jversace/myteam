@@ -1364,6 +1364,27 @@ def raw_read(u, pid, p, a, path, t0):
     return (t, None) if note is None else (None, t)
 
 
+def locked_rmw(u, pid, p, a, path, t0, fn):
+    """Exécute `fn()` (lecture puis écriture du fichier) en tenant le verrou du fichier pendant TOUTE l'opération quand l'agent travaille sur le répertoire
+    local partagé : personne ne peut modifier le fichier entre la lecture et l'écriture. Verrou déjà tenu par l'agent : conservé ; pris ici : rendu à la fin.
+    Aux autres modes (worktree git personnel, GitHub) : pas de verrou, `fn()` directement."""
+    if git_agent(p, a) or not local_agent(p, a):
+        return fn()
+    held = locks.held_by(p, path, a["id"])
+    if not held:
+        ok, m = locks.acquire(u, pid, a["id"], [path], note="écriture", since=t0, log=lambda m: log(u, pid, "Système", "Vous", m))
+        if not ok:
+            return (lambda m: (m, m))("Écriture refusée : " + m)
+    try:
+        r = fn()
+    finally:
+        if not held:
+            locks.release(u, pid, a["id"], [path])
+    if not held and isinstance(r, tuple) and isinstance(r[0], str):
+        r = (r[0].replace(" (verrou conservé)", ""), r[1])           # verrou éphémère : rendu, pas conservé
+    return r
+
+
 def file_act(u, pid, p, a, x, kind, t0=0):
     """Actions fichiers : lecture/écriture/suppression (repo_act) et, au-dessus, `edit_file` (remplacements ciblés) et `write_chunk`
     (écriture en morceaux reconstitués ici), plus le garde-fou contre l'écriture d'un fichier tronqué."""
@@ -1374,12 +1395,16 @@ def file_act(u, pid, p, a, x, kind, t0=0):
         return chunk_act(u, pid, p, a, x, t0)
     if kind == "write_file" and not x.get("confirm_shrink"):
         path = safe_path(x.get("path"), write=True)
-        old, _ = raw_read(u, pid, p, a, path, t0)
-        new = str(x.get("content", ""))
-        if old is not None and len(old) >= SHRINK_GUARD[0] and len(new) < len(old) * SHRINK_GUARD[1]:
+
+        def guarded():
+            old, _ = raw_read(u, pid, p, a, path, t0)
+            new = str(x.get("content", ""))
+            if old is None or len(old) < SHRINK_GUARD[0] or len(new) >= len(old) * SHRINK_GUARD[1]:
+                return repo_act(u, pid, p, a, x, kind, t0)
             return refuse("Écriture refusée : %s fait %d caractères et ton contenu seulement %d. write_file remplace le fichier ENTIER : ce contenu semble tronqué ou incomplet "
                           "(les anciens résultats de lecture sont abrégés dans ta mémoire). Rien n’a été écrit. Modifie une partie avec edit_file (relis d’abord la zone avec read_file "
                           "from_line/to_line), écris un gros fichier avec write_chunk, ou, si le raccourcissement est voulu, renvoie l’action avec \"confirm_shrink\":true." % (path, len(old), len(new)))
+        return locked_rmw(u, pid, p, a, path, t0, guarded)
     return repo_act(u, pid, p, a, x, kind, t0)
 
 
@@ -1392,26 +1417,28 @@ def edit_act(u, pid, p, a, x, t0=0):
         edits = [{"old": x.get("old"), "new": x.get("new", ""), "all": x.get("all")}]
     if not isinstance(edits, list) or not edits or len(edits) > 50 or not all(isinstance(e, dict) and str(e.get("old", "")) for e in edits):
         return refuse("Édition refusée : « edits » doit être une liste de 1 à 50 objets {\"old\":\"texte exact existant\",\"new\":\"remplacement\"}.")
-    cur, why = raw_read(u, pid, p, a, path, t0)
-    if cur is None:
-        return refuse("Édition refusée : " + why)
-    crlf = "\r\n" in cur
-    for i, e in enumerate(edits, 1):
-        old, new = str(e["old"]), str(e.get("new", ""))
-        if crlf and "\r\n" not in old:                      # fichier Windows : l'agent écrit des fins de ligne « \n »
-            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
-        n = cur.count(old)
-        if n == 0:
-            return refuse("Édition %d refusée : le texte « old » est introuvable dans %s (copie-le exactement, espaces et fins de ligne compris : relis la zone avec read_file from_line/to_line). Aucune modification n’a été faite." % (i, path))
-        if n > 1 and not e.get("all"):
-            return refuse("Édition %d refusée : le texte « old » apparaît %d fois dans %s. Allonge-le avec le contexte voisin pour qu’il soit unique, ou ajoute \"all\":true. Aucune modification n’a été faite." % (i, n, path))
-        cur = cur.replace(old, new) if e.get("all") else cur.replace(old, new, 1)
-    if len(cur) > 200000:
-        raise Err(413, "Fichier trop volumineux (200 000 caractères maximum)")
-    r = repo_act(u, pid, p, a, {"do": "write_file", "path": path, "content": cur, "message": str(x.get("message") or "") or "edit %s" % path}, "write_file", t0)
-    if r[1] is None:
-        return "%s — %d modification(s)" % (r[0], len(edits)), None
-    return r
+    def run():
+        cur, why = raw_read(u, pid, p, a, path, t0)
+        if cur is None:
+            return refuse("Édition refusée : " + why)
+        crlf = "\r\n" in cur
+        for i, e in enumerate(edits, 1):
+            old, new = str(e["old"]), str(e.get("new", ""))
+            if crlf and "\r\n" not in old:                      # fichier Windows : l'agent écrit des fins de ligne « \n »
+                old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+            n = cur.count(old)
+            if n == 0:
+                return refuse("Édition %d refusée : le texte « old » est introuvable dans %s (copie-le exactement, espaces et fins de ligne compris : relis la zone avec read_file from_line/to_line). Aucune modification n’a été faite." % (i, path))
+            if n > 1 and not e.get("all"):
+                return refuse("Édition %d refusée : le texte « old » apparaît %d fois dans %s. Allonge-le avec le contexte voisin pour qu’il soit unique, ou ajoute \"all\":true. Aucune modification n’a été faite." % (i, n, path))
+            cur = cur.replace(old, new) if e.get("all") else cur.replace(old, new, 1)
+        if len(cur) > 200000:
+            raise Err(413, "Fichier trop volumineux (200 000 caractères maximum)")
+        r = repo_act(u, pid, p, a, {"do": "write_file", "path": path, "content": cur, "message": str(x.get("message") or "") or "edit %s" % path}, "write_file", t0)
+        if r[1] is None:
+            return "%s — %d modification(s)" % (r[0], len(edits)), None
+        return r
+    return locked_rmw(u, pid, p, a, path, t0, run)
 
 
 def chunk_act(u, pid, p, a, x, t0=0):
