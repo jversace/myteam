@@ -9,7 +9,7 @@
 | Id | Règle (reformulée) |
 |---|---|
 | R01 | Agent d'une équipe de développement ; répond en français, concis et factuel. |
-| R02 | Travaille uniquement sur sa branche, jamais sur la branche de base. La publication de la release (fusion + tag) est faite par l'utilisateur ; le texte du prompt dit encore « l'agent principal » (à corriger, décision du 25 nov. 2026). |
+| R02 | Travaille uniquement sur sa branche, jamais sur la branche de base. La publication de la release (fusion + tag) est faite par l'utilisateur ; le texte du prompt dit encore « l'agent principal » (à corriger, décision du 24 nov. 2026). |
 | R03 | Lit/écrit via `list_files`, `read_file`, `write_file`, `edit_file`, `write_chunk`, `delete_file` ; `write_file` remplace le fichier entier (création ou petit fichier) ; pour modifier un fichier existant : lire la zone (`read_file` `from_line`/`to_line`) puis `edit_file` ; gros fichier : `write_chunk` ; les anciens résultats de lecture sont abrégés (relire la zone juste avant d'éditer) ; commits clairs ; ne touche ni à `.github/` ni aux `.agents/` des autres. |
 | R04 | Son fichier de contexte (`.agents/<prénom>.md` sur sa branche) fait foi : le respecter, le mettre à jour avec l'action `context` à chaque décision/convention durable. |
 | R05 | Respecte ses droits ; une création soumise à validation va dans la boîte « Décisions » : continuer ce qui n'en dépend pas, ne pas la recréer. |
@@ -133,6 +133,6 @@
 5. **R06 (s'arrêter sur la tâche) vs R19 (reprendre sans attendre)** : l'exception « sauf décision en attente » n'existe que dans le code (E03), pas dans le texte de R19.
 6. **R14 (ne pas s'arrêter) vs R06 (ne pas improviser)** : la frontière entre erreur technique et décision structurante n'est pas définie.
 7. **R15 vs T01** : la règle dit « le principal ou le QA vérifie » ; le code exige `bug_verify` libre et exclut l'assigné ; l'utilisateur peut contourner depuis l'IHM.
-8. **R02 / G03** : le prompt dit que la release finale est réalisée par l'agent principal, alors que le code la publie par une tâche lancée par l'utilisateur (G03, G08). Décision du 25 nov. 2026 : l'utilisateur publie ; texte du prompt à corriger.
+8. **R02 / G03** : le prompt dit que la release finale est réalisée par l'agent principal, alors que le code la publie par une tâche lancée par l'utilisateur (G03, G08). Décision du 24 nov. 2026 : l'utilisateur publie ; texte du prompt à corriger.
 9. **D02 vs D01** : les droits par défaut sont dupliqués dans `rights.py` et `static/index.html` (risque de divergence).
 10. **R03 « contenu complet » (ancien texte) vs F04 / F02** : `write_file` remplace le fichier entier mais est refusé s'il raccourcit fortement un fichier existant ; modifier un fichier se fait par `edit_file`. R03 est corrigée (24 nov. 2026) ; les messages de conflit de fusion (« réécris chaque fichier COMPLET avec `write_file` », `engine.py`) restent à aligner sur `edit_file`.

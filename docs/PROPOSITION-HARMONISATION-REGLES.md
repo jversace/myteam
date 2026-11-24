@@ -2,7 +2,7 @@
 
 > **Mise à jour (24 nov. 2026)** : prise en compte des évolutions « gros fichiers » déjà implémentées (commits `5c52789`, `08cd9c5`, `b211c17`, voir `CLAUDE.md`, section « Gros fichiers ») : lecture par plage, `edit_file`, `write_chunk`, garde-fou anti-troncature, verrou tenu pendant l'édition, historique abrégé selon un budget, avertissement de relecture. Elles touchent R03, l'exception de sécurité (§1), le socle commun et les modules (§3), les contradictions (§4) et la mise en œuvre (§5). Le reste de la proposition est inchangé.
 
-> **Décisions du 25 nov. 2026** : (a) conflit « règle large plus récente vs règle spécifique » → **une question à la saisie** (déjà le cas au §1.3) ; (b) **la release est publiée par l'utilisateur** : le texte « la publication revient à l'agent principal » est retiré du module GitHub (le code fait déjà ainsi : la publication est une tâche lancée depuis l'interface, pas une action d'agent) ; (c) question sur l'ordre des portées : voir §6.
+> **Décisions du 24 nov. 2026** : (a) conflit « règle large plus récente vs règle spécifique » → **une question à la saisie** (déjà le cas au §1.3) ; (b) **la release est publiée par l'utilisateur** : le texte « la publication revient à l'agent principal » est retiré du module GitHub (le code fait déjà ainsi : la publication est une tâche lancée depuis l'interface, pas une action d'agent) ; (c) question sur l'ordre des portées : voir §6.
 
 Objectifs : (1) supprimer les contradictions, (2) réduire les tokens, (3) les règles spécifiques l'emportent sur les règles internes (qui ne sont que des **défauts**), (4) une règle plus récente qui change une règle spécifique la **remplace**.
 Base : `docs/REGLES-INTERNES.md`.
@@ -75,7 +75,7 @@ Autres économies : l'historique envoyé à l'IA garde désormais intacts les re
 | 5 | R06 s'arrêter / R19 reprendre | « sauf décision en attente » écrit dans la règle 6 |
 | 6 | R14 continuer / R06 ne pas improviser | Règle 4 : erreur technique = continuer ; choix structurant = demander |
 | 7 | R15 « principal ou QA » vs code | « Vérificateur habilité autre que toi » |
-| 8 | R02 « release finale réalisée par l'agent principal » vs code (publication lancée par l'utilisateur) | Décision du 25 nov. : l'utilisateur publie ; module GitHub : « tu ne publies jamais une release » |
+| 8 | R02 « release finale réalisée par l'agent principal » vs code (publication lancée par l'utilisateur) | Décision du 24 nov. : l'utilisateur publie ; module GitHub : « tu ne publies jamais une release » |
 | 9 | Droits par défaut dupliqués (`rights.py` / `index.html`) | Le front lit les défauts servis par le serveur (une seule source) |
 | 10 | R03 « `write_file` remplace le fichier entier : contenu complet » vs garde-fou anti-troncature et `edit_file` | Règle 10 du socle (modifier = `edit_file`, `write_file` = création/petit fichier) ; le garde-fou reste dans le code (§1) |
 | 11 | Messages de conflit de fusion « réécris le fichier COMPLET avec `write_file` » (`engine.py`) vs règle 10 | Aligner ces textes : retirer les marqueurs de conflit avec `edit_file` (étape 2) |
