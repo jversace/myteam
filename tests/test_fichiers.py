@@ -50,7 +50,7 @@ class Lecture(unittest.TestCase):
     def test_historique_abrege_indique_comment_relire(self):
         h = [{"role": "user", "content": engine.OLD_RESULT + " : " + "z" * 3000}, {"role": "assistant", "content": "ok"},
              {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
-        self.assertIn("from_line", engine.shrink_history(h)[0]["content"])
+        self.assertIn("from_line", engine.shrink_history(h, budget=1000)[0]["content"])
 
 
 class Edition(unittest.TestCase):
@@ -207,6 +207,79 @@ class Edition(unittest.TestCase):
     def test_prompt_annonce_les_nouvelles_actions(self):
         for k in ("edit_file", "write_chunk", "from_line"):
             self.assertIn(k, engine.ACTIONS)
+
+
+def _res(*fichiers, taille=12000):
+    return engine.OLD_RESULT + " :\n\n" + "\n\n".join("Fichier %s (répertoire local) :\n```\n%s\n```" % (f, "z" * taille) for f in fichiers)
+
+
+class HistoriqueBudget(unittest.TestCase):
+    """Cause de la boucle de relecture : seuls 2 messages restaient intacts, donc lire 3 fichiers en abrégeait un, que l'agent relisait, etc."""
+
+    def msgs(self, *res):
+        h = []
+        for r in res:
+            h += [{"role": "user", "content": r}, {"role": "assistant", "content": "ok"}]
+        return h
+
+    def test_trois_fichiers_lus_restent_tous_lisibles(self):
+        h = self.msgs(_res("app/db.py"), _res("app/main.py", taille=10000), _res("app/home.html", taille=3000), "[Vous] vas-y")
+        r = engine.shrink_history(h)
+        for i in (0, 2, 4):
+            self.assertEqual(r[i]["content"], h[i]["content"])                      # db.py, main.py et home.html intacts (ancien comportement : db.py abrégé)
+
+    def test_budget_depasse_abrege_les_plus_anciens(self):
+        h = self.msgs(*[_res("f%d.py" % i) for i in range(6)])                       # 6 × 12 000 = 72 000 > budget
+        r = engine.shrink_history(h)
+        self.assertIn("abrégé", r[0]["content"])
+        self.assertEqual(r[10]["content"], h[10]["content"])                         # les plus récents intacts
+        self.assertLessEqual(sum(len(m["content"]) for m in r if m["role"] == "user" and m["content"].startswith(engine.OLD_RESULT) and "abrégé" not in m["content"]), engine.HIST_BUDGET + 12100)
+
+    def test_fichier_relu_les_anciennes_copies_sont_abregees(self):
+        h = self.msgs(*[_res("app/db.py", taille=6000) for _ in range(5)], "[Vous] x")
+        r = engine.shrink_history(h)
+        self.assertEqual([("abrégé" in r[i]["content"]) for i in (0, 2, 4, 6, 8)], [True, True, True, True, False])   # seule la copie la plus récente reste intacte
+
+    def test_original_non_modifie(self):
+        h = self.msgs(*[_res("f%d.py" % i) for i in range(6)])
+        avant = [m["content"] for m in h]
+        engine.shrink_history(h)
+        self.assertEqual(avant, [m["content"] for m in h])
+
+
+class Relectures(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "db.py").write_text(BIG, encoding="utf-8", newline="")
+        store.wj(store.state_path("u"), make_state(self.tmp))
+        engine.READS.clear()
+
+    def act(self, who, kind, **x):
+        return engine.do_act("u", "p1", who, {"do": kind, **x}, 0, {"n": 0, "t0": time.time()})
+
+    def test_avertissement_des_la_troisieme_relecture(self):
+        backs = [self.act("a2", "read_file", path="db.py")[1] for _ in range(4)]
+        self.assertNotIn("⚠", backs[0] + backs[1])
+        self.assertIn("lecture n°3", backs[2])
+        self.assertIn("edit_file", backs[2])
+        self.assertIn("lecture n°4", backs[3])
+
+    def test_extraits_differents_ne_comptent_pas_ensemble(self):
+        for i in range(5):
+            back = self.act("a2", "read_file", path="db.py", from_line=1 + 10 * i, to_line=10 + 10 * i)[1]
+            self.assertNotIn("⚠", back)
+
+    def test_compteur_par_agent_et_remis_a_zero_apres_ecriture(self):
+        for _ in range(2):
+            self.act("a2", "read_file", path="db.py")
+        self.assertNotIn("⚠", self.act("a3", "read_file", path="db.py")[1])           # autre agent : compteur à lui
+        self.act("a2", "edit_file", path="db.py", edits=[{"old": "ligne 001", "new": "Z"}])
+        self.assertNotIn("⚠", self.act("a2", "read_file", path="db.py")[1])           # écriture réussie : on repart de zéro
+
+    def test_fichier_introuvable_pas_d_avertissement_parasite(self):
+        for _ in range(4):
+            note, back = self.act("a2", "read_file", path="absent.py")
+        self.assertNotIn("⚠", back)
 
 
 class Reseau(unittest.TestCase):

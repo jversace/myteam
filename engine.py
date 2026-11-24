@@ -437,6 +437,7 @@ OLD_RESULT = "[Application] Résultats de tes actions"
 READ_MAX = 12000       # taille maximale d'un résultat de read_file
 SHRINK_GUARD = (2000, 0.5)   # write_file refusé si le fichier existant fait >= 2000 caractères et que le nouveau contenu en fait moins de la moitié
 CHUNK_TTL, CHUNK_MAX, CHUNK_BUF = 1800, 50, {}
+READS, REREAD_WARN = {}, 3      # relectures identiques d'un fichier par un agent, sans écriture entre-temps : avertissement dès la 3e
 CHUNK_LOCK = threading.Lock()
 
 
@@ -476,13 +477,26 @@ def read_view(t, x):
     return body, lab, nxt
 
 
-def shrink_history(h, keep=2, cap=400):
-    """Abrège les anciens retours d'actions (contenu de fichiers, listes…) de l'historique envoyé à l'IA : seuls les `keep`
-    derniers messages restent intacts. L'historique stocké n'est pas modifié."""
-    n = len(h)
-    return [m if i >= n - keep or m["role"] != "user" or not m["content"].startswith(OLD_RESULT) or len(m["content"]) <= cap
-            else {"role": "user", "content": m["content"][:cap] + "\n[…ancien résultat abrégé : relis la zone utile avec read_file (from_line/to_line) ; ne réécris jamais un fichier à partir de ce texte abrégé]"}
-            for i, m in enumerate(h)]
+HIST_BUDGET = 36000         # caractères de retours d'actions gardés intacts dans l'historique (≈ 9 000 tokens)
+
+
+def shrink_history(h, keep=2, cap=400, budget=HIST_BUDGET):
+    """Abrège les anciens retours d'actions (contenu de fichiers, listes…) de l'historique envoyé à l'IA. L'historique stocké n'est pas modifié.
+    Restent intacts : les `keep` derniers messages, puis, du plus récent au plus ancien, les retours qui tiennent dans `budget` caractères.
+    Un retour dont tous les fichiers ont été relus depuis (même en-tête « Fichier … ») est abrégé d'office : relire en boucle ne remplit pas le budget.
+    (Avant : seuls les 2 derniers messages restaient intacts, si bien que lire trois fichiers en abrégeait un et poussait l'agent à le relire sans fin.)"""
+    n, used, seen, out = len(h), 0, set(), list(h)
+    for i in range(n - 1, -1, -1):
+        m = h[i]
+        if m["role"] != "user" or not m["content"].startswith(OLD_RESULT) or len(m["content"]) <= cap:
+            continue
+        heads = set(re.findall(r"^Fichier .* :$", m["content"], re.M))
+        if i >= n - keep or (not (heads and heads <= seen) and used + len(m["content"]) <= budget):
+            used += len(m["content"])
+            seen |= heads
+        else:
+            out[i] = {"role": "user", "content": m["content"][:cap] + "\n[…ancien résultat abrégé : si tu as besoin d’un passage, relis seulement la zone utile (read_file from_line/to_line) ; ne réécris jamais un fichier entier à partir de ce texte abrégé]"}
+    return out
 
 
 def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None, fresh=False):
@@ -1388,6 +1402,32 @@ def locked_rmw(u, pid, p, a, path, t0, fn):
 def file_act(u, pid, p, a, x, kind, t0=0):
     """Actions fichiers : lecture/écriture/suppression (repo_act) et, au-dessus, `edit_file` (remplacements ciblés) et `write_chunk`
     (écriture en morceaux reconstitués ici), plus le garde-fou contre l'écriture d'un fichier tronqué."""
+    refuse = lambda m: (m, m)
+    if kind == "read_file" and not str(x.get("agent") or "").strip():
+        r = repo_act(u, pid, p, a, x, kind, t0)
+        k = (str(u), pid, a["id"], str(x.get("path")), tuple(str(x.get(c)) for c in ("from_line", "to_line", "offset", "limit")))
+        now_t = time.time()
+        with CHUNK_LOCK:
+            for kk in [kk for kk, v in READS.items() if now_t - v[1] > CHUNK_TTL]:
+                READS.pop(kk, None)
+            n = READS.get(k, (0, 0))[0] + 1
+            READS[k] = (n, now_t)
+        if n >= REREAD_WARN and r[1] is not None and r[0] is not r[1]:
+            r = (r[0], r[1] + "\n⚠ C’est la lecture n°%d de ce même extrait sans écriture entre-temps. Relire en boucle ne sert à rien : passe à l’étape suivante. "
+                 "Pour modifier, utilise edit_file avec un passage exact copié ci-dessus (pas besoin du fichier entier) ; pour un autre passage, lis seulement la zone utile (from_line/to_line) ; "
+                 "pour garder une information d’un tour à l’autre, note-la avec l’action context. Si tu es réellement bloqué, dis-le (ask_user)." % n)
+        return r
+    if kind in ("edit_file", "write_chunk", "write_file", "delete_file"):
+        r = _file_write(u, pid, p, a, x, kind, t0)
+        if r[1] is None or kind == "write_chunk" and r[0] != r[1]:      # écriture réussie : les relectures de ce fichier repartent de zéro
+            with CHUNK_LOCK:
+                for kk in [kk for kk in READS if kk[:3] == (str(u), pid, a["id"]) and kk[3] == str(x.get("path"))]:
+                    READS.pop(kk, None)
+        return r
+    return repo_act(u, pid, p, a, x, kind, t0)
+
+
+def _file_write(u, pid, p, a, x, kind, t0=0):
     refuse = lambda m: (m, m)
     if kind == "edit_file":
         return edit_act(u, pid, p, a, x, t0)

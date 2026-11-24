@@ -1569,7 +1569,7 @@ class Economie(unittest.TestCase):
     def test_historique_abrege(self):
         big = "[Application] Résultats de tes actions :\n\n" + "x" * 5000
         h = [{"role": "user", "content": big}, {"role": "assistant", "content": "a"}, {"role": "user", "content": big}, {"role": "assistant", "content": "b"}]
-        r = engine.shrink_history(h)
+        r = engine.shrink_history(h, budget=6000)                                                 # budget serré : seul le dernier retour tient
         self.assertTrue(len(r[0]["content"]) < 600 and "abrégé" in r[0]["content"])
         self.assertEqual(r[2]["content"], big)                                                   # les 2 derniers messages restent intacts
         self.assertEqual(h[0]["content"], big)                                                   # l'original n'est pas modifié
