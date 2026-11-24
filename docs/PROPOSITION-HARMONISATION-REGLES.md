@@ -1,5 +1,7 @@
 # Proposition d'harmonisation des règles (à valider — rien n'est implémenté)
 
+> **Mise à jour (24 nov. 2026)** : prise en compte des évolutions « gros fichiers » déjà implémentées (commits `5c52789`, `08cd9c5`, `b211c17`, voir `CLAUDE.md`, section « Gros fichiers ») : lecture par plage, `edit_file`, `write_chunk`, garde-fou anti-troncature, verrou tenu pendant l'édition, historique abrégé selon un budget, avertissement de relecture. Elles touchent R03, l'exception de sécurité (§1), le socle commun et les modules (§3), les contradictions (§4) et la mise en œuvre (§5). Le reste de la proposition est inchangé.
+
 Objectifs : (1) supprimer les contradictions, (2) réduire les tokens, (3) les règles spécifiques l'emportent sur les règles internes (qui ne sont que des **défauts**), (4) une règle plus récente qui change une règle spécifique la **remplace**.
 Base : `docs/REGLES-INTERNES.md`.
 
@@ -16,7 +18,7 @@ Ordre de résolution, par sujet, calculé **par l'application** (sans IA) :
 3. Une règle plus **récente mais de portée plus large** ne remplace une règle spécifique que si elle le déclare (`replaces`) ou si tu le confirmes. À la saisie, l'application détecte le même sujet et pose **une** question : « Remplace la règle n° X de <agent> / La garde (la spécifique reste) / Sujets différents ».
 4. Seules les règles **effectives** sont envoyées aux agents. Les règles remplacées vont dans `rules_log` (historique), jamais dans le prompt.
 
-**Exception de sécurité** : les garde-fous du code (droits, verrous, interdits d'écriture `.git/ .github/ .agents/`, budget, contrôles approuvés, jeton jamais exposé) ne sont **pas** des règles par défaut : aucune règle utilisateur ne les lève (il faut changer le droit ou le réglage correspondant).
+**Exception de sécurité** : les garde-fous du code (droits, verrous, interdits d'écriture `.git/ .github/ .agents/`, budget, contrôles approuvés, jeton jamais exposé) ne sont **pas** des règles par défaut : aucune règle utilisateur ne les lève (il faut changer le droit ou le réglage correspondant). S'y ajoutent les garde-fous « fichiers » : **refus d'un `write_file` bien plus court que le fichier existant** (seul `confirm_shrink:true` du paramètre d'action le contourne, jamais une règle), **unicité et tout-ou-rien des remplacements de `edit_file`**, **verrou tenu pendant toute l'opération lecture + écriture** en répertoire local, **reconstitution et contrôle d'empreinte de `write_chunk`**. Une règle comme « réécris toujours le fichier entier » ne peut donc pas les neutraliser.
 
 ## 2. Ce que les règles utilisateur deviennent
 
@@ -28,7 +30,7 @@ Ordre de résolution, par sujet, calculé **par l'application** (sans IA) :
 
 ## 3. Règles internes réécrites : socle commun + un module par mode
 
-Le mode de l'agent (GitHub / répertoire local / git local) décide du module injecté : **fini les règles qui se contredisent** (R02/R10 vs R11/R16/R17), et chaque agent ne reçoit que ce qui le concerne. Ancienne taille : ~1 680 tokens ; nouvelle : **~520 à 570 tokens (−67 à −70 %)**.
+Le mode de l'agent (GitHub / répertoire local / git local) décide du module injecté : **fini les règles qui se contredisent** (R02/R10 vs R11/R16/R17), et chaque agent ne reçoit que ce qui le concerne. Ancienne taille : ~1 680 tokens ; nouvelle : **~590 à 640 tokens (−62 à −65 %)** (la règle « fichiers » du socle ajoute ~70 tokens ; elle remplace les deux mentions « write_file = contenu complet » des modules).
 
 ### Socle commun (tous les modes)
 ```
@@ -41,23 +43,24 @@ Le mode de l'agent (GitHub / répertoire local / git local) décide du module in
 7. Avant de toucher ce qui dépend d'un autre agent ou l'impacte, écris-lui ; réponds aux messages ; avancement d'un autre : get_progress d'abord.
 8. Ton fichier de contexte (chemin dans « Dépôt et intégration ») fait foi ; mets-le à jour avec context.
 9. Pas de terminal ni d'environnement : tout passe par les actions. Action refusée : lis le message, n'invente aucune cause ; get_blockers avant toute question technique.
-10. Modules facultatifs. Bug : bug_fix puis « corrigé », vérifié par le QA. Workflow : run_workflow ; étape confiée : wf_step ok/ko.
-11. Contrôles automatiques : tu les proposes (propose_check, explication simple sans jargon), tu ne les exécutes ni ne les modifies ; échec bloquant : corrige.
-12. Pour agir, termine par un bloc action.
+10. Fichiers : lis seulement la zone utile (read_file from_line/to_line ; 12 000 caractères max par lecture), puis modifie avec edit_file (extrait exact et unique). write_file : création ou petit fichier. write_chunk : gros fichier (morceaux numérotés, reconstitués par l'application). Les anciens résultats de lecture sont abrégés : ne réécris jamais un fichier entier à partir d'eux, ne relis pas en boucle.
+11. Modules facultatifs. Bug : bug_fix puis « corrigé », vérifié par le QA. Workflow : run_workflow ; étape confiée : wf_step ok/ko.
+12. Contrôles automatiques : tu les proposes (propose_check, explication simple sans jargon), tu ne les exécutes ni ne les modifies ; échec bloquant : corrige.
+13. Pour agir, termine par un bloc action.
 ```
 ### Module « GitHub »
 ```
-Travaille sur ta branche, jamais sur la base. Pull automatique ; en fin de travail merge_request vers release/<version> ; validation par un agent habilité ; une tâche dépendante attend la fusion. Conflit : règle du projet (resolve_merge si confié). La publication de la release revient à l'agent principal. Ne touche ni .github/ ni .agents/. write_file = contenu complet.
+Travaille sur ta branche, jamais sur la base. Pull automatique ; en fin de travail merge_request vers release/<version> ; validation par un agent habilité ; une tâche dépendante attend la fusion. Conflit : règle du projet (resolve_merge si confié). La publication de la release revient à l'agent principal. Ne touche ni .github/ ni .agents/.
 ```
 ### Module « répertoire local partagé »
 ```
-Répertoire partagé : lock_file (liste, en une fois) avant de modifier, unlock_file dès fini, ne contourne jamais un verrou ; ni pull ni merge request. write_file = contenu complet.
+Répertoire partagé : lock_file (liste, en une fois) avant de modifier, unlock_file dès fini, ne contourne jamais un verrou ; ni pull ni merge request. edit_file garde le verrou pendant toute l'édition : si le fichier est tenu par un autre agent, la demande attend.
 ```
 ### Module « git local »
 ```
 Worktree à toi seul, sans verrou ; rien n'est enregistré sans commit ; seulement status/commit/diff/search/sync/git_log/git_show, aucune commande git libre. Fin de tâche : soumission automatique.
 ```
-Autres économies : n'injecter dans `ACTIONS` que les actions permises par les droits et le mode de l'agent ; le socle et le module restent dans les blocs de prompt **mis en cache** (aucun contenu changeant) ; l'analyse de cohérence reçoit les règles effectives, pas les règles intégrées complètes.
+Autres économies : l'historique envoyé à l'IA garde désormais intacts les retours de fichiers jusqu'à un budget (`HIST_BUDGET`, 36 000 caractères) et abrège les doublons de relecture (déjà en place) ; n'injecter dans `ACTIONS` que les actions permises par les droits et le mode de l'agent  (la section `ACTIONS` a grossi d'environ 250 tokens avec `edit_file`, `write_chunk` et la lecture par plage : `edit_file`/`write_chunk` suivent le même droit et le même mode que `write_file`) ; le socle et le module restent dans les blocs de prompt **mis en cache** (aucun contenu changeant) ; l'analyse de cohérence reçoit les règles effectives, pas les règles intégrées complètes.
 
 ## 4. Contradictions résolues
 
@@ -72,13 +75,15 @@ Autres économies : n'injecter dans `ACTIONS` que les actions permises par les d
 | 7 | R15 « principal ou QA » vs code | « Vérificateur habilité autre que toi » |
 | 8 | Publication par le principal vs l'application | Module GitHub : « revient à l'agent principal » (exécutée par l'application) |
 | 9 | Droits par défaut dupliqués (`rights.py` / `index.html`) | Le front lit les défauts servis par le serveur (une seule source) |
+| 10 | R03 « `write_file` remplace le fichier entier : contenu complet » vs garde-fou anti-troncature et `edit_file` | Règle 10 du socle (modifier = `edit_file`, `write_file` = création/petit fichier) ; le garde-fou reste dans le code (§1) |
+| 11 | Messages de conflit de fusion « réécris le fichier COMPLET avec `write_file` » (`engine.py`) vs règle 10 | Aligner ces textes : retirer les marqueurs de conflit avec `edit_file` (étape 2) |
 
 ## 5. Mise en œuvre proposée (par étapes)
 1. Modèle de règle + migration de `rules` en listes ; résolution `effective_rules(p, a)` et tests.
-2. Sujets sur les règles internes ; module par mode dans `sys_prompt` (blocs 1/2 en cache) ; tests de non-régression.
+2. Sujets sur les règles internes (R03 → sujet `écriture_fichiers`) ; module par mode dans `sys_prompt` (blocs 1/2 en cache) ; règle « fichiers » du socle ; alignement des messages de conflit sur `edit_file` ; tests de non-régression.
 3. Détection à la saisie (même sujet → question unique) ; action `instruction` étendue (portée, sujet, `replaces`).
 4. `lint` par sujet ; analyse IA limitée aux sujets en doute.
-5. Mise à jour de `CLAUDE.md` et de `docs/REGLES-INTERNES.md`.
+5. Mise à jour de `CLAUDE.md` et de `docs/REGLES-INTERNES.md` (dont R03 : elle décrit encore « contenu complet »).
 
 ## 6. Points à valider
 - Ordre des portées proposé : tâche/étape > agent > rôle > module > global > défaut. Faut-il vraiment placer « module » sous « rôle » ?
