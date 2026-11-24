@@ -1407,7 +1407,7 @@ class Integration(unittest.TestCase):
 
     def test_consigne_contre_les_causes_inventees(self):
         regles = "\n".join(engine.RULES)
-        self.assertTrue("MERGE_HEAD" in regles and "n’invente pas de cause" in regles and "get_blockers" in regles)
+        self.assertTrue("MERGE_HEAD" in regles and "n’invente aucune cause" in regles and "get_blockers" in regles)
         self.assertIn("get_blockers", engine.sys_prompt(proj(), proj()["agents"][1]))
 
     def test_classer_une_question_sans_objet(self):

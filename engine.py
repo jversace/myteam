@@ -18,6 +18,7 @@ import checks
 import locks
 import project_rules as prules
 import rights
+import rulebook
 from ai import call_ai, System
 from rights import by_id, mod_ids, now, uid, roles_of
 from store import DATA, Err, load, mutate
@@ -43,27 +44,9 @@ MR_ACTIVE, MR_SYNC_EVERY = ("ouverte", "conflit"), 120   # statuts d'une MR qui 
 MANUAL_TIMEOUT = 24 * 3600   # attente maximale d'une réponse manuelle
 WAIT = {}                    # échanges manuels en attente : id -> {u, ev, text}
 F = "`" * 3
-RULES = [
-    "Tu es un agent IA membre d’une équipe de développement pilotée depuis une application web. Tu réponds en français, de façon concise et factuelle.",
-    "Tu travailles uniquement sur ta branche git, jamais directement sur la branche de base. La release finale (fusion dans la branche de base et tag) est réalisée par l’agent principal.",
-    "Tu lis et écris les fichiers du dépôt avec les actions list_files, read_file, write_file, delete_file (sur ta branche). write_file remplace le fichier entier : réserve-le à la création ou à un petit fichier, avec le contenu complet. Pour modifier un fichier existant, utilise edit_file (remplacement de texte ciblé, sans réécrire le reste) après avoir lu la zone concernée avec read_file (from_line/to_line). Les anciens résultats de lecture sont abrégés dans ta mémoire : relis la zone juste avant de l’éditer. Un fichier trop gros pour un seul write_file s’écrit avec write_chunk (morceaux numérotés, reconstitués par l’application). Messages de commit clairs. Ne touche ni à .github/ ni aux fichiers .agents/ des autres.",
-    "Ton fichier de contexte (.agents/<ton prénom>.md sur ta branche) fait foi : respecte-le rigoureusement et mets-le à jour avec l’action « context » dès qu’une décision ou une convention durable apparaît.",
-    "Tu respectes tes droits (section « Tes droits »). Quand une création est soumise à validation, ta proposition est enregistrée dans la boîte « Décisions » de l’utilisateur : continue ce qui n’en dépend pas, sans la recréer.",
-    "En cas d’ambiguïté ou de décision structurante (architecture, périmètre, choix coûteux à défaire), n’improvise pas : utilise l’action ask_user avec 2 ou 3 options et ta recommandation, puis arrête-toi sur la tâche concernée.",
-    "Les instructions de l’utilisateur et les spécifications sont partagées par toute l’équipe : respecte-les. L’agent principal les tient à jour ; si tu constates un manque ou une contradiction, écris-lui.",
-    "Pour connaître l’avancement d’un autre agent, utilise d’abord get_progress (sans coût) ; n’interroge l’agent par message que pour obtenir une précision.",
-    "Une tâche ou un bug peut être rattaché à un ou plusieurs modules, sans obligation (ex. le cahier des charges est global). Un bug se corrige par des sous-tâches de correction (bug_fix) ; quand elles sont terminées, il passe à « corrigé » et le QA le vérifie.",
-    "Chaque release a une branche de travail (release/<version>) ; la branche principale est réservée à la release finale. Tu te synchronises avec la branche de travail par pull (fait automatiquement au démarrage d’une tâche et avant une merge request) ; quand ton travail est prêt, tu soumets une merge request (merge_request) vers cette branche ; l’agent principal la valide. Une tâche qui dépend d’une autre ne démarre que lorsque celle-ci est terminée et sa merge request fusionnée. En cas de conflit de fusion, la règle du projet décide qui le résout (l’utilisateur, l’auteur de la branche ou un agent désigné) ; si le conflit t’est confié, résous-le avec resolve_merge.",
-    "Tu n’as aucun environnement d’exécution local ni dépôt git local : tout passe par les actions de l’application et l’API GitHub (ou, si tu travailles sur le répertoire local du projet, par ces mêmes actions : tu n’as pas de terminal). Il n’existe donc ni répertoire .git, ni état « MERGE_HEAD », ni environnement à nettoyer ou à redémarrer. Quand une action est refusée, lis le message : il donne la cause et la suite ; n’invente pas de cause absente du message et ne demande jamais à l’utilisateur de « nettoyer » un environnement. Pour connaître les vraies causes d’un blocage, appelle get_blockers avant de poser une question technique.",
-    "Les règles globales, tes règles spécifiques et les workflows du projet sont écrits par l’utilisateur et priment sur ta propre initiative. Un workflow est un enchaînement d’étapes à respecter : déclenche-le avec run_workflow quand une règle te le demande ; quand une étape te est confiée, réalise-la puis conclus-la avec wf_step (ok ou ko). Si deux règles te semblent se contredire, applique la plus spécifique et signale la contradiction à l’agent principal.",
-    "Prends l’initiative de la coordination : avant de coder ce qui dépend du travail d’un autre agent ou qui l’impacte (interface, contrat d’API, schéma de données, convention), écris-lui avec message pour convenir de l’approche ; préviens-le quand tu modifies ce qu’il utilise ; réponds toujours aux messages que tu reçois. « Travail des autres agents » et get_progress te disent qui fait quoi.",
-    "Ne t’arrête pas à la première erreur : analyse-la, corrige et continue (relis le fichier, change d’approche). Si tu es réellement bloqué, écris à l’agent qui peut t’aider ou pose la question avec ask_user ; ne laisse jamais une tâche en suspens sans le dire.",
-    "Ne déclare jamais une tâche terminée si le travail demandé n’est pas réellement fait : mets-la à « à vérifier » (task_status) avec un compte rendu précis de ce qui est fait. L’agent principal (ou le QA) vérifie puis la clôture ; s’il la refuse, corrige ce qui manque. S’il reste du travail ou un blocage, dis-le ou pose la question avec ask_user.",
-    "Si tu travailles sur le RÉPERTOIRE LOCAL du projet (section « Dépôt et intégration »), il est partagé avec d’autres agents : verrouille chaque fichier AVANT de le lire pour le modifier (lock_file), modifie-le, puis libère-le dès que tu as fini (unlock_file). Si un fichier est verrouillé par un autre agent, la demande attend qu’il le libère ; ne le contourne jamais. Ne garde pas de verrou plus longtemps que nécessaire, et ne verrouille pas dans un ordre qui peut croiser celui d’un autre agent : demande tous tes fichiers d’un coup (lock_file accepte une liste). Il n’y a ni pull ni merge request sur le répertoire local.",
-    "Si ta section « Dépôt et intégration » décrit un WORKTREE GIT LOCAL : il est à toi seul (pas de verrou), write_file et delete_file modifient seulement tes fichiers, et rien n’est enregistré tant que tu n’as pas fait commit. Tu ne lances jamais de commande git toi-même : tout passe par les actions status, commit, diff, search, sync, git_log, git_show.",
-    "Tu ne peux ni exécuter ni modifier une commande de contrôle automatique : tu peux seulement la PROPOSER (propose_check). L’utilisateur n’est pas technicien : ton explication doit tenir en quelques phrases simples, sans jargon, et dire ce que la commande vérifie, si elle modifie des fichiers et pourquoi tu la proposes. Chaque modification de la commande redemande son approbation. Les contrôles approuvés sont exécutés par l’application quand tu soumets ton travail ; en cas d’échec bloquant, tu reçois la fin de leur sortie et tu corriges.",
-    "Une interruption (message de l’utilisateur ou d’un agent, étape de workflow, suivi) ne remplace pas ta tâche en cours : réponds-y, puis reprends ta tâche là où tu t’étais arrêté, sans attendre qu’on te le redemande. Ta tâche en cours (consigne d’origine comprise) est rappelée dans la section « Ta tâche en cours » : ne dépends pas de ta mémoire de la conversation.",
-    "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
+# Règles par défaut : socle commun + module par mode, avec sujets (voir rulebook.py). Les agents reçoivent rulebook.locked_core()
+# (bloc partagé) puis rulebook.agent_rules(mode, sujets remplacés) ; RULES = tout, pour l'analyse de cohérence.
+RULES = rulebook.all_lines()
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
     '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>","from_line":1,"to_line":80} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent) ; 12 000 caractères maximum par lecture : au-delà, lis la suite avec from_line/to_line ou offset/limit (en caractères)',
@@ -104,7 +87,7 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"bug_fix","bug":"<id>","title":"...","desc":"...","assignee":"<prénom>"} : créer une sous-tâche de correction d’un bug',
     '{"do":"bug_status","id":"<id>","status":"en correction|corrigé|vérifié|rouvert"} : faire évoluer un bug (vérifié/rouvert : droit de vérification)',
     '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>","replaces":[<n° des décisions en attente auxquelles cette question répond aussi>]} : poser une question à l’utilisateur (ambiguïté, décision structurante) ; si elle répond aussi à une question déjà en attente, indique son numéro dans replaces : l’ancienne est annulée et remplacée',
-    '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur',
+    '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>","subject":"<sujet facultatif>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur ; subject (langue, ambiguite, interruption, coordination, fichier_contexte, fichiers) fait remplacer la règle par défaut correspondante',
     '{"do":"instr_rewrite","items":[...],"obsolete":[...]} : (uniquement lors d’une consolidation demandée par l’application) liste consolidée des instructions',
     '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications'])
 
@@ -131,6 +114,16 @@ def git_mode(p):
 
 def git_agent(p, a):
     return local_agent(p, a) and git_mode(p)
+
+
+def agent_mode(p, a):
+    """Mode de travail de l'agent pour le choix du module de règles : git, local ou github."""
+    return rulebook.mode_of(local_agent(p, a), git_agent(p, a))
+
+
+def agent_rules_lines(p, a):
+    """Règles par défaut propres à l'agent : règles modifiables non remplacées par une règle de l'utilisateur + module du mode."""
+    return rulebook.agent_rules(agent_mode(p, a), rights.overridden_subjects(p, a))
 
 
 def git_target(p):
@@ -286,7 +279,7 @@ def ctx_text(p, a):
     return "\n".join([
         "# Contexte de l’agent %s — projet %s" % (a["name"], p["name"]), "",
         "> Ce fichier fait foi : respecte-le rigoureusement et mets-le à jour (action « context »).", "",
-        "## Règles de l’équipe", "\n".join("- " + x for x in RULES),
+        "## Règles de l’équipe", "\n".join("- " + x for x in rulebook.locked_core() + agent_rules_lines(p, a)),
         ("\n## Règles du projet\n" + p["rules"]) if p.get("rules") else "",
         ("\n" + prules.agent_rules_text(p, a, "##")) if (a.get("rules") or "").strip() else "", ("\n" + prules.workflows_text(p, a, "##")) if prules.workflows_text(p, a) else "",
         "\n## Mon rôle\n%s — %s" % (r["name"], r["desc"]),
@@ -360,7 +353,7 @@ def sys_prompt(p, a):
         news.append("- Les spécifications ont été mises à jour.")
     repo = p.get("repo") or {}
     parts = [
-        "# Règles de l’équipe\n" + "\n".join(RULES),
+        "# Règles de l’équipe\n" + "\n".join(rulebook.locked_core()),
         ("# Règles du projet\n" + p["rules"]) if p.get("rules") else "",
         prules.agent_rules_text(p, a), prules.workflows_text(p, a),
         ("# Instructions de l’utilisateur (à respecter)\n" + "\n".join(ins)) if ins else "",
@@ -379,11 +372,12 @@ def sys_prompt(p, a):
         ("# Bugs ouverts (id | titre | gravité | statut | modules)\n" + bs) if bs else "",
         ("# Décisions en attente de l’utilisateur\n" + "\n".join("- %s (%s)" % (d.get("question") or (d["payload"].get("title") or d["payload"].get("name")), d["byName"]) for d in pend)) if pend else "",
         ("# Spécifications actuelles\n" + p["spec"][:6000]) if p.get("spec") else "",
-        "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), ACTIONS, focus_text(p, a)]
+        "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), ACTIONS, focus_text(p, a),
+        "# Règles de l’équipe propres à ton mode de travail\n" + "\n".join(agent_rules_lines(p, a))]
     # Blocs du plus stable au plus changeant (prompt caching Anthropic : les deux premiers sont mis en cache) :
     # 1) commun à tous les agents, 2) propre à l'agent mais rarement modifié, 3) change à presque chaque tour.
     shared = [parts[0], parts[18], parts[1], parts[11], parts[12], parts[16]]
-    per_agent = [parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
+    per_agent = [parts[20], parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
     volatile = [parts[19], parts[5], parts[10], parts[13], parts[14], parts[15], parts[17]]
     return System.of(["\n\n".join(x for x in grp if x) for grp in (shared, per_agent, volatile)])
 
@@ -674,7 +668,7 @@ def check_budget(p):
 
 def _dec_key(d):
     """Clé « sujet » d'une décision : deux décisions en attente de même clé portent sur la même chose."""
-    for k in ("conflict", "mr_review", "wf_run", "review"):
+    for k in ("conflict", "mr_review", "wf_run", "review", "ruleconf"):
         if d.get(k):
             return (k, d[k])
     if d.get("escalation") and d.get("task"):
@@ -1067,8 +1061,13 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                 return refuse("Instruction vide.")
             if sc != "global" and sc.split(":")[0] not in ("role", "agent", "module"):
                 sc = "global"
-            out = []
-            mp(u, pid, lambda pp: out.extend(rights.add_instruction(pp, {"id": uid(), "by": a["name"], "scope": sc, "text": text}, x.get("replaces"))))
+            ins = {"id": uid(), "by": a["name"], "scope": sc, "text": text}
+            if rights.clean_subject(x.get("subject")):
+                ins["subject"] = str(x["subject"]).strip()
+            res = rule_submit(u, pid, ins, x.get("replaces") or (), a)
+            if "pending" in res:
+                return "Instruction NON appliquée pour l’instant : elle touche le même sujet qu’une règle plus spécifique ; une question a été posée à l’utilisateur (décision n° %s)." % res["pending"], None
+            out = res.get("off", [])
             return "Instruction enregistrée (%s) : %s%s" % (sc, text, (" — remplace n° " + ", ".join(map(str, out))) if out else ""), None
         if kind == "spec":
             if not mn:
@@ -1122,6 +1121,15 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
         def f(pp):
             dd = by_id(pp["decisions"], did)
             dd.update(status="répondue", answer=full, done=now(), n_done=rights.next_seq(pp))
+            rc = dd.get("ruleconf")
+            if rc:                                         # question « règle en conflit » : 0 remplacer, 1 garder la spécifique, 2 sujets différents
+                k = opts.index(ans) if ans in opts else -1
+                ins = dict(rc["ins"])
+                if k == 0:
+                    rights.add_instruction(pp, ins, list(rc.get("replaces") or []) + list(rc.get("old") or []))
+                elif k == 2:
+                    ins.pop("subject", None)
+                    rights.add_instruction(pp, ins, rc.get("replaces") or [])
             if dd.get("structural"):
                 rights.add_instruction(pp, {"id": uid(), "by": "Décision", "scope": "global", "key": "dec:" + rights.norm(dd["question"]),
                                             "text": "Décision (%s) : %s → %s" % (dd["byName"], dd["question"], full)})
@@ -1170,6 +1178,8 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                     mgr = by_id(p["agents"], p.get("mainId"))
                     c = by_id(snap(u, pid)["conflicts"], cid)
                     resolve_conflict(u, pid, cid, mgr["id"] if (ans == opts[1] and mgr) else c["agent"])
+        elif d.get("ruleconf"):                             # règle en conflit : la réponse est appliquée plus haut ; la règle arrive aux agents via leurs instructions
+            pass
         elif d.get("mr_review"):                              # validation de merge request par l'utilisateur
             log(u, pid, "Système", "Vous", apply_mr_review(u, pid, d["mr_review"], "Vous", "approved" if ans == opts[0] else "rejected", nt if ans == opts[0] else (nt or "Refusée par l’utilisateur")))
         elif d.get("escalation"):                             # décision sur une tâche bloquée
@@ -1235,13 +1245,45 @@ def instr_consolidate(u, pid):
     mp(u, pid, lambda pp: pp.setdefault("instr_consol", {}).update(analyzing="", note=pp["instr_consol"].get("note") if pp["instr_consol"].get("note", "").endswith("désactivée(s).") else "Aucun changement proposé par l’agent."))
 
 
-def instr_add(u, pid, scope, text, replaces=()):
+def rule_submit(u, pid, ins, replaces=(), agent=None):
+    """Enregistre une règle de l'utilisateur (instruction). Si elle porte le même sujet qu'une règle plus spécifique encore active
+    et visant aussi les mêmes agents (ex. règle globale récente vs règle d'un agent), elle ne la remplace pas d'office : une
+    question est posée à l'utilisateur (remplacer / garder la spécifique / sujets différents) et la règle attend sa réponse.
+    Retourne {"off": [n° désactivés]} ou {"pending": n° de la décision}."""
+    res = {}
+
+    def f(pp):
+        olds = rights.rule_conflicts(pp, ins)
+        if not olds:
+            res["off"] = rights.add_instruction(pp, ins, replaces)
+            return
+        ns = [x.get("n") for x in olds]
+        lab = ", ".join("n°%s [%s]" % (x.get("n"), x.get("scope", "global")) for x in olds)
+        d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": (agent or {}).get("id") or pp.get("mainId") or "",
+             "byName": (agent or {}).get("name") or "Vous", "d": now(), "status": "attente", "task": "", "structural": False,
+             "question": "Nouvelle règle [%s] sur le sujet « %s » : « %s ». Elle est plus récente mais plus large que la règle %s, qui l’emporte aujourd’hui pour ses agents. Que faire ?" % (
+                 ins.get("scope", "global"), rulebook.SUBJECTS.get(ins.get("subject"), ins.get("subject")), str(ins.get("text", ""))[:300], lab),
+             "options": ["Remplacer la règle %s par la nouvelle" % lab, "Garder la règle spécifique (elle reste prioritaire)", "Les deux : ce sont des sujets différents"],
+             "recommendation": "", "impact": "Sans réponse, la nouvelle règle n’est pas appliquée.",
+             "ruleconf": {"ins": dict(ins), "replaces": [r for r in (replaces or ())], "old": ns}}
+        add_decision(pp, d)
+        res["pending"] = d["n"]
+    mp(u, pid, f)
+    return res
+
+
+def instr_add(u, pid, scope, text, replaces=(), subject=""):
     text = text.strip()
     if not text:
         raise Err(400, "Instruction vide")
     sc = scope if scope == "global" or scope.split(":")[0] in ("role", "agent", "module") else "global"
-    mp(u, pid, lambda pp: rights.add_instruction(pp, {"id": uid(), "by": "Vous", "scope": sc, "text": text}, replaces))
-    log(u, pid, "Système", "Vous", "Instruction enregistrée (%s) : %s%s" % (sc, text, (" — remplace n° " + ", ".join(map(str, replaces))) if replaces else ""))
+    ins = {"id": uid(), "by": "Vous", "scope": sc, "text": text}
+    if rights.clean_subject(subject):
+        ins["subject"] = subject
+    res = rule_submit(u, pid, ins, replaces)
+    if "pending" in res:
+        return log(u, pid, "Système", "Vous", "Règle en attente de votre réponse (décision n° %s) : elle touche le même sujet qu’une règle plus spécifique : %s" % (res["pending"], text))
+    log(u, pid, "Système", "Vous", "Instruction enregistrée (%s) : %s%s" % (sc, text, (" — remplace n° " + ", ".join(map(str, res["off"]))) if res.get("off") else ""))
 
 
 def git_act(u, pid, p, a, x, kind, t0=0):
@@ -1317,7 +1359,7 @@ def git_act(u, pid, p, a, x, kind, t0=0):
         r = lg.sync(wt, src, a["name"])
         if r["state"] == "conflict":
             return "Synchronisation avec %s : conflit" % tgt, ("Conflit avec %s dans : %s.\nOuvre chaque fichier : les marqueurs <<<<<<< ======= >>>>>>> montrent les deux versions. "
-                                                           "Réécris le fichier COMPLET résolu avec write_file, puis fais commit. Pour renoncer : {\"do\":\"sync\",\"abort\":true}.") % (tgt, ", ".join(r["files"]))
+                                                           "Retire les marqueurs avec edit_file (write_file seulement pour un petit fichier), puis fais commit. Pour renoncer : {\"do\":\"sync\",\"abort\":true}.") % (tgt, ", ".join(r["files"]))
         return "Synchronisation avec %s : %s" % (tgt, r["state"]), {"uptodate": "Ta branche contient déjà %s.", "merged": "%s a été intégrée à ta branche (aucun conflit)."}[r["state"]] % tgt
     return refuse("Action inconnue : %s" % kind)
 
@@ -2341,7 +2383,7 @@ def rules_analysis(u, pid):
            "{\"issues\":[{\"severity\":\"erreur|avertissement|info\",\"where\":\"...\",\"text\":\"...\",\"suggestion\":\"...\"}]} (liste vide si tout est cohérent). "
            "Ne signale que ce qui découle du texte ci-dessous, sans rien inventer. Ce texte est l'état ACTUEL et complet : ignore toute version antérieure des règles. "
            "Les instructions et décisions de l'utilisateur sont plus récentes que les règles et les complètent ou les remplacent : un point qu'elles précisent n'est PLUS ambigu, ne le signale pas. "
-           "Entre deux instructions qui se contredisent, la plus RÉCENTE (n° le plus élevé) l'emporte : ce n'est pas une incohérence, signale seulement l'ancienne comme « instruction obsolète n°X » (niveau info).\n\n" + prules.dump(p, RULES))
+           "Entre deux instructions de même sujet qui se contredisent, la plus spécifique (agent > rôle ou module > global) l'emporte, puis à portée égale la plus RÉCENTE (n° le plus élevé) : ce n'est pas une incohérence, signale seulement l'autre comme « instruction obsolète n°X » (niveau info). Les règles intégrées « par défaut » cèdent devant toute règle de l'utilisateur de même sujet.\n\n" + prules.dump(p, RULES))
     try:
         reply = ask(u, pid, an["id"], msg, "Analyse des règles", relog=False, fresh=True)
     except Err as e:
@@ -3278,7 +3320,7 @@ def git_submit(u, pid, aid, title="", body="", task=""):
         ex = next((m for m in p.get("mrs", []) if m.get("git") and m.get("from") == br and m.get("status") in MR_ACTIVE), None)
     r = lg.sync(wt, git_source(lg, p), a["name"])
     if r["state"] == "conflict":
-        return "conflict", ("Conflit avec %s dans : %s. Les marqueurs <<<<<<< ======= >>>>>>> sont dans tes fichiers : réécris chaque fichier COMPLET résolu avec write_file, "
+        return "conflict", ("Conflit avec %s dans : %s. Les marqueurs <<<<<<< ======= >>>>>>> sont dans tes fichiers : retire les marqueurs de chaque fichier avec edit_file (write_file seulement pour un petit fichier), "
                             "fais commit, puis soumets à nouveau (merge_request). Pour renoncer : {\"do\":\"sync\",\"abort\":true}.") % (tgt, ", ".join(r["files"]))
     if r["state"] == "merged":
         record_commit(u, pid, a["name"], "sync : %s" % tgt, lg.sha("HEAD", cwd=wt) or "")
@@ -3398,7 +3440,7 @@ def git_resolve_conflict(u, pid, cid, rid):
     if rid == c["agent"]:
         mp(u, pid, lambda pp: by_id(pp["conflicts"], cid).update(resolver=rid, status="ouvert", mode="worktree", tries=1))
         spawn(ask, u, pid, rid, "[Intégration] Ta merge request #%s est en conflit avec %s sur : %s. Lance sync (les marqueurs apparaissent dans les fichiers), "
-              "résous-les en réécrivant chaque fichier COMPLET avec write_file, fais commit, puis soumets à nouveau avec merge_request." % (m["n"], m["to"], ", ".join(c["files"])), "Intégration MR")
+              "résous-les en retirant les marqueurs de chaque fichier avec edit_file (write_file seulement pour un petit fichier), fais commit, puis soumets à nouveau avec merge_request." % (m["n"], m["to"], ", ".join(c["files"])), "Intégration MR")
         return
     lg = git_repo(u, pid, p)
     owner = by_id(p["agents"], c["agent"]) or {"name": m.get("by", "?")}
@@ -3982,7 +4024,7 @@ def start(u, j):
             "mr_done": lambda: mr_done(u, pid, j.get("mrId")),
             "mr_sync": lambda: mr_sync(u, pid),
             "decide": lambda: decide(u, pid, j.get("decisionId"), str(j.get("decision", "")), str(j.get("note", "")), j.get("fields") or {}, str(j.get("answer", ""))),
-            "instr_add": lambda: instr_add(u, pid, str(j.get("scope", "global")), str(j.get("text", "")), j.get("replaces") or ()),
+            "instr_add": lambda: instr_add(u, pid, str(j.get("scope", "global")), str(j.get("text", "")), tuple(j.get("replaces") or ()), str(j.get("subject", ""))),
             "instr_consolidate": lambda: instr_consolidate(u, pid),
             "instr_del": lambda: mp(u, pid, lambda pp: pp.__setitem__("instructions", [i for i in pp.get("instructions", []) if i["id"] != j.get("instrId")]))}
     if t not in jobs:

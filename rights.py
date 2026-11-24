@@ -6,6 +6,7 @@ import secrets
 from datetime import datetime
 
 from store import Err
+import rulebook
 
 CAPS = ["subtask", "task_top", "module", "bug", "bug_update", "bug_verify", "mr_review", "link", "check"]
 FREE, APPROVE, NO = "free", "approve", "no"
@@ -209,18 +210,34 @@ def instr_applies(p, a, i):
     return True
 
 
+def scope_rank(sc):
+    """Portée d'une instruction, de la plus spécifique (0) à la plus large : agent, rôle ou module, global."""
+    sc = str(sc or "global")
+    return 0 if sc.startswith("agent:") else 1 if sc.startswith(("role:", "module:")) else 2
+
+
+def clean_subject(s):
+    """Sujet d'une instruction : seulement un sujet modifiable de rulebook.SUBJECTS, sinon vide."""
+    s = str(s or "").strip()
+    return s if s in rulebook.SUBJECTS else ""
+
+
 def add_instruction(pp, ins, replaces=()):
     """Ajoute une instruction en « annule et remplace » : elle désactive les instructions dont les numéros sont dans `replaces`,
-    ainsi que toute instruction active de même `key` (même décision reposée). Retourne les numéros désactivés."""
+    toute instruction active de même `key` (même décision reposée) et toute instruction active de même `subject` ET de même
+    portée (une règle plus récente sur le même sujet et la même portée remplace l'ancienne). Retourne les numéros désactivés."""
     reps = set()
     for r in replaces or ():
         m = re.search(r"\d+", str(r))
         if m:
             reps.add(int(m.group()))
     ins.update(n=next_seq(pp), d=now(), active=True)
+    if ins.get("subject") and not clean_subject(ins["subject"]):
+        ins.pop("subject")
     off = []
     for i in pp.get("instructions", []):
-        if i.get("active", True) and (i.get("n") in reps or (ins.get("key") and i.get("key") == ins["key"])):
+        same_subject = bool(ins.get("subject")) and i.get("subject") == ins["subject"] and norm(i.get("scope", "global")) == norm(ins.get("scope", "global"))
+        if i.get("active", True) and (i.get("n") in reps or (ins.get("key") and i.get("key") == ins["key"]) or same_subject):
             i.update(active=False, replaced_by=ins["n"])
             off.append(i.get("n"))
     pp.setdefault("instructions", []).append(ins)
@@ -230,10 +247,54 @@ def add_instruction(pp, ins, replaces=()):
     return off
 
 
+def subject_winners(p, a):
+    """Pour un agent : {sujet: instruction effective}. Parmi les instructions actives qui le concernent et portent le même
+    sujet, la portée la plus spécifique l'emporte ; à portée égale, la plus récente (numéro le plus élevé)."""
+    win = {}
+    for i in p.get("instructions", []):
+        sj = clean_subject(i.get("subject"))
+        if not sj or not i.get("active", True) or not instr_applies(p, a, i):
+            continue
+        cur = win.get(sj)
+        if cur is None or (scope_rank(i.get("scope")), -i.get("n", 0)) < (scope_rank(cur.get("scope")), -cur.get("n", 0)):
+            win[sj] = i
+    return win
+
+
+def overridden_subjects(p, a):
+    """Sujets des règles par défaut remplacées, pour cet agent, par une règle de l'utilisateur."""
+    return set(subject_winners(p, a))
+
+
+def _covers(p, new_sc, old_sc):
+    """Une instruction de portée `new_sc` s'applique-t-elle aussi à ceux que vise `old_sc` (plus spécifique) ?"""
+    new_sc, old_sc = str(new_sc or "global"), str(old_sc or "global")
+    if new_sc == "global" or new_sc.startswith("module:"):
+        return True
+    if new_sc.startswith("role:") and old_sc.startswith("agent:"):
+        ag = next((x for x in p.get("agents", []) if norm(x.get("name")) == norm(old_sc[6:])), None)
+        return bool(ag) and norm((by_id(roles_of(p), ag.get("role")) or {}).get("name")) == norm(new_sc[5:])
+    return False
+
+
+def rule_conflicts(p, ins):
+    """Instructions actives de même sujet, plus spécifiques que la nouvelle et qui sont visées aussi par elle : la nouvelle,
+    plus récente mais plus large, ne peut pas les remplacer sans l'accord de l'utilisateur."""
+    sj = clean_subject(ins.get("subject"))
+    if not sj:
+        return []
+    return [i for i in p.get("instructions", [])
+            if i.get("active", True) and i.get("subject") == sj and scope_rank(i.get("scope")) < scope_rank(ins.get("scope"))
+            and _covers(p, ins.get("scope"), i.get("scope"))]
+
+
 def instruction_lines(p, a, only_new=False):
     seen = a.get("seen_seq", 0)
-    out = []
+    out, win = [], subject_winners(p, a)
     for i in p.get("instructions", []):
+        sj = clean_subject(i.get("subject"))
+        if sj and win.get(sj) is not i:                        # règle d'un sujet déjà tranchée par une règle plus spécifique ou plus récente
+            continue
         if i.get("active", True) and instr_applies(p, a, i) and (not only_new or i.get("n", 0) > seen):
             sc = i.get("scope", "global")
             out.append("- n°%s %s%s" % (i.get("n", "?"), ("[%s] " % sc) if sc != "global" else "", i["text"]))
