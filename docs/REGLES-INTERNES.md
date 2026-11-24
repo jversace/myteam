@@ -1,6 +1,6 @@
 # Règles internes de l'application « myTeam »
 
-> Inventaire des règles **codées en dur** dans l'application (non modifiables par l'utilisateur). Extrait du code (`engine.py`, `rights.py`, `project_rules.py`, `locks.py`, `checks.py`, `github.py`, `gitlocal.py`) et de `CLAUDE.md`, état au commit `1566fee`.
+> Inventaire des règles **codées en dur** dans l'application (non modifiables par l'utilisateur). Extrait du code (`engine.py`, `rights.py`, `project_rules.py`, `locks.py`, `checks.py`, `github.py`, `gitlocal.py`) et de `CLAUDE.md`, état au commit `1566fee`, complété le 24 nov. 2026 pour les évolutions « gros fichiers » (commits `5c52789`, `08cd9c5`, `b211c17` : R03, E06, E07, F01–F06, contradiction 10).
 > Chaque règle a un identifiant stable (R = règle transmise aux agents, D = droit, G = git, T = tâches, E = erreurs/reprises, V = verrous, C = contrôles, S = sécurité/données) pour pouvoir y renvoyer et détecter les contradictions avec les cinq autres niveaux de règles (projet, agent, messages, décisions, workflows).
 > **Source de vérité** : `RULES` dans `engine.py` pour les R01–R20 ; les autres sont des comportements du code (constantes indiquées).
 
@@ -10,7 +10,7 @@
 |---|---|
 | R01 | Agent d'une équipe de développement ; répond en français, concis et factuel. |
 | R02 | Travaille uniquement sur sa branche, jamais sur la branche de base. La release finale (fusion + tag) est faite par l'agent principal. |
-| R03 | Lit/écrit via `list_files`, `read_file`, `write_file`, `delete_file` ; `write_file` remplace le fichier entier (contenu complet) ; commits clairs ; ne touche ni à `.github/` ni aux `.agents/` des autres. |
+| R03 | Lit/écrit via `list_files`, `read_file`, `write_file`, `edit_file`, `write_chunk`, `delete_file` ; `write_file` remplace le fichier entier (création ou petit fichier) ; pour modifier un fichier existant : lire la zone (`read_file` `from_line`/`to_line`) puis `edit_file` ; gros fichier : `write_chunk` ; les anciens résultats de lecture sont abrégés (relire la zone juste avant d'éditer) ; commits clairs ; ne touche ni à `.github/` ni aux `.agents/` des autres. |
 | R04 | Son fichier de contexte (`.agents/<prénom>.md` sur sa branche) fait foi : le respecter, le mettre à jour avec l'action `context` à chaque décision/convention durable. |
 | R05 | Respecte ses droits ; une création soumise à validation va dans la boîte « Décisions » : continuer ce qui n'en dépend pas, ne pas la recréer. |
 | R06 | Ambiguïté ou décision structurante : pas d'improvisation, `ask_user` avec 2–3 options et une recommandation, puis s'arrêter sur la tâche concernée. |
@@ -82,7 +82,8 @@
 | E03 | Interruption : marquage + reprise automatique (max 3), **sauf** décision en attente, tâche bloquée/arrêtée/en échec, conflit ouvert, dépendances non satisfaites, agent manuel, `autopilot` off. |
 | E04 | Tâche persistante : jusqu'à 6 tours de 8 étapes ; deux tours sans action = travail rendu (« à vérifier »). Dialogue direct : jusqu'à 4 échanges, puis « écris continue ». |
 | E05 | Plafond de budget `p.budget` : tout appel API refusé (402) quand le coût l'atteint. |
-| E06 | Économie de tokens : prompt en 3 blocs (stable / rare / changeant) ; **rien de changeant dans les blocs 1 et 2** ; historique abrégé (retours d'actions à 400 car., sauf les 2 derniers) ; diff fourni aux validateurs. |
+| E06 | Économie de tokens : prompt en 3 blocs (stable / rare / changeant) ; **rien de changeant dans les blocs 1 et 2** ; historique abrégé (retours d'actions à 400 car. au-delà d'un budget de 36 000 car. intacts, du plus récent au plus ancien, plus les 2 derniers messages ; un retour dont les fichiers ont été relus depuis est abrégé d'office) ; diff fourni aux validateurs. |
+| E07 | Réseau : coupure sans réponse (`RemoteDisconnected`, reset, délai dépassé, hôte injoignable) → 2 nouvelles tentatives (2 s puis 6 s) puis erreur 502 explicite ; les erreurs HTTP (quota, 4xx/5xx) ne sont pas rejouées par cette couche (`ai._post`). |
 
 ## Verrous du répertoire local (`locks.py`)
 
@@ -110,6 +111,17 @@
 | S03 | On n'automatise pas les sites de chat grand public (claude.ai, chatgpt.com…) : chat manuel (24 h d'attente max) ou API/modèle local. |
 | S04 | Rôles et services IA sont **globaux** (réutilisables par tous les projets). |
 
+## Fichiers : lecture, édition, gros fichiers (`engine.py`)
+
+| Id | Règle |
+|---|---|
+| F01 | Lecture : 12 000 caractères maximum par `read_file` (`READ_MAX`) ; extrait par `from_line`/`to_line` ou `offset`/`limit` ; le retour indique comment lire la suite. |
+| F02 | `edit_file` : remplacements `old` → `new`, tout ou rien ; chaque `old` doit apparaître exactement une fois (sinon refus avec le nombre d'occurrences, ou `all:true`) ; fins de ligne `\r\n` respectées ; mêmes droits, verrous et commit que `write_file`. |
+| F03 | `write_chunk` : 50 morceaux maximum, dans le désordre, gardés en mémoire (par utilisateur, projet, agent, chemin ; purge après 30 min) ; rien n'est écrit tant qu'il en manque un ; reconstitution, empreinte `sha256` vérifiée si fournie, puis écriture comme `write_file` ; 200 000 caractères maximum. |
+| F04 | Garde-fou : `write_file` refusé si le fichier existant fait ≥ 2 000 caractères et que le nouveau contenu en fait moins de la moitié (seul `confirm_shrink:true` le contourne). **Garde-fou du code, pas une règle modifiable par l'utilisateur.** |
+| F05 | En répertoire local, `edit_file` et la lecture du garde-fou tiennent le verrou du fichier pendant toute l'opération (lecture + écriture) ; verrou déjà tenu conservé, verrou pris ici rendu à la fin. Worktree git et GitHub : pas de verrou. |
+| F06 | Relecture : dès la 3e lecture identique d'un même extrait par un agent sans écriture entre-temps, le retour ajoute un avertissement (passer à `edit_file`, lire la zone utile ou noter avec `context`) ; une écriture réussie remet le compteur à zéro. |
+
 ---
 
 ## Contradictions et recouvrements détectés (à trancher)
@@ -123,3 +135,4 @@
 7. **R15 vs T01** : la règle dit « le principal ou le QA vérifie » ; le code exige `bug_verify` libre et exclut l'assigné ; l'utilisateur peut contourner depuis l'IHM.
 8. **R10 / G03** : la publication est décrite comme faite par l'agent principal, mais en mode git elle est exécutée par l'application (G08).
 9. **D02 vs D01** : les droits par défaut sont dupliqués dans `rights.py` et `static/index.html` (risque de divergence).
+10. **R03 « contenu complet » (ancien texte) vs F04 / F02** : `write_file` remplace le fichier entier mais est refusé s'il raccourcit fortement un fichier existant ; modifier un fichier se fait par `edit_file`. R03 est corrigée (24 nov. 2026) ; les messages de conflit de fusion (« réécris chaque fichier COMPLET avec `write_file` », `engine.py`) restent à aligner sur `edit_file`.
