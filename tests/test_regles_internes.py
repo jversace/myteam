@@ -218,3 +218,78 @@ class Saisie(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegleEnTexte(unittest.TestCase):
+    """Règles du projet et d'un agent en texte libre : une règle par ligne ou puce, sujet facultatif entre crochets."""
+    def setUp(self):
+        self.p = pr()
+        self.bob, self.carl = self.p["agents"][1], self.p["agents"][2]
+
+    def test_decoupage(self):
+        t = "Règle libre\nsuite\n- [langue] Réponds en anglais\n- Pas de TODO\n[fichiers] Toujours edit_file\n* [urgent] autre mot"
+        r = rulebook.parse_rules(t)
+        self.assertEqual([x["subject"] for x in r], ["", "langue", "", "fichiers", ""])
+        self.assertEqual(r[0]["text"], "Règle libre\nsuite")
+        self.assertEqual(r[1]["text"], "Réponds en anglais")
+        self.assertEqual(r[4]["subject"], "")                  # [urgent] n'est pas un sujet : la ligne reste telle quelle
+
+    def test_texte_sans_sujet_inchange(self):
+        t = "Règle un.\n\nRègle deux, longue\n   avec retrait.\n"
+        self.p["rules"] = t
+        self.assertEqual(prules_shared(self.p), t.strip())
+
+    def test_regle_du_projet_a_sujet_remplace_le_defaut(self):
+        self.p["rules"] = "Commits courts\n- [langue] Réponds en anglais"
+        sp = engine.sys_prompt(self.p, self.bob)
+        self.assertNotIn("Réponds en français", sp)
+        self.assertIn("Réponds en anglais", sp)
+        self.assertNotIn("Réponds en anglais", sp.blocks[0])   # propre à l'agent : jamais dans le bloc partagé
+        self.assertIn("Commits courts", sp.blocks[0])
+
+    def test_regle_d_agent_l_emporte_sur_celle_du_projet(self):
+        self.p["rules"] = "- [langue] Anglais"
+        self.bob["rules"] = "- [langue] Allemand"
+        sb, sc = engine.sys_prompt(self.p, self.bob), engine.sys_prompt(self.p, self.carl)
+        self.assertIn("Allemand", sb)
+        self.assertNotIn("Anglais", sb)
+        self.assertIn("Anglais", sc)
+        self.assertNotIn("Allemand", sc)
+
+    def test_instruction_plus_recente_de_meme_portee_bat_la_regle_en_texte(self):
+        self.p["rules"] = "- [langue] Anglais"
+        self.p["instructions"] = [{"id": "i", "n": 4, "scope": "global", "subject": "langue", "text": "Italien", "active": True}]
+        sp = engine.sys_prompt(self.p, self.bob)
+        self.assertIn("Italien", sp)
+        self.assertNotIn("Anglais", sp)
+
+    def test_regle_d_agent_en_texte_bat_instruction_globale(self):
+        self.bob["rules"] = "- [langue] Allemand"
+        self.p["instructions"] = [{"id": "i", "n": 4, "scope": "global", "subject": "langue", "text": "Italien", "active": True}]
+        sp = engine.sys_prompt(self.p, self.bob)
+        self.assertIn("Allemand", sp)
+        self.assertNotIn("Italien", sp)
+
+    def test_cohérence_signale_la_regle_qui_l_emporte(self):
+        self.p["rules"] = "- [langue] Anglais"
+        self.bob["rules"] = "- [langue] Allemand"
+        msgs = " ¦ ".join(x["text"] for x in engine.prules.lint(self.p))
+        self.assertIn("l’emporte sur", msgs)
+        self.assertIn("Bob", msgs)
+
+    def test_question_si_instruction_large_touche_une_regle_d_agent_en_texte(self):
+        store.wj(store.state_path("u"), make_state(tempfile.mkdtemp()))
+        st = store.load("u")
+        st["projects"][0]["agents"][1]["rules"] = "Soigne les noms\n- [langue] Allemand"
+        store.wj(store.state_path("u"), st)
+        engine.instr_add("u", "p1", "global", "Tous en anglais", (), "langue")
+        d = [x for x in proj()["decisions"] if x.get("ruleconf")]
+        self.assertEqual(len(d), 1)
+        engine.decide("u", "p1", d[0]["id"], "answer", answer=d[0]["options"][0])
+        self.assertNotIn("Allemand", proj()["agents"][1]["rules"])      # la règle en texte de Bob est retirée
+        self.assertIn("Soigne les noms", proj()["agents"][1]["rules"])
+        self.assertEqual([i["scope"] for i in proj()["instructions"] if i["active"]], ["global"])
+
+
+def prules_shared(p):
+    return engine.prules.shared_rules_text(p)

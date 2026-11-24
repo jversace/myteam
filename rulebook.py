@@ -11,6 +11,7 @@ globales > règles par défaut (ce module). À portée égale, la plus récente 
 Module sans dépendance (fonctions pures). La liste SUBJECTS est dupliquée dans static/index.html (constante SUBJ) :
 un test vérifie qu'elles restent identiques.
 """
+import re
 
 MODES = ("github", "local", "git")
 MODE_LABEL = {"github": "dépôt GitHub", "local": "répertoire local partagé", "git": "worktree git local"}
@@ -91,6 +92,46 @@ SUBJECTS = {
     "fichier_contexte": "Fichier de contexte de l’agent",
     "fichiers": "Lecture et écriture des fichiers",
 }   # sujets modifiables, dans l'ordre d'affichage
+
+
+def clean_subject(s):
+    """Sujet valide (modifiable) ou chaîne vide."""
+    s = str(s or "").strip()
+    return s if s in SUBJECTS else ""
+
+
+_START = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+|^\s*\[\w+\]")
+_TAG = re.compile(r"^\s*(?:(?:[-*•]|\d+[.)])\s*)?\[(\w+)\]\s*(.*)$", re.S)
+
+
+def parse_rules(text):
+    """Découpe un texte de règles (règles du projet ou d'un agent) en règles : une par ligne ou puce (« - », « * », « 1. »),
+    ou par ligne commençant par un [sujet] ; les lignes suivantes qui n'ouvrent pas une règle la prolongent.
+    Retourne [{raw, text, subject}] : `raw` = texte d'origine (tel quel), `subject` = sujet modifiable donné entre crochets
+    en début de règle (« [langue] Réponds en anglais »), sinon vide. Un autre mot entre crochets n'est pas un sujet."""
+    items = []
+    for line in str(text or "").split("\n"):
+        if not line.strip():
+            if items:
+                items[-1]["raw"] += "\n" + line
+            continue
+        if _START.match(line) or not items:
+            items.append({"raw": line})
+        else:
+            items[-1]["raw"] += "\n" + line
+    out = []
+    for it in items:
+        raw = it["raw"].rstrip()
+        m = _TAG.match(raw)
+        sj = clean_subject(m.group(1)) if m else ""
+        out.append({"raw": raw, "text": (m.group(2).strip() if sj else raw.strip()), "subject": sj})
+    return out
+
+
+def remove_rule(text, raw):
+    """Retire une règle (son `raw`) d'un texte de règles."""
+    out = str(text or "").replace(raw, "", 1)
+    return re.sub(r"\n{3,}", "\n\n", out).strip("\n")
 
 
 def mode_of(local, git):

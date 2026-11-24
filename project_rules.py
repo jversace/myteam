@@ -5,6 +5,8 @@ d'un agent (action run_workflow) ou par une minuterie (tous les jours à une heu
 import re
 from datetime import datetime
 
+import rulebook
+
 STEP_KINDS = ("ask", "start_tasks", "ask_user")
 ON_KO = ("stop", "continue", "ask_user", "goto")
 WF_LATE = 6 * 3600          # une minuterie quotidienne manquée de plus de 6 h n'est pas rattrapée
@@ -85,8 +87,30 @@ def workflows_text(p, a, h="#"):
     return "%s Workflows du projet (enchaînements d’actions à respecter ; déclenche-en un avec run_workflow, conclus l’étape qui t’est confiée avec wf_step)\n%s" % (h, "\n".join(L))
 
 
+def _untagged(text):
+    """Règles d'un texte qui ne portent pas de sujet (inchangé s'il n'y en a aucune : le texte part tel quel dans le prompt)."""
+    items = rulebook.parse_rules(text)
+    if not any(i["subject"] for i in items):
+        return str(text or "").strip()
+    return "\n".join(i["raw"] for i in items if not i["subject"]).strip()
+
+
+def shared_rules_text(p):
+    """Règles du projet communes à tous les agents (bloc de prompt partagé) : sans les règles à sujet, envoyées au cas par cas."""
+    return _untagged(p.get("rules"))
+
+
 def agent_rules_text(p, a, h="#"):
-    return ("%s Règles spécifiques à toi (%s)\n%s" % (h, a["name"], a["rules"].strip())) if (a.get("rules") or "").strip() else ""
+    t = _untagged(a.get("rules"))
+    return ("%s Règles spécifiques à toi (%s)\n%s" % (h, a["name"], t)) if t else ""
+
+
+def subject_rules_text(p, a, h="#"):
+    """Règles à sujet (projet ou agent) qui l'emportent, pour cet agent, sur la règle par défaut du même sujet. Les règles à sujet
+    battues par une règle plus spécifique ou plus récente ne sont pas envoyées."""
+    import rights                                          # import tardif : rights ne dépend pas de ce module, mais reste chargé à la demande
+    L = [c["text"] for c in rights.subject_winners(p, a).values() if c["kind"] in ("global", "agent")]
+    return ("%s Règles du projet et règles pour toi sur des sujets précis (remplacent les règles par défaut)\n%s" % (h, "\n".join("- " + x for x in L))) if L else ""
 
 
 def snapshot(p):
@@ -213,6 +237,22 @@ def lint(p):
             add("avertissement", "Conflits de fusion", "L’agent désigné (%s) est en chat manuel : il ne sera pas sollicité automatiquement, la question vous sera posée." % ag["name"])
     if agents and not main:
         add("avertissement", "Équipe", "Aucun agent principal : la vérification des tâches, la validation des merge requests et le suivi ne fonctionneront pas.")
+    import rights
+    seen_sj = set()
+    for ag in agents:
+        by_sj = {}
+        for c in rights.rule_candidates(p, ag):
+            by_sj.setdefault(c["subject"], []).append(c)
+        for sj, cs in by_sj.items():
+            if len(cs) < 2:
+                continue
+            cs.sort(key=lambda c: (rights.scope_rank(c["scope"]), -c["n"]))
+            key = (sj, cs[0]["text"])
+            if key in seen_sj:
+                continue
+            seen_sj.add(key)
+            add("info", "Sujet « %s »" % rulebook.SUBJECTS.get(sj, sj), "Pour %s, la règle [%s] « %s » l’emporte sur %s." % (
+                ag.get("name", "?"), cs[0]["scope"], cs[0]["text"][:80], " ; ".join("[%s] « %s »" % (c["scope"], c["text"][:60]) for c in cs[1:])))
     if agents and not (p.get("rules") or "").strip():
         add("info", "Règles globales", "Aucune règle globale n’est définie (seules les règles intégrées s’appliquent).")
     return out

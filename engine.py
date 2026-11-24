@@ -280,7 +280,8 @@ def ctx_text(p, a):
         "# Contexte de l’agent %s — projet %s" % (a["name"], p["name"]), "",
         "> Ce fichier fait foi : respecte-le rigoureusement et mets-le à jour (action « context »).", "",
         "## Règles de l’équipe", "\n".join("- " + x for x in rulebook.locked_core() + agent_rules_lines(p, a)),
-        ("\n## Règles du projet\n" + p["rules"]) if p.get("rules") else "",
+        ("\n## Règles du projet\n" + prules.shared_rules_text(p)) if prules.shared_rules_text(p) else "",
+        ("\n" + prules.subject_rules_text(p, a, "##")) if prules.subject_rules_text(p, a, "##") else "",
         ("\n" + prules.agent_rules_text(p, a, "##")) if (a.get("rules") or "").strip() else "", ("\n" + prules.workflows_text(p, a, "##")) if prules.workflows_text(p, a) else "",
         "\n## Mon rôle\n%s — %s" % (r["name"], r["desc"]),
         ("\n## Mon espace de travail\nWorktree git local personnel (branche %s) : pas de verrou, tes modifications ne comptent qu'après commit." % git_branch_hint(p, a)) if git_agent(p, a) else ("\n## Mon espace de travail\nRépertoire local du projet : %s (partagé : verrouille les fichiers avant de les modifier). Pas de branche, pas de pull ni de merge request." % (p.get("localdir") or "non défini")) if local_agent(p, a) else "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
@@ -354,7 +355,7 @@ def sys_prompt(p, a):
     repo = p.get("repo") or {}
     parts = [
         "# Règles de l’équipe\n" + "\n".join(rulebook.locked_core()),
-        ("# Règles du projet\n" + p["rules"]) if p.get("rules") else "",
+        ("# Règles du projet\n" + prules.shared_rules_text(p)) if prules.shared_rules_text(p) else "",
         prules.agent_rules_text(p, a), prules.workflows_text(p, a),
         ("# Instructions de l’utilisateur (à respecter)\n" + "\n".join(ins)) if ins else "",
         ("# Nouveautés depuis ta dernière activité\n" + "\n".join(news)) if news else "",
@@ -373,11 +374,11 @@ def sys_prompt(p, a):
         ("# Décisions en attente de l’utilisateur\n" + "\n".join("- %s (%s)" % (d.get("question") or (d["payload"].get("title") or d["payload"].get("name")), d["byName"]) for d in pend)) if pend else "",
         ("# Spécifications actuelles\n" + p["spec"][:6000]) if p.get("spec") else "",
         "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), ACTIONS, focus_text(p, a),
-        "# Règles de l’équipe propres à ton mode de travail\n" + "\n".join(agent_rules_lines(p, a))]
+        "# Règles de l’équipe propres à ton mode de travail\n" + "\n".join(agent_rules_lines(p, a)), prules.subject_rules_text(p, a)]
     # Blocs du plus stable au plus changeant (prompt caching Anthropic : les deux premiers sont mis en cache) :
     # 1) commun à tous les agents, 2) propre à l'agent mais rarement modifié, 3) change à presque chaque tour.
     shared = [parts[0], parts[18], parts[1], parts[11], parts[12], parts[16]]
-    per_agent = [parts[20], parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
+    per_agent = [parts[20], parts[21], parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
     volatile = [parts[19], parts[5], parts[10], parts[13], parts[14], parts[15], parts[17]]
     return System.of(["\n\n".join(x for x in grp if x) for grp in (shared, per_agent, volatile)])
 
@@ -1127,6 +1128,10 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                 ins = dict(rc["ins"])
                 if k == 0:
                     rights.add_instruction(pp, ins, list(rc.get("replaces") or []) + list(rc.get("old") or []))
+                    for o in rc.get("old_text") or []:             # règle en texte d'un agent : retirée de ses règles
+                        ag2 = by_id(pp["agents"], o["agent"])
+                        if ag2:
+                            ag2["rules"] = rulebook.remove_rule(ag2.get("rules"), o["raw"])
                 elif k == 2:
                     ins.pop("subject", None)
                     rights.add_instruction(pp, ins, rc.get("replaces") or [])
@@ -1257,15 +1262,16 @@ def rule_submit(u, pid, ins, replaces=(), agent=None):
         if not olds:
             res["off"] = rights.add_instruction(pp, ins, replaces)
             return
-        ns = [x.get("n") for x in olds]
-        lab = ", ".join("n°%s [%s]" % (x.get("n"), x.get("scope", "global")) for x in olds)
+        ns = [x["n"] for x in olds if x["kind"] == "ins"]
+        txt = [{"agent": x["agent"], "raw": x["raw"]} for x in olds if x["kind"] == "agent"]
+        lab = ", ".join(("n°%s [%s]" % (x["n"], x["scope"])) if x["kind"] == "ins" else "[%s] « %s »" % (x["scope"], x["text"][:60]) for x in olds)
         d = {"id": uid(), "n": rights.next_seq(pp), "kind": "question", "by": (agent or {}).get("id") or pp.get("mainId") or "",
              "byName": (agent or {}).get("name") or "Vous", "d": now(), "status": "attente", "task": "", "structural": False,
              "question": "Nouvelle règle [%s] sur le sujet « %s » : « %s ». Elle est plus récente mais plus large que la règle %s, qui l’emporte aujourd’hui pour ses agents. Que faire ?" % (
                  ins.get("scope", "global"), rulebook.SUBJECTS.get(ins.get("subject"), ins.get("subject")), str(ins.get("text", ""))[:300], lab),
              "options": ["Remplacer la règle %s par la nouvelle" % lab, "Garder la règle spécifique (elle reste prioritaire)", "Les deux : ce sont des sujets différents"],
              "recommendation": "", "impact": "Sans réponse, la nouvelle règle n’est pas appliquée.",
-             "ruleconf": {"ins": dict(ins), "replaces": [r for r in (replaces or ())], "old": ns}}
+             "ruleconf": {"ins": dict(ins), "replaces": [r for r in (replaces or ())], "old": ns, "old_text": txt}}
         add_decision(pp, d)
         res["pending"] = d["n"]
     mp(u, pid, f)

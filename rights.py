@@ -217,9 +217,8 @@ def scope_rank(sc):
 
 
 def clean_subject(s):
-    """Sujet d'une instruction : seulement un sujet modifiable de rulebook.SUBJECTS, sinon vide."""
-    s = str(s or "").strip()
-    return s if s in rulebook.SUBJECTS else ""
+    """Sujet d'une règle : seulement un sujet modifiable de rulebook.SUBJECTS, sinon vide."""
+    return rulebook.clean_subject(s)
 
 
 def add_instruction(pp, ins, replaces=()):
@@ -247,17 +246,32 @@ def add_instruction(pp, ins, replaces=()):
     return off
 
 
-def subject_winners(p, a):
-    """Pour un agent : {sujet: instruction effective}. Parmi les instructions actives qui le concernent et portent le même
-    sujet, la portée la plus spécifique l'emporte ; à portée égale, la plus récente (numéro le plus élevé)."""
-    win = {}
+def rule_candidates(p, a):
+    """Toutes les règles de l'utilisateur qui portent un sujet et concernent cet agent : instructions actives, règles du projet
+    (texte, portée globale) et règles de l'agent (texte, portée agent). Les règles en texte n'ont pas de date : elles sont plus
+    anciennes que toute instruction (n = 0)."""
+    out = []
     for i in p.get("instructions", []):
         sj = clean_subject(i.get("subject"))
-        if not sj or not i.get("active", True) or not instr_applies(p, a, i):
-            continue
-        cur = win.get(sj)
-        if cur is None or (scope_rank(i.get("scope")), -i.get("n", 0)) < (scope_rank(cur.get("scope")), -cur.get("n", 0)):
-            win[sj] = i
+        if sj and i.get("active", True) and instr_applies(p, a, i):
+            out.append({"subject": sj, "scope": i.get("scope", "global"), "n": i.get("n", 0), "kind": "ins", "ref": i, "text": i.get("text", "")})
+    for it in rulebook.parse_rules(p.get("rules")):
+        if it["subject"]:
+            out.append({"subject": it["subject"], "scope": "global", "n": 0, "kind": "global", "ref": it, "text": it["text"]})
+    for it in rulebook.parse_rules(a.get("rules")):
+        if it["subject"]:
+            out.append({"subject": it["subject"], "scope": "agent:" + str(a.get("name", "")), "n": 0, "kind": "agent", "ref": it, "text": it["text"]})
+    return out
+
+
+def subject_winners(p, a):
+    """Pour un agent : {sujet: règle effective}. Parmi les règles qui le concernent et portent le même sujet, la portée la plus
+    spécifique l'emporte ; à portée égale, la plus récente (numéro le plus élevé ; une règle en texte est plus ancienne)."""
+    win = {}
+    for c in rule_candidates(p, a):
+        cur = win.get(c["subject"])
+        if cur is None or (scope_rank(c["scope"]), -c["n"]) < (scope_rank(cur["scope"]), -cur["n"]):
+            win[c["subject"]] = c
     return win
 
 
@@ -278,14 +292,21 @@ def _covers(p, new_sc, old_sc):
 
 
 def rule_conflicts(p, ins):
-    """Instructions actives de même sujet, plus spécifiques que la nouvelle et qui sont visées aussi par elle : la nouvelle,
-    plus récente mais plus large, ne peut pas les remplacer sans l'accord de l'utilisateur."""
+    """Règles actives de même sujet, plus spécifiques que la nouvelle instruction et visées aussi par elle : la nouvelle, plus
+    récente mais plus large, ne peut pas les remplacer sans l'accord de l'utilisateur. Retourne [{kind: ins|agent, n, scope, text,
+    agent, raw}] (instructions ; règles en texte d'un agent)."""
     sj = clean_subject(ins.get("subject"))
     if not sj:
         return []
-    return [i for i in p.get("instructions", [])
-            if i.get("active", True) and i.get("subject") == sj and scope_rank(i.get("scope")) < scope_rank(ins.get("scope"))
-            and _covers(p, ins.get("scope"), i.get("scope"))]
+    out = [{"kind": "ins", "n": i.get("n"), "scope": i.get("scope", "global"), "text": i.get("text", "")} for i in p.get("instructions", [])
+           if i.get("active", True) and i.get("subject") == sj and scope_rank(i.get("scope")) < scope_rank(ins.get("scope"))
+           and _covers(p, ins.get("scope"), i.get("scope"))]
+    if scope_rank(ins.get("scope")) > 0:
+        for ag in p.get("agents", []):
+            for it in rulebook.parse_rules(ag.get("rules")):
+                if it["subject"] == sj and _covers(p, ins.get("scope"), "agent:" + str(ag.get("name", ""))):
+                    out.append({"kind": "agent", "n": None, "scope": "agent:" + str(ag.get("name", "")), "text": it["text"], "agent": ag.get("id"), "raw": it["raw"]})
+    return out
 
 
 def instruction_lines(p, a, only_new=False):
@@ -293,7 +314,7 @@ def instruction_lines(p, a, only_new=False):
     out, win = [], subject_winners(p, a)
     for i in p.get("instructions", []):
         sj = clean_subject(i.get("subject"))
-        if sj and win.get(sj) is not i:                        # règle d'un sujet déjà tranchée par une règle plus spécifique ou plus récente
+        if sj and (win.get(sj) or {}).get("ref") is not i:     # règle d'un sujet déjà tranchée par une règle plus spécifique ou plus récente
             continue
         if i.get("active", True) and instr_applies(p, a, i) and (not only_new or i.get("n", 0) > seen):
             sc = i.get("scope", "global")
