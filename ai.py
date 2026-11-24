@@ -1,5 +1,8 @@
 """Appel des API des services IA : format Anthropic ou compatible OpenAI."""
+import http.client
 import json
+import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -22,6 +25,25 @@ class System(str):
 class Reply(str):
     """Texte de la réponse ; .usage = {"in": tokens d'entrée, "out": tokens de sortie} quand le fournisseur les donne."""
     usage = None
+
+
+NET_RETRIES, NET_BACKOFF = 2, (2, 6)     # coupures réseau (connexion fermée sans réponse, délai dépassé…) : nouvelles tentatives avant d'abandonner
+
+
+def _post(req):
+    """Envoie la requête ; en cas de coupure réseau (RemoteDisconnected, reset, délai dépassé, hôte injoignable), réessaie après une courte attente.
+    Les erreurs HTTP (quota, 4xx/5xx) ne sont jamais rejouées ici : elles sont traitées par l'appelant."""
+    for n in range(NET_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                return json.load(r)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, http.client.HTTPException, ConnectionError, socket.timeout, TimeoutError) as e:
+            if n >= NET_RETRIES:
+                why = e.reason if isinstance(e, urllib.error.URLError) else "%s : %s" % (type(e).__name__, e)
+                raise Err(502, "Service IA injoignable après %d tentatives : %s" % (n + 1, why))
+            time.sleep(NET_BACKOFF[min(n, len(NET_BACKOFF) - 1)])
 
 
 def call_ai(s, system, messages, max_tokens=8192):
@@ -47,8 +69,7 @@ def call_ai(s, system, messages, max_tokens=8192):
     hd.update({"Content-Type": "application/json", "User-Agent": "myteam/1.0"})
     req = urllib.request.Request(u, json.dumps(body).encode(), hd, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=300) as r:
-            res = json.load(r)
+        res = _post(req)
     except urllib.error.HTTPError as e:
         txt = e.read().decode(errors="replace")[:400]
         if e.code in (429, 529):  # quota / surcharge : l'agent se suspend puis reprend
@@ -60,8 +81,6 @@ def call_ai(s, system, messages, max_tokens=8192):
         if e.code == 404:
             raise Err(502, "Modèle ou URL introuvable (404) : vérifiez les champs « Modèle » et « URL de base » dans Services IA > Modifier (les noms de modèles changent souvent). Réponse du fournisseur : %s" % txt)
         raise Err(502, "Erreur du service IA (%s) : %s" % (e.code, txt))
-    except urllib.error.URLError as e:
-        raise Err(502, "Service IA injoignable : %s" % e.reason)
     us = res.get("usage") or {}
     if anth:
         text = "".join(b.get("text", "") for b in res.get("content", []))

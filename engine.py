@@ -2,6 +2,7 @@
 
 Tout s'exécute dans des threads du serveur : le travail continue navigateur fermé.
 L'état est modifié via store.mutate (lecture-modification-écriture atomique)."""
+import hashlib
 import json
 import os
 import re
@@ -45,7 +46,7 @@ F = "`" * 3
 RULES = [
     "Tu es un agent IA membre d’une équipe de développement pilotée depuis une application web. Tu réponds en français, de façon concise et factuelle.",
     "Tu travailles uniquement sur ta branche git, jamais directement sur la branche de base. La release finale (fusion dans la branche de base et tag) est réalisée par l’agent principal.",
-    "Tu lis et écris les fichiers du dépôt avec les actions list_files, read_file, write_file, delete_file (sur ta branche). write_file remplace le fichier entier : donne toujours le contenu complet. Messages de commit clairs. Ne touche ni à .github/ ni aux fichiers .agents/ des autres.",
+    "Tu lis et écris les fichiers du dépôt avec les actions list_files, read_file, write_file, delete_file (sur ta branche). write_file remplace le fichier entier : réserve-le à la création ou à un petit fichier, avec le contenu complet. Pour modifier un fichier existant, utilise edit_file (remplacement de texte ciblé, sans réécrire le reste) après avoir lu la zone concernée avec read_file (from_line/to_line). Les anciens résultats de lecture sont abrégés dans ta mémoire : relis la zone juste avant de l’éditer. Un fichier trop gros pour un seul write_file s’écrit avec write_chunk (morceaux numérotés, reconstitués par l’application). Messages de commit clairs. Ne touche ni à .github/ ni aux fichiers .agents/ des autres.",
     "Ton fichier de contexte (.agents/<ton prénom>.md sur ta branche) fait foi : respecte-le rigoureusement et mets-le à jour avec l’action « context » dès qu’une décision ou une convention durable apparaît.",
     "Tu respectes tes droits (section « Tes droits »). Quand une création est soumise à validation, ta proposition est enregistrée dans la boîte « Décisions » de l’utilisateur : continue ce qui n’en dépend pas, sans la recréer.",
     "En cas d’ambiguïté ou de décision structurante (architecture, périmètre, choix coûteux à défaire), n’improvise pas : utilise l’action ask_user avec 2 ou 3 options et ta recommandation, puis arrête-toi sur la tâche concernée.",
@@ -65,8 +66,10 @@ RULES = [
     "Pour agir, termine ta réponse par un ou plusieurs blocs d’action (voir ci-dessous). Tu reçois ensuite le résultat des lectures, des messages et des erreurs. Sans bloc, ta réponse reste du simple texte."]
 ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
-    '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>"} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
-    '{"do":"write_file","path":"...","content":"<contenu complet>","message":"<message de commit>"} : créer ou remplacer un fichier sur ta branche',
+    '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>","from_line":1,"to_line":80} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent) ; 12 000 caractères maximum par lecture : au-delà, lis la suite avec from_line/to_line ou offset/limit (en caractères)',
+    '{"do":"write_file","path":"...","content":"<contenu complet>","message":"<message de commit>"} : créer ou remplacer un fichier sur ta branche (refusé si le contenu est bien plus court que le fichier existant : c’est probablement une troncature ; utilise edit_file, ou confirm_shrink:true si c’est voulu)',
+    '{"do":"edit_file","path":"...","edits":[{"old":"<texte exact existant>","new":"<remplacement>"}],"message":"<message de commit>"} : modifier un fichier existant par remplacements ; « old » doit apparaître exactement une fois (sinon allonge-le avec du contexte, ou all:true) ; tout ou rien ; pour insérer, reprends une ancre dans « old » et ajoute le texte dans « new »',
+    '{"do":"write_chunk","path":"...","index":1,"total":3,"content":"<morceau>","message":"<message de commit>"} : écrire un gros fichier en plusieurs morceaux (1 à 50, dans n’importe quel ordre) ; dès que tous sont reçus, l’application reconstitue et écrit le fichier, puis te donne sa taille et son empreinte sha256 ; sha256 facultatif pour contrôle',
     '{"do":"delete_file","path":"...","message":"..."} : supprimer un fichier sur ta branche',
     '{"do":"lock_file","paths":["<fichier>"],"note":"<pourquoi, facultatif>"} : (répertoire local) verrouiller des fichiers avant de les modifier ; attend que les autres agents les libèrent (jusqu’à 90 s), tout ou rien',
     '{"do":"unlock_file","paths":["<fichier>"]} : (répertoire local) libérer des fichiers verrouillés (sans « paths » : tous les tiens)',
@@ -431,12 +434,54 @@ def _overflow(e):
 OLD_RESULT = "[Application] Résultats de tes actions"
 
 
+READ_MAX = 12000       # taille maximale d'un résultat de read_file
+SHRINK_GUARD = (2000, 0.5)   # write_file refusé si le fichier existant fait >= 2000 caractères et que le nouveau contenu en fait moins de la moitié
+CHUNK_TTL, CHUNK_MAX, CHUNK_BUF = 1800, 50, {}
+CHUNK_LOCK = threading.Lock()
+
+
+def read_view(t, x):
+    """Extrait lu d'un fichier selon x : `from_line`/`to_line` (1-based, inclus) ou `offset`/`limit` (caractères) ; au plus READ_MAX caractères.
+    Retourne (texte, étiquette, suite) : étiquette = précision sur l'extrait ; suite = message pour lire la suite (ou '')."""
+    def num(k):
+        try:
+            return int(x.get(k))
+        except (TypeError, ValueError):
+            return None
+    n, fl, tl, off, lim = len(t), num("from_line"), num("to_line"), num("offset"), num("limit")
+    if fl is not None or tl is not None:
+        lines = t.splitlines(True)
+        a = max(fl or 1, 1)
+        b = min(tl if tl and tl >= a else len(lines), len(lines))
+        body = "".join(lines[a - 1:b])
+        if len(body) > READ_MAX:
+            body = body[:READ_MAX]
+            b = a + body.count("\n") - (0 if body.endswith("\n") else 1)
+            nxt = "[…extrait tronqué à %d caractères : suite avec from_line=%d]" % (READ_MAX, b + 1)
+        else:
+            nxt = "[suite : from_line=%d]" % (b + 1) if b < len(lines) else ""
+        return body, " — lignes %d à %d sur %d" % (a, max(b, a), len(lines)), nxt
+    start = max(off or 0, 0)
+    size = min(max(lim or READ_MAX, 1), READ_MAX)
+    body = t[start:start + size]
+    end = start + len(body)
+    if start == 0 and off is None and lim is None:
+        lab = ""
+    else:
+        lab = " — caractères %d à %d sur %d" % (start, end, n)
+    if end < n:
+        nxt = "[…tronqué à %d caractères sur %d : lis la suite avec offset=%d, ou la zone voulue avec from_line/to_line ; pour modifier, utilise edit_file]" % (end - start, n, end)
+    else:
+        nxt = ""
+    return body, lab, nxt
+
+
 def shrink_history(h, keep=2, cap=400):
     """Abrège les anciens retours d'actions (contenu de fichiers, listes…) de l'historique envoyé à l'IA : seuls les `keep`
     derniers messages restent intacts. L'historique stocké n'est pas modifié."""
     n = len(h)
     return [m if i >= n - keep or m["role"] != "user" or not m["content"].startswith(OLD_RESULT) or len(m["content"]) <= cap
-            else {"role": "user", "content": m["content"][:cap] + "\n[…ancien résultat abrégé : relis le fichier si besoin]"}
+            else {"role": "user", "content": m["content"][:cap] + "\n[…ancien résultat abrégé : relis la zone utile avec read_file (from_line/to_line) ; ne réécris jamais un fichier à partir de ce texte abrégé]"}
             for i, m in enumerate(h)]
 
 
@@ -726,6 +771,7 @@ def do_act(u, pid, aid, x, depth, ctx=None):
     byname = lambda n: next((g for g in p["agents"] if g["name"].lower() == str(n or "").lower()), None)
     refuse = lambda m: (m, m)
     lv = lambda cap: rights.level(p, a, cap, mn)
+    x.pop("_raw", None)                                    # drapeau interne (lecture intégrale) : jamais fourni par un agent
     try:
         if kind == "message":
             t = byname(x.get("to"))
@@ -737,8 +783,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                 return refuse("Message non délivré (profondeur maximale d’échanges atteinte).")
             r = ask(u, pid, t["id"], str(x.get("text", "")), a["name"], depth + 1)
             return "", "[Réponse de %s] %s" % (t["name"], r or "(pas de réponse écrite)")
-        if kind in ("list_files", "read_file", "write_file", "delete_file"):
-            return repo_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
+        if kind in ("list_files", "read_file", "write_file", "delete_file", "edit_file", "write_chunk"):
+            return file_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
         if kind == "propose_check":
             return propose_check(u, pid, p, a, x, mn, ctx)
         if kind in GIT_KINDS:
@@ -1209,8 +1255,11 @@ def git_act(u, pid, p, a, x, kind, t0=0):
             t = locks.read_text(pw, path)
             if t is None:
                 return refuse("Fichier introuvable : %s" % path)
-            return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s (ton worktree) :\n%s\n%s\n%s%s" % (
-                path, F, t[:12000], F, "\n[…tronqué à 12000 caractères]" if len(t) > 12000 else "")
+            if x.get("_raw"):
+                return None, t
+            body, lab, nxt = read_view(t, x)
+            return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s (ton worktree)%s :\n%s\n%s\n%s%s" % (
+                path, lab, F, body, F, ("\n" + nxt) if nxt else "")
         content = str(x.get("content", "")) if kind == "write_file" else None
         if content is not None and len(content) > 200000:
             raise Err(413, "Fichier trop volumineux (200 000 caractères maximum)")
@@ -1274,10 +1323,12 @@ def local_act(u, pid, p, a, x, kind, t0=0):
         t = locks.read_text(p, path)
         if t is None:
             return refuse("Fichier introuvable : %s" % path)
+        if x.get("_raw"):
+            return None, t
         l = locks.holder_of(p, path)
         warn = ("\n⚠ Ce fichier est verrouillé par %s (modifications en cours) : son contenu peut changer." % l["name"]) if l and l["by"] != a["id"] else ""
-        cut = len(t) > 12000
-        return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s (répertoire local) :\n%s\n%s\n%s%s%s" % (path, F, t[:12000], F, "\n[…tronqué à 12000 caractères]" if cut else "", warn)
+        body, lab, nxt = read_view(t, x)
+        return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s (répertoire local)%s :\n%s\n%s\n%s%s%s" % (path, lab, F, body, F, ("\n" + nxt) if nxt else "", warn)
     content = None
     if kind == "write_file":
         content = str(x.get("content", ""))
@@ -1305,6 +1356,100 @@ def local_act(u, pid, p, a, x, kind, t0=0):
         locks.touch(u, pid, a["id"])
     record_commit(u, pid, a["name"], msg, "local")
     return "Fichier %s dans le répertoire local : %s%s" % ("écrit" if kind == "write_file" else "supprimé", path, " (verrou conservé)" if held else ""), None
+
+
+def raw_read(u, pid, p, a, path, t0):
+    """Contenu intégral d'un fichier de l'agent (quel que soit son espace de travail) : (texte, None), ou (None, motif) s'il n'existe pas."""
+    note, t = repo_act(u, pid, p, a, {"do": "read_file", "path": path, "_raw": True}, "read_file", t0)
+    return (t, None) if note is None else (None, t)
+
+
+def file_act(u, pid, p, a, x, kind, t0=0):
+    """Actions fichiers : lecture/écriture/suppression (repo_act) et, au-dessus, `edit_file` (remplacements ciblés) et `write_chunk`
+    (écriture en morceaux reconstitués ici), plus le garde-fou contre l'écriture d'un fichier tronqué."""
+    refuse = lambda m: (m, m)
+    if kind == "edit_file":
+        return edit_act(u, pid, p, a, x, t0)
+    if kind == "write_chunk":
+        return chunk_act(u, pid, p, a, x, t0)
+    if kind == "write_file" and not x.get("confirm_shrink"):
+        path = safe_path(x.get("path"), write=True)
+        old, _ = raw_read(u, pid, p, a, path, t0)
+        new = str(x.get("content", ""))
+        if old is not None and len(old) >= SHRINK_GUARD[0] and len(new) < len(old) * SHRINK_GUARD[1]:
+            return refuse("Écriture refusée : %s fait %d caractères et ton contenu seulement %d. write_file remplace le fichier ENTIER : ce contenu semble tronqué ou incomplet "
+                          "(les anciens résultats de lecture sont abrégés dans ta mémoire). Rien n’a été écrit. Modifie une partie avec edit_file (relis d’abord la zone avec read_file "
+                          "from_line/to_line), écris un gros fichier avec write_chunk, ou, si le raccourcissement est voulu, renvoie l’action avec \"confirm_shrink\":true." % (path, len(old), len(new)))
+    return repo_act(u, pid, p, a, x, kind, t0)
+
+
+def edit_act(u, pid, p, a, x, t0=0):
+    """`edit_file` : applique des remplacements de texte à un fichier existant, tout ou rien. Chaque `old` doit apparaître exactement une fois (ou `all`)."""
+    refuse = lambda m: (m, m)
+    path = safe_path(x.get("path"), write=True)
+    edits = x.get("edits")
+    if edits is None and "old" in x:
+        edits = [{"old": x.get("old"), "new": x.get("new", ""), "all": x.get("all")}]
+    if not isinstance(edits, list) or not edits or len(edits) > 50 or not all(isinstance(e, dict) and str(e.get("old", "")) for e in edits):
+        return refuse("Édition refusée : « edits » doit être une liste de 1 à 50 objets {\"old\":\"texte exact existant\",\"new\":\"remplacement\"}.")
+    cur, why = raw_read(u, pid, p, a, path, t0)
+    if cur is None:
+        return refuse("Édition refusée : " + why)
+    crlf = "\r\n" in cur
+    for i, e in enumerate(edits, 1):
+        old, new = str(e["old"]), str(e.get("new", ""))
+        if crlf and "\r\n" not in old:                      # fichier Windows : l'agent écrit des fins de ligne « \n »
+            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+        n = cur.count(old)
+        if n == 0:
+            return refuse("Édition %d refusée : le texte « old » est introuvable dans %s (copie-le exactement, espaces et fins de ligne compris : relis la zone avec read_file from_line/to_line). Aucune modification n’a été faite." % (i, path))
+        if n > 1 and not e.get("all"):
+            return refuse("Édition %d refusée : le texte « old » apparaît %d fois dans %s. Allonge-le avec le contexte voisin pour qu’il soit unique, ou ajoute \"all\":true. Aucune modification n’a été faite." % (i, n, path))
+        cur = cur.replace(old, new) if e.get("all") else cur.replace(old, new, 1)
+    if len(cur) > 200000:
+        raise Err(413, "Fichier trop volumineux (200 000 caractères maximum)")
+    r = repo_act(u, pid, p, a, {"do": "write_file", "path": path, "content": cur, "message": str(x.get("message") or "") or "edit %s" % path}, "write_file", t0)
+    if r[1] is None:
+        return "%s — %d modification(s)" % (r[0], len(edits)), None
+    return r
+
+
+def chunk_act(u, pid, p, a, x, t0=0):
+    """`write_chunk` : reçoit un fichier en morceaux numérotés (1..total, dans n'importe quel ordre), garde les morceaux en mémoire, puis, dès qu'ils sont tous là,
+    reconstitue le fichier, vérifie l'empreinte `sha256` si elle est fournie et l'écrit comme write_file. Rien n'est écrit tant qu'il manque un morceau."""
+    refuse = lambda m: (m, m)
+    path = safe_path(x.get("path"), write=True)
+    try:
+        idx, total = int(x.get("index")), int(x.get("total"))
+    except (TypeError, ValueError):
+        return refuse("Morceau refusé : « index » et « total » doivent être des entiers.")
+    if not 1 <= total <= CHUNK_MAX or not 1 <= idx <= total:
+        return refuse("Morceau refusé : index %s / total %s invalides (1 ≤ index ≤ total ≤ %d)." % (x.get("index"), x.get("total"), CHUNK_MAX))
+    key, now = (str(u), pid, a["id"], path), time.time()
+    with CHUNK_LOCK:
+        for k in [k for k, v in CHUNK_BUF.items() if now - v["ts"] > CHUNK_TTL]:
+            CHUNK_BUF.pop(k, None)                         # morceaux orphelins (agent arrêté, application redémarrée…)
+        b = CHUNK_BUF.get(key)
+        if b is None or b["total"] != total:
+            b = CHUNK_BUF[key] = {"total": total, "parts": {}, "ts": now, "message": "", "sha": ""}
+        b["parts"][idx], b["ts"] = str(x.get("content", "")), now
+        b["message"] = str(x.get("message") or b["message"])
+        b["sha"] = str(x.get("sha256") or b["sha"]).strip().lower()
+        missing = [i for i in range(1, total + 1) if i not in b["parts"]]
+        if missing:
+            return "Morceau %d/%d de %s reçu" % (idx, total, path), "Morceau %d/%d reçu (%d caractères). Manquants : %s. Rien n’est encore écrit." % (idx, total, len(b["parts"][idx]), ", ".join(map(str, missing)))
+        full = "".join(b["parts"][i] for i in range(1, total + 1))
+        CHUNK_BUF.pop(key, None)
+        msg, want = b["message"], b["sha"]
+    if len(full) > 200000:
+        raise Err(413, "Fichier trop volumineux (200 000 caractères maximum)")
+    got = hashlib.sha256(full.encode("utf-8")).hexdigest()
+    if want and want != got:
+        return refuse("Reconstitution de %s refusée : empreinte sha256 différente (attendue %s…, obtenue %s…). Rien n’a été écrit : renvoie tous les morceaux." % (path, want[:12], got[:12]))
+    r = file_act(u, pid, p, a, {"do": "write_file", "path": path, "content": full, "message": msg or "update %s" % path, "confirm_shrink": x.get("confirm_shrink")}, "write_file", t0)
+    if r[1] is None:
+        return "%s — reconstitué de %d morceaux (%d caractères, sha256 %s…)" % (r[0], total, len(full), got[:12]), "Fichier %s reconstitué à partir de %d morceaux : %d caractères, sha256 %s." % (path, total, len(full), got)
+    return r
 
 
 def repo_act(u, pid, p, a, x, kind, t0=0):
@@ -1343,8 +1488,10 @@ def repo_act(u, pid, p, a, x, kind, t0=0):
         if t is None:
             m = "Fichier introuvable : %s" % path
             return m, m
-        cut = len(t) > 12000
-        return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s :\n%s\n%s\n%s%s" % (path, F, t[:12000], F, "\n[…tronqué à 12000 caractères]" if cut else "")
+        if x.get("_raw"):
+            return None, t
+        body, lab, nxt = read_view(t, x)
+        return "Lecture de %s (%d caractères)" % (path, len(t)), "Fichier %s%s :\n%s\n%s\n%s%s" % (path, lab, F, body, F, ("\n" + nxt) if nxt else "")
     msg = str(x.get("message") or "")
     if kind == "write_file":
         content = str(x.get("content", ""))
