@@ -2659,5 +2659,46 @@ class LimitesGithub(unittest.TestCase):
         self.assertTrue(all(w <= self.gh.MAX_WAIT for w in self.sleeps))
 
 
+class EconomieLectureGithub(unittest.TestCase):
+    """Plan, lecture ciblée et mise en cache du plan sur le faux GitHub."""
+    def setUp(self):
+        reset()
+        BRANCHES["main"] = mk_commit({"README.md": "# demo", "src/app.py": "def demarrer():\n    return 1\n\n\nclass Serveur:\n    def run(self):\n        return 2\n",
+                                      "src/util.js": "function aide(x) {\n  return x;\n}\n", "node_modules/x.js": "function inutile() {}\n"}, [], "init")
+        store.wj(store.state_path("u"), make_state())
+        engine.SYM_CACHE.clear()
+        engine.SYM_MAPS.clear()
+
+    def act(self, who, kind, **x):
+        return engine.do_act("u", "p1", who, {"do": kind, **x}, 0, {"n": 0, "t0": time.time()})
+
+    def test_plan_recherche_et_lecture_de_symbole(self):
+        n, back = self.act("a2", "outline", path="")
+        self.assertIn("src/app.py", back)
+        self.assertIn("Serveur{1}", back)
+        self.assertIn("aide", back)
+        self.assertNotIn("inutile", back)
+        n, back = self.act("a2", "read_symbol", path="src/app.py", symbol="Serveur.run")
+        self.assertIn("return 2", back)
+        self.assertNotIn("demarrer", back)
+        self.assertIn("src/util.js:L1-3", self.act("a2", "find_symbol", name="aide")[1])
+        self.assertIn("introuvable", self.act("a2", "outline", path="nexiste/pas")[1].lower())
+
+    def test_plan_en_cache_tant_que_la_branche_ne_bouge_pas(self):
+        self.act("a2", "outline", path="")
+        n, back = self.act("a2", "outline", path="")
+        self.assertIn("en cache", n)
+        self.act("a2", "write_file", path="src/new.py", content="def nouveau():\n    pass\n", message="m")      # la branche avance : plan recalculé
+        n, back = self.act("a2", "outline", path="")
+        self.assertNotIn("en cache", n)
+        self.assertIn("nouveau", back)
+
+    def test_lecture_de_la_branche_d_un_autre_agent_et_de_base(self):
+        self.act("a2", "write_file", path="src/b.py", content="def de_bob():\n    pass\n", message="m")
+        self.assertIn("de_bob", self.act("a1", "outline", path="src/b.py", agent="Bob")[1])
+        self.assertIn("introuvable", self.act("a1", "outline", path="src/b.py", agent="base")[1].lower())
+        self.assertIn("inconnu", self.act("a1", "outline", path="", agent="Zoé")[1])
+
+
 if __name__ == "__main__":
     unittest.main()

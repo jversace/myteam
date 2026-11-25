@@ -18,6 +18,7 @@ import gitlocal
 import checks
 import locks
 import project_rules as prules
+import symbols
 import system_actions as sysact
 import rights
 import rulebook
@@ -53,7 +54,10 @@ RULES = rulebook.all_lines()
 ACTION_HEAD = "Actions (un objet JSON par bloc %saction ... %s) :" % (F, F)
 ACTION_LINES = [
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
-    '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>","from_line":1,"to_line":80} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent) ; 12 000 caractères maximum par lecture : au-delà, lis la suite avec from_line/to_line ou offset/limit (en caractères)',
+    '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>","from_line":1,"to_line":80} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent) ; 12 000 caractères maximum par lecture : au-delà, lis la suite avec from_line/to_line ou offset/limit (en caractères) ; une relecture identique à une lecture encore visible dans ta conversation renvoie « INCHANGÉ » (ou seulement les différences) : \"full\":true force le contenu complet',
+    '{"do":"outline","path":"<fichier, ou dossier ; vide = tout le dépôt>","agent":"<prénom ou base, facultatif>"} : plan SANS lire le contenu : symboles d’un fichier avec leurs lignes (classes, fonctions, sections, blocs script) ou plan compact du dépôt ; à utiliser AVANT read_file pour t’orienter',
+    '{"do":"read_symbol","path":"...","symbol":"<nom ou Classe.méthode>","context":0,"agent":"<prénom ou base, facultatif>"} : lire UNE fonction/classe/section (avec les numéros de ligne pour edit_file) au lieu du fichier entier',
+    '{"do":"find_symbol","name":"<nom ou début de nom>","path":"<dossier, facultatif>","agent":"<prénom ou base, facultatif>"} : où est défini ce symbole dans le dépôt (fichier et lignes)',
     '{"do":"write_file","path":"...","content":"<contenu complet>","message":"<message de commit>"} : créer ou remplacer un fichier sur ta branche (refusé si le contenu est bien plus court que le fichier existant : c’est probablement une troncature ; utilise edit_file, ou confirm_shrink:true si c’est voulu)',
     '{"do":"edit_file","path":"...","edits":[{"old":"<texte exact existant>","new":"<remplacement>"}],"message":"<message de commit>"} : modifier un fichier existant par remplacements ; « old » doit apparaître exactement une fois (sinon allonge-le avec du contexte, ou all:true) ; tout ou rien ; pour insérer, reprends une ancre dans « old » et ajoute le texte dans « new »',
     '{"do":"write_chunk","path":"...","index":1,"total":3,"content":"<morceau>","message":"<message de commit>"} : écrire un gros fichier en plusieurs morceaux (1 à 50, dans n’importe quel ordre) ; dès que tous sont reçus, l’application reconstitue et écrit le fichier, puis te donne sa taille et son empreinte sha256 ; sha256 facultatif pour contrôle',
@@ -81,6 +85,9 @@ ACTION_LINES = [
     '{"do":"wf_step","outcome":"ok|ko","comment":"..."} : conclure l’étape de workflow qui t’est confiée (ok = réalisée)',
     '{"do":"get_blockers"} : liste FACTUELLE des blocages du projet (conflits, dépendances, erreurs, décisions en attente) — à consulter avant toute question technique',
     '{"do":"context","text":"..."} : réécrire tes notes personnelles (fichier de contexte)',
+    '{"do":"note","text":"<une ligne>"} : AJOUTER une ligne à tes notes sans les renvoyer en entier (4 000 caractères maximum ; au-delà, condense avec context)',
+    '{"do":"get_work_context"} : en UN appel, sans coût : tes tâches ouvertes, les blocages qui te concernent, tes merge requests, l’état de ton espace (git : fichiers modifiés, avance/retard ; répertoire local : verrous)',
+    '{"do":"submit_task","id":"<id de la tâche>","summary":"<compte rendu précis>"} : terminer ta tâche en UN appel : commit éventuel, soumission (merge request) ou libération des verrous, puis statut « à vérifier » ; refusé avec le motif si les contrôles ou un conflit l’empêchent (la tâche reste en cours)',
     '{"do":"task","title":"...","desc":"...","assignee":"<prénom>","parent":"<id de la tâche parente, vide = 1er niveau>","modules":["<module>"],"depends_on":["<id d’une tâche à terminer avant>"],"why":"<justification>"} : créer une tâche (sous-tâche libre sous tes tâches ; 1er niveau selon tes droits)',
     '{"do":"task_status","id":"<id>","status":"à faire|en cours|en attente|à vérifier","note":"<compte rendu>"} : statut d’une de tes tâches (« à vérifier » = fini de ton côté ; la clôture se fait par vérification)',
     '{"do":"task_review","id":"<id>","verdict":"accepted|rejected","comment":"<ce qui manque, si rejected>"} : (agent principal / QA) vérifier une tâche « à vérifier » : accepted seulement si le travail est réellement fait',
@@ -93,7 +100,8 @@ ACTION_LINES = [
     '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>","replaces":[<n° des décisions en attente auxquelles cette question répond aussi>]} : poser une question à l’utilisateur (ambiguïté, décision structurante) ; si elle répond aussi à une question déjà en attente, indique son numéro dans replaces : l’ancienne est annulée et remplacée',
     '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>","subject":"<sujet facultatif>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur ; subject (langue, ambiguite, interruption, coordination, fichier_contexte, fichiers) fait remplacer la règle par défaut correspondante',
     '{"do":"instr_rewrite","items":[...],"obsolete":[...]} : (uniquement lors d’une consolidation demandée par l’application) liste consolidée des instructions',
-    '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications']
+    '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications',
+    '{"do":"spec_edit","edits":[{"old":"<texte exact>","new":"<remplacement>"}],"append":"<texte à ajouter à la fin, facultatif>"} : (agent principal) modifier les spécifications par remplacements ou ajout, sans les renvoyer en entier (préférable à spec)']
 ACTIONS = ACTION_HEAD + "\n" + "\n".join(ACTION_LINES)           # liste complète (référence) : les agents reçoivent la liste filtrée, voir actions_text
 
 
@@ -102,7 +110,8 @@ def _aname(line):
 
 
 # Actions toujours proposées (bloc de prompt partagé) ; les autres dépendent des droits, du mode et du projet (voir action_applies).
-ACTIONS_ALWAYS = ("list_files", "read_file", "write_file", "edit_file", "write_chunk", "delete_file", "get_blockers", "context", "task_status", "ask_user")
+ACTIONS_ALWAYS = ("list_files", "outline", "read_symbol", "find_symbol", "read_file", "write_file", "edit_file", "write_chunk", "delete_file", "get_blockers", "get_work_context",
+                  "context", "note", "task_status", "submit_task", "ask_user")
 ACTIONS_HIDDEN = ("instr_rewrite",)                # décrite dans la demande de consolidation, jamais dans le prompt courant
 GIT_ONLY = ("status", "commit", "diff", "search", "sync", "git_log", "git_show")
 
@@ -151,7 +160,7 @@ def action_applies(p, a, name):
         return mode == "local"
     if name == "force_unlock":
         return mn and any(local_agent(p, x) and not git_agent(p, x) for x in p.get("agents", []))
-    if name in ("stop_agent", "relaunch", "instruction", "spec"):
+    if name in ("stop_agent", "relaunch", "instruction", "spec", "spec_edit"):
         return mn
     if name in GIT_ONLY:
         return mode == "git"
@@ -900,6 +909,16 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return "", "[Réponse de %s] %s" % (t["name"], r or "(pas de réponse écrite)")
         if kind in ("list_files", "read_file", "write_file", "delete_file", "edit_file", "write_chunk"):
             return file_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
+        if kind in ("outline", "read_symbol", "find_symbol"):
+            return sym_act(u, pid, p, a, x, kind, ctx.get("t0", 0))
+        if kind == "get_work_context":
+            return work_context(u, pid, p, a, mn)
+        if kind == "note":
+            return note_act(u, pid, p, a, x, depth, ctx)
+        if kind == "submit_task":
+            return submit_task_act(u, pid, p, a, x, mn, depth, ctx)
+        if kind == "spec_edit":
+            return spec_edit_act(u, pid, p, a, x, mn, depth, ctx)
         if kind == "propose_check":
             return propose_check(u, pid, p, a, x, mn, ctx)
         if kind in GIT_KINDS:
@@ -1571,6 +1590,8 @@ def file_act(u, pid, p, a, x, kind, t0=0):
                 READS.pop(kk, None)
             n = READS.get(k, (0, 0))[0] + 1
             READS[k] = (n, now_t)
+        if r[1] is not None and r[0] is not r[1] and not x.get("full"):
+            r = (r[0], reread_filter(a, r[1]))
         if n >= REREAD_WARN and r[1] is not None and r[0] is not r[1]:
             r = (r[0], r[1] + "\n⚠ C’est la lecture n°%d de ce même extrait sans écriture entre-temps. Relire en boucle ne sert à rien : passe à l’étape suivante. "
                  "Pour modifier, utilise edit_file avec un passage exact copié ci-dessus (pas besoin du fichier entier) ; pour un autre passage, lis seulement la zone utile (from_line/to_line) ; "
@@ -1731,6 +1752,318 @@ def repo_act(u, pid, p, a, x, kind, t0=0):
     sha = rp.delete_file(b, path, msg)
     record_commit(u, pid, a["name"], msg, sha)
     return "Fichier supprimé sur %s : %s (%s)" % (b, path, sha[:7]), None
+
+
+# ---------------------------------------------------------------- Économie de tokens : relecture différentielle, plan et lecture ciblée, actions « tout-en-un »
+
+REREAD_WINDOW = 20      # un extrait n'est déclaré « inchangé » que si sa lecture précédente est dans les 20 derniers messages (l'historique envoyé en garde 30)
+SYM_FILES, SYM_READS, SYM_DIRS, SYM_CAP = 400, 150, 150, 3000
+SYM_CACHE, SYM_MAPS = {}, {}                         # analyse par fichier (empreinte du contenu) ; plan de dépôt GitHub (empreinte de la branche)
+SYM_LOCK = threading.Lock()
+NOTES_MAX = 4000        # caractères maximum des notes personnelles d'un agent (elles sont renvoyées à l'IA à chaque tour : elles ne doivent pas enfler)
+HEAD_RE = re.compile(r"\A(Fichier [^\n]* :)\n" + F + r"\n")
+
+
+def reread_filter(a, res):
+    """Relecture différentielle : `res` est le retour d'un read_file (ou read_symbol) réussi, de la forme « Fichier … :\\n```\\ncorps\\n```… ».
+    Si la MÊME zone du MÊME fichier figure déjà, intacte, parmi les derniers messages de l'agent (ce que l'IA verra vraiment : historique borné et abrégé
+    comme dans `ask`), on renvoie « INCHANGÉ » à la place du contenu ; si elle a changé et que la différence est courte, seulement le diff.
+    Dans tout autre cas (jamais lue, abrégée depuis, trop ancienne) : le contenu complet, inchangé."""
+    m = HEAD_RE.match(res)
+    if not m:
+        return res
+    head, rest = m.group(1), res[m.end():]
+    cut = rest.rfind("\n" + F)
+    if cut < 0:
+        return res
+    body, tail = rest[:cut], rest[cut + 1 + len(F):]
+    h = list(a.get("history", []))[-30:]
+    while h and h[0]["role"] != "user":
+        h.pop(0)
+    h = shrink_history(h)                                   # exactement ce que l'IA recevra : un retour abrégé ne compte pas comme « encore visible »
+    block = head + "\n" + F + "\n" + body + "\n" + F
+    for i in range(len(h) - 1, max(len(h) - REREAD_WINDOW, 0) - 1, -1):
+        c = h[i]["content"]
+        if h[i]["role"] != "user" or not c.startswith(OLD_RESULT):
+            continue
+        if block in c:
+            return "%s INCHANGÉ depuis ta lecture précédente (%d caractères, sha256 %s…) : son contenu est toujours plus haut dans la conversation. Pour le relire quand même : \"full\":true.%s" % (
+                head[:-2], len(body), hashlib.sha256(body.encode("utf-8")).hexdigest()[:10], tail)
+        pos = c.find(head + "\n" + F + "\n")
+        if pos >= 0 and F not in body:
+            prev = c[pos + len(head) + 1 + len(F) + 1:]
+            e = prev.find("\n" + F)
+            if e >= 0 and F not in prev[:e]:
+                d = symbols.compact_diff(prev[:e], body)
+                if d and len(d) < 0.6 * len(body) and len(d) < 6000:
+                    return "%s MODIFIÉ depuis ta lecture précédente (encore visible plus haut) : seules les différences sont renvoyées (- ancien, + nouveau). Contenu complet : \"full\":true.\n%sdiff\n%s\n%s%s" % (
+                        head[:-2], F, d, F, tail)
+            break                                           # même zone retrouvée mais inexploitable : contenu complet
+    return res
+
+
+def _space(u, pid, p, a, agent=""):
+    """Espace de fichiers lisible par l'agent (comme repo_act) : (mode, poignée, branche) ; mode = git | local | github."""
+    tgt = str(agent or "").strip()
+    other = next((g for g in p["agents"] if g["name"].lower() == tgt.lower()), None) if tgt else None
+    if git_agent(p, a):
+        if tgt:
+            raise Err(400, "En mode git local, tu ne vois que ton propre worktree : pour le travail d'un autre agent, utilise git_show (rev = sa branche).")
+        lg, wt = git_workspace(u, pid, p, a)
+        return "git", dict(p, localdir=wt), ""
+    if (local_agent(p, a) and not tgt) or (other and local_agent(p, other)):
+        return "local", p, ""
+    rp = github.Repo(p)
+    b = a["branch"]
+    if tgt:
+        if other:
+            b = other["branch"]
+        elif tgt.lower() == "base":
+            b = rp.base
+        else:
+            raise Err(404, "Agent inconnu : %s." % tgt)
+    else:
+        rp.ensure_branch(b)
+    return "github", rp, b
+
+
+def _ls(sp, path):
+    return sp[1].list_dir(sp[2], path) if sp[0] == "github" else locks.list_dir(sp[1], path)
+
+
+def _cat(sp, path):
+    return sp[1].read_file(sp[2], path) if sp[0] == "github" else locks.read_text(sp[1], path)
+
+
+def _items(u, pid, sp, path, text):
+    """Symboles d'un fichier, avec cache par empreinte du contenu (un fichier inchangé n'est pas réanalysé)."""
+    key = (str(u), pid, sp[0], sp[2], path)
+    hh = hashlib.md5(text.encode("utf-8", "replace")).hexdigest()
+    with SYM_LOCK:
+        c = SYM_CACHE.get(key)
+        if c and c[0] == hh:
+            return c[1]
+    it = symbols.outline(path, text)
+    with SYM_LOCK:
+        if len(SYM_CACHE) >= SYM_CAP:
+            SYM_CACHE.clear()
+        SYM_CACHE[key] = (hh, it)
+    return it
+
+
+def _walk(sp, root):
+    """Fichiers (chemin, taille) sous `root`, dossiers techniques ignorés, bornés (SYM_FILES fichiers, SYM_DIRS dossiers). -> (fichiers, tronqué)."""
+    files, todo, nd = [], [root], 0
+    while todo:
+        d = todo.pop(0)
+        if nd >= SYM_DIRS or len(files) >= SYM_FILES:
+            return sorted(files), True
+        nd += 1
+        for e in _ls(sp, d) or []:
+            full = (d + "/" if d else "") + e["name"]
+            if e["type"] == "dir":
+                if not symbols.skip_dir(e["name"]):
+                    todo.append(full)
+            else:
+                files.append((full, e.get("size") or 0))
+    return sorted(files), False
+
+
+def sym_act(u, pid, p, a, x, kind, t0=0):
+    """`outline` (plan d'un fichier ou du dépôt), `read_symbol` (une fonction/classe/section), `find_symbol` (où est défini un nom) : l'application analyse les
+    fichiers (module `symbols`, sans IA) et ne renvoie à l'agent que ce qui l'intéresse, au lieu de lui faire lire des fichiers entiers."""
+    refuse = lambda m: (m, m)
+    agent = str(x.get("agent") or "").strip()
+    path = safe_path(x.get("path"))
+    sp = _space(u, pid, p, a, agent)
+    where = {"git": "ton worktree", "local": "répertoire local", "github": sp[2]}[sp[0]]
+    text = None
+    if path:
+        try:
+            text = _cat(sp, path)
+        except Err:
+            text = None                                              # dossier (GitHub refuse de lire un dossier comme un fichier)
+    if kind == "read_symbol":
+        name = str(x.get("symbol") or x.get("name") or "").strip()
+        if not path or text is None:
+            return refuse("Fichier introuvable : %s" % path if path else "read_symbol : indique « path » (le fichier) et « symbol ».")
+        if not name:
+            return refuse("read_symbol : indique « symbol » (nom, ou Classe.méthode). Pour la liste des symboles : outline sur ce fichier.")
+        its = _items(u, pid, sp, path, text)
+        if its is None:
+            return refuse("Analyse impossible pour %s (langage non reconnu ou erreur de syntaxe) : utilise read_file avec from_line/to_line." % path)
+        hit = symbols.find(its, name)
+        if not hit:
+            near = symbols.close_names(its, name)
+            return refuse("Symbole « %s » introuvable dans %s.%s Liste des symboles : outline sur ce fichier." % (name, path, (" Noms proches : " + ", ".join(near) + ".") if near else ""))
+        if len(hit) > 1:
+            return "Plusieurs symboles « %s » dans %s" % (name, path), "Plusieurs symboles « %s » dans %s : %s. Précise Classe.méthode, ou lis par lignes (from_line/to_line)." % (
+                name, path, " ; ".join("%s (L%d-%d)" % (i["qual"], i["start"], i["end"]) for i in hit[:8]))
+        s = hit[0]
+        try:
+            ctxn = min(max(int(x.get("context") or 0), 0), 30)
+        except (TypeError, ValueError):
+            ctxn = 0
+        n = len(text.splitlines())
+        body, lab, nxt = read_view(text, {"from_line": max(s["start"] - ctxn, 1), "to_line": min(s["end"] + ctxn, n)})
+        res = "Fichier %s (%s)%s [%s %s : lignes %d-%d] :\n%s\n%s\n%s%s" % (path, where, lab, s["kind"], s["qual"], s["start"], s["end"], F, body, F, ("\n" + nxt) if nxt else "")
+        if not x.get("full"):
+            res = reread_filter(a, res)
+        return "Lecture de %s dans %s (%d lignes)" % (s["qual"], path, s["end"] - s["start"] + 1), res
+    if kind == "outline" and text is not None:
+        its = _items(u, pid, sp, path, text)
+        if its is None:
+            return refuse("Plan indisponible pour %s (langage non reconnu, fichier trop gros ou erreur de syntaxe) : utilise read_file avec from_line/to_line." % path)
+        n = len(text.splitlines())
+        return "Plan de %s (%d symboles)" % (path, len(its)), "Plan de %s (%s, %d lignes) :\n%s\n[lire un symbole : read_symbol ; une zone : read_file from_line/to_line]" % (path, where, n, symbols.format_outline(its, n))
+    if path and text is None and _ls(sp, path) is None:
+        return refuse("Introuvable : %s" % path)
+    # dossier (ou racine) : plan compact du dépôt, ou recherche d'un symbole
+    mkey = (str(u), pid, sp[2], path)
+    head = None
+    if sp[0] == "github" and kind == "outline":
+        head = sp[1].sha(sp[2])
+        with SYM_LOCK:
+            c = SYM_MAPS.get(mkey)
+        if c and head and c[0] == head:
+            return "Plan de /%s (en cache)" % path, c[1]
+    files, cut = _walk(sp, path)
+    src = [(f, s) for f, s in files if symbols.kind_of(f) and s <= symbols.MAX_FILE]
+    others = [f for f, _ in files if not symbols.kind_of(f)]
+    q = str(x.get("name") or x.get("symbol") or "").strip()
+    if kind == "find_symbol" and not q:
+        return refuse("find_symbol : indique « name » (nom du symbole, ou début du nom).")
+    entries, exact, loose, reads = [], [], [], 0
+    for f, _sz in src:
+        if reads >= SYM_READS:
+            cut = True
+            break
+        reads += 1
+        try:
+            tx = _cat(sp, f)
+        except Err:
+            continue
+        if tx is None:
+            continue
+        its = _items(u, pid, sp, f, tx)
+        if its is None:
+            continue
+        if kind == "outline":
+            entries.append((f, its, len(tx.splitlines())))
+        else:
+            exact += [(f, i) for i in symbols.find(its, q)]
+            loose += [(f, i) for i in its if q.lower() in i["name"].lower()]
+    if kind == "find_symbol":
+        hits = exact or loose
+        rows = ["%s:L%d-%d  %s" % (f, i["start"], i["end"], i["sig"] or i["name"]) for f, i in hits[:30]]
+        more = ("\n[… %d résultats de plus : précise le nom ou le dossier]" % (len(hits) - 30)) if len(hits) > 30 else ""
+        part = "\n[recherche partielle : dépôt volumineux, précise « path » (dossier)]" if cut else ""
+        return "Recherche de « %s » : %d résultat(s)" % (q[:40], len(hits)), ("\n".join(rows) + more + part) if rows else "Aucun symbole « %s » défini dans /%s (%d fichiers analysés).%s" % (q, path, reads, part)
+    txt = "Plan de /%s (%s) : %d fichier(s) source. Chaque ligne : chemin (lignes) : symboles de premier niveau, Classe{nb méthodes}.\n%s%s\n[détail d'un fichier : outline path=… ; lire un symbole : read_symbol ; où est défini un nom : find_symbol]" % (
+        path, where, len(entries), symbols.repo_map(entries, others), "\n[plan partiel : dépôt volumineux]" if cut else "")
+    if head and not cut:
+        with SYM_LOCK:
+            if len(SYM_MAPS) > 200:
+                SYM_MAPS.clear()
+            SYM_MAPS[mkey] = (head, txt)
+    return "Plan de /%s (%d fichiers)" % (path, len(entries)), txt
+
+
+def work_context(u, pid, p, a, mn):
+    """`get_work_context` : tout ce qu'un agent consulte d'habitude en plusieurs actions (tâches, blocages, merge requests, état de l'espace), en un seul retour, sans IA."""
+    if sync_mrs(u, pid, force=True):                              # comme get_blockers : jamais de « blocage fantôme »
+        spawn(tick, u, pid)
+        p = snap(u, pid)
+    L = []
+    mine = [t for t in p.get("tasks", []) if t.get("who") == a["id"] and t["status"] in ("en cours", "à faire", "en attente", "à vérifier")]
+    for t in mine[:8]:
+        d = deps_unmet(p, t)
+        L.append("- %s « %s » [%s]%s%s" % (t["id"], t["title"], t["status"], (" — attend : " + ", ".join(d)) if d else "", (" — en attente de décision" if t.get("blocked") else "")))
+    L = ["Tes tâches :"] + (L or ["- (aucune tâche ouverte)"])
+    bl = [i for i in diagnose(p) if mn or i["who"] in (a["name"], "Projet") or i["level"] == "bloquant"]
+    L += ["Blocages :"] + ["- [%s] %s : %s" % (i["level"], i["who"], i["text"]) for i in bl]
+    mrs = [m for m in p.get("mrs", []) if m.get("id") and m.get("status") in MR_ACTIVE and (mn or m.get("by_id") == a["id"])]
+    if mrs:
+        L += ["Merge requests ouvertes :"] + ["- #%s « %s » (%s → %s) : %s" % (m.get("n", "?"), m.get("title", ""), m.get("from", "?"), m.get("to", "?"), m["status"]) for m in mrs]
+    if git_agent(p, a):
+        try:
+            lg, wt = git_workspace(u, pid, p, a)
+            st, br, tgt = lg.status(wt), lg.current_branch(wt), git_target(p)
+            L.append("Ton worktree : branche %s, cible %s, %s." % (br or "?", tgt, ("%d fichier(s) modifié(s) non commité(s) : %s" % (len(st), ", ".join(i["path"] for i in st[:8]))) if st else "rien à committer"))
+            if br:
+                ab = lg.ahead_behind(br, tgt)
+                L.append("Par rapport à %s : %d commit(s) en avance, %d en retard%s." % (tgt, ab["ahead"], ab["behind"], " → fais sync" if ab["behind"] else ""))
+        except Err as e:
+            L.append("Espace git indisponible : %s" % e.msg)
+    elif local_agent(p, a):
+        L.append(lock_report(p))
+    return "Contexte de travail consulté", "\n".join(L)
+
+
+def note_act(u, pid, p, a, x, depth, ctx):
+    """`note` : ajoute une ligne aux notes de l'agent sans qu'il ait à les renvoyer en entier (action `context`, qui écrit aussi le fichier de contexte)."""
+    t = " ".join(str(x.get("text", "")).split())
+    if not t:
+        return "Note vide.", "Note vide."
+    cur = (a.get("notes") or "").rstrip()
+    new = (cur + "\n" if cur else "") + "- " + t
+    if len(new) > NOTES_MAX:
+        m = "Note refusée : tes notes feraient %d caractères (maximum %d : elles sont renvoyées à l’IA à chaque tour). Condense-les avec context (réécriture complète), puis réessaie." % (len(new), NOTES_MAX)
+        return m, m
+    return do_act(u, pid, a["id"], {"do": "context", "text": new}, depth, ctx)
+
+
+def spec_edit_act(u, pid, p, a, x, mn, depth, ctx):
+    """`spec_edit` : modifie les spécifications par remplacements exacts (tout ou rien) et/ou ajout en fin, sans les renvoyer en entier."""
+    refuse = lambda m: (m, m)
+    if not mn:
+        return refuse("Mise à jour des spécifications refusée : réservée à l’agent principal.")
+    cur = p.get("spec") or ""
+    edits, app = x.get("edits") or [], str(x.get("append") or "")
+    if not isinstance(edits, list) or len(edits) > 50 or not all(isinstance(e, dict) and str(e.get("old", "")) for e in edits) or not (edits or app.strip()):
+        return refuse("spec_edit refusé : fournis « edits » (liste de {\"old\":\"texte exact\",\"new\":\"remplacement\"}) et/ou « append » (texte à ajouter).")
+    for i, e in enumerate(edits, 1):
+        old, new = str(e["old"]), str(e.get("new", ""))
+        n = cur.count(old)
+        if n == 0:
+            return refuse("Édition %d refusée : « old » est introuvable dans les spécifications (copie-le exactement). Aucune modification n’a été faite." % i)
+        if n > 1 and not e.get("all"):
+            return refuse("Édition %d refusée : « old » apparaît %d fois. Allonge-le pour qu’il soit unique, ou ajoute \"all\":true. Aucune modification n’a été faite." % (i, n))
+        cur = cur.replace(old, new) if e.get("all") else cur.replace(old, new, 1)
+    if app.strip():
+        cur = cur.rstrip("\n") + "\n\n" + app.strip() + "\n"
+    note, back = do_act(u, pid, a["id"], {"do": "spec", "text": cur}, depth, ctx)
+    if back is None:
+        return "%s (%d remplacement(s)%s)" % (note, len(edits), ", ajout en fin" if app.strip() else ""), None
+    return note, back
+
+
+def submit_task_act(u, pid, p, a, x, mn, depth, ctx):
+    """`submit_task` : termine une tâche en un seul appel (commit programmatique + merge request en mode git ou GitHub, libération des verrous en répertoire local),
+    puis statut « à vérifier ». Un conflit ou des contrôles en échec refusent la soumission : la tâche reste en cours et l'agent reçoit le motif."""
+    refuse = lambda m: (m, m)
+    t = by_id(p.get("tasks", []), x.get("id"))
+    if not t or (t.get("who") != a["id"] and not mn):
+        return refuse("submit_task refusé : tâche inconnue ou qui n'est pas la tienne.")
+    if t["status"] not in ("en cours", "à faire", "en attente"):
+        return refuse("submit_task refusé : la tâche « %s » est déjà « %s »." % (t["title"], t["status"]))
+    summ = str(x.get("summary") or x.get("note") or "").strip()
+    if not summ:
+        return refuse("submit_task refusé : « summary » (compte rendu précis de ce qui est fait) est obligatoire.")
+    notes = []
+    owner = by_id(p["agents"], t.get("who")) or a
+    if local_agent(p, owner) and not git_agent(p, owner):
+        freed = locks.release(u, pid, owner["id"])
+        notes.append(("Verrous libérés : %s." % ", ".join(freed)) if freed else "Aucun verrou à libérer.")
+    else:
+        st, mm = submit_mr(u, pid, owner["id"], "Tâche : %s" % t["title"], summ, t["id"])
+        if st in ("conflict", "checks"):
+            return refuse("Soumission interrompue, la tâche « %s » reste en cours.\n%s" % (t["title"], mm))
+        notes.append(mm)
+    note, back = do_act(u, pid, a["id"], {"do": "task_status", "id": t["id"], "status": "à vérifier", "note": summ}, depth, ctx)
+    if back is not None:
+        return note, back
+    return "Tâche « %s » soumise : %s" % (t["title"], " ".join(notes)), "%s %s" % (note, " ".join(notes))
 
 
 def lock_report(p):

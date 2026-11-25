@@ -1425,5 +1425,27 @@ class PousseeRelease(RemoteBase):
         self.assertIn("Aucun remote", self.logs())
 
 
+
+class EconomieTokens(Base):
+    """Plan, lecture ciblée et contexte de travail dans le worktree git de l'agent."""
+    def test_outline_read_symbol_find_symbol_et_contexte_dans_le_worktree(self):
+        self.act("a2", "write_file", path="src/x.py", content="def tache():\n    return 42\n\n\nclass Moteur:\n    def run(self):\n        return 1\n")
+        n, back = self.act("a2", "outline", path="")
+        self.assertIn("src/x.py", back)
+        self.assertIn("Moteur{1}", back)
+        self.assertIn("ton worktree", self.act("a2", "outline", path="src/x.py")[1])
+        self.assertIn("return 42", self.act("a2", "read_symbol", path="src/x.py", symbol="tache")[1])
+        self.assertNotIn("class Moteur", self.act("a2", "read_symbol", path="src/x.py", symbol="tache")[1])
+        self.assertIn("src/x.py:L5-7", self.act("a2", "find_symbol", name="Moteur")[1])
+        self.assertIn("Aucun symbole", self.act("a3", "find_symbol", name="Moteur")[1])        # Carl ne voit pas le worktree de Bob
+        n, ctx = self.act("a2", "get_work_context")
+        self.assertIn("src/x.py", ctx)                                                         # fichier modifié non commité
+        self.assertIn("Ton worktree", ctx)
+
+    def test_agent_autre_refuse_en_mode_git(self):
+        self.act("a2", "write_file", path="x.py", content="def f():\n    pass\n")
+        self.assertIn("git_show", self.act("a2", "outline", path="", agent="Carl")[1])
+
+
 if __name__ == "__main__":
     unittest.main()
