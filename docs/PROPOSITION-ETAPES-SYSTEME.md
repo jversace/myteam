@@ -1,6 +1,6 @@
 # Proposition — étapes de workflow exécutées par le système (sans IA)
 
-*Statut : validée le 25 nov. 2026. **Première livraison (« mécanique simple ») implémentée** : voir § 10. Le reste du catalogue (lots v2 et v3) n'est pas implémenté.*
+*Statut : validée le 25 nov. 2026. **Lots MVP et v2 (partiel) implémentés** : voir § 10 et § 11. Le reste du catalogue (v3) n'est pas implémenté.*
 
 ## 1. Problème
 
@@ -182,6 +182,17 @@ Aujourd'hui un workflow se déclenche par l'utilisateur, un agent ou une minuter
 - **Interface** : type d'étape « Le système exécute une action », liste d'actions avec aide, cible, valeur, confirmation, « si réussite » (suite ou saut).
 - **Tests** : 8 nouveaux (statuts, affectation, notes, bug, clôture avec confirmation, refus, échec par défaut ou arrêt, saut et fin, MR, synchronisation GitHub, cohérence et prompt) ; 415 au total.
 
-### Reste à faire
+### Reste à faire après la première livraison
 
-Lots v2 et v3 du § 3 : conditions `if`, `create_subtask`, `link_*_modules`, `merge_mr`, `run_checks`, `push_branch`, nettoyage de branches, release, sous-workflows, boucle sur les sous-tâches ; essai à blanc (« simuler ») ; déclencheurs sur événement (§ 8).
+Voir § 11 pour ce qui a été livré ensuite.
+
+## 11. Lot v2 (partiel), livré le 25 nov. 2026
+
+- **Condition `if`** : réussit si la condition est vraie, échoue sinon. On aiguille avec « si réussite » et « si échec » (saut ou suite). Un échec de condition continue sans question à l'utilisateur (c'est une réponse « faux », pas une erreur). Conditions : `task_status=<statut>`, `bug_status=<statut>`, `subtasks_done`, `mr_active`, `agent_free`, `decision_pending`, `release_open`.
+- **Nouvelles actions** : `create_subtask` (profondeur maximale respectée, doublons refusés), `create_bug_fix_subtask`, `link_modules`, `set_task_dependency` (`add:<id>` / `remove:<id>`, dépendance circulaire refusée), `close_subtasks` (clôture : confirmation par défaut), `sync_all_agent_branches` (un échec par agent est rapporté, les agents en répertoire local sans git sont ignorés), `stop_agent`, `run_workflow` (un workflow ne peut pas se relancer lui-même ; les limites par heure s'appliquent aux boucles A→B→A).
+- **Simulation** : bouton « Simuler » sur un workflow. Il décrit chaque étape dans l'historique, sans rien exécuter ni modifier : confirmation demandée, conditions évaluées sur l'état actuel, problèmes détectés, étapes d'agent signalées comme consommatrices de tokens. Les sauts ne sont pas suivis.
+- **Tests** : 6 nouveaux ; 421 au total.
+
+### Reste à faire (v3 et au-delà)
+
+`merge_mr`, `run_checks`, `push_branch`, `create_task_branch`, nettoyage des branches fusionnées, `release_start` / `release_publish` / poussée de `main`, `develop` et des tags, `force_unlock`, `reset_usage`, `refresh_agent_context`, `log_history`, `export_recap`, boucle sur les sous-tâches, déclencheurs sur événement (§ 8).

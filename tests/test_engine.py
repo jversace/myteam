@@ -2122,6 +2122,71 @@ class Regles(unittest.TestCase):
         self.assertIn("[automatique, sans IA", prompt)
         self.assertIn("Changer le statut d’une tâche", prompt)
 
+    def test_systeme_v2_sous_taches_modules_dependances(self):
+        self.set(bugs=[{"id": "b1", "t": "Plantage", "status": "ouvert", "modules": ["m1"]}])
+        w = self.add_wf("V2", [self.sys("create_subtask", target="t1", text="Écrire les tests de {task.title}", who="agent:a3"),
+                               self.sys("create_bug_fix_subtask", target="b1", text="Corriger le plantage", who="agent:a2"),
+                               self.sys("link_modules", target="t1", value="Auth"),
+                               self.sys("run_workflow", value="Cible")])
+        self.add_wf("Cible", [self.sys("notify_user", text="lancé")])
+        run = self.run_wf(w, self.no_ai(), task="t1")
+        P = proj()
+        sub = next(t for t in P["tasks"] if t["parent"] == "t1")
+        fix = next(t for t in P["tasks"] if t.get("bug") == "b1")
+        self.assertEqual((run["status"], sub["title"], sub["who"], fix["who"], P["bugs"][0]["status"], P["tasks"][0]["modules"]), ("terminé", "Écrire les tests de Login", "a3", "a2", "en correction", ["m1"]))
+        self.assertEqual(self.spawned[-1][0], "wf_continue")                                     # le workflow cible a été lancé
+
+    def test_systeme_v2_dependance_et_cloture_des_sous_taches(self):
+        st = store.load("u"); st["projects"][0]["tasks"] += [{"id": "t2", "parent": "t1", "title": "A", "desc": "", "who": "a3", "status": "à faire", "modules": [], "by": ""},
+                                                             {"id": "t3", "parent": "t2", "title": "B", "desc": "", "who": "a3", "status": "à faire", "modules": [], "by": ""}]
+        store.wj(store.state_path("u"), st)
+        w = self.add_wf("Deps", [self.sys("set_task_dependency", target="t3", value="add:t2"), self.sys("set_task_dependency", target="t2", value="add:t3", on_ko="continue"),
+                                 self.sys("close_subtasks", target="t1", value="en attente")])
+        run = self.run_wf(w, self.no_ai())
+        P = proj()
+        self.assertEqual([r["outcome"] for r in run["results"]], ["ok", "ko", "ok"])             # la dépendance circulaire est refusée
+        self.assertIn("circulaire", run["results"][1]["comment"])
+        self.assertEqual((P["tasks"][2]["deps"], [t["status"] for t in P["tasks"][1:]]), (["t2"], ["en attente", "en attente"]))
+
+    def test_systeme_condition_aiguillage(self):
+        w = self.add_wf("Si", [self.sys("if", value="task_status=en cours", on_ok="goto", goto_ok=3, target="t1"), self.sys("notify_user", text="faux"),
+                               self.sys("notify_user", text="vrai")])
+        run = self.run_wf(w, self.no_ai())
+        self.assertEqual((run["status"], [r["i"] for r in run["results"]], run["results"][0]["comment"]), ("terminé", [1, 3], "vrai : « Login » est « en cours »"))
+        st = store.load("u"); st["projects"][0].update(workflows=[], wf_runs=[]); st["projects"][0]["tasks"][0]["status"] = "à faire"; store.wj(store.state_path("u"), st)
+        w = self.add_wf("Si2", [self.sys("if", value="task_status=en cours", target="t1"), self.sys("notify_user", text="suite")])
+        run = self.run_wf(w, self.no_ai())
+        self.assertEqual((run["status"], [r["outcome"] for r in run["results"]], proj().get("decisions", [])), ("terminé", ["ko", "ok"], []))   # faux : on continue, sans question
+
+    def test_systeme_synchro_de_tous_les_agents_et_arret(self):
+        calls = []
+
+        class Rp:
+            base, work = "main", "main"
+            def ensure_branch(self, b): pass
+            def merge_branch(self, into, src): calls.append(into); return {"state": "conflict"} if into == "agent/bob" else {"state": "merged"}
+        w = self.add_wf("Tous", [self.sys("sync_all_agent_branches", value="main", on_ko="continue"), self.sys("stop_agent", who="agent:a2")])
+        with mock.patch.object(engine.sysact.github, "Repo", lambda p: Rp()), mock.patch.object(engine, "stop_agent", lambda *a, **k: "arrêté"):
+            run = self.run_wf(w, self.no_ai())
+        self.assertEqual((sorted(calls), [r["outcome"] for r in run["results"]]), (["agent/alice", "agent/bob", "agent/carol"], ["ko", "ok"]))
+        self.assertIn("Bob", run["results"][0]["comment"])
+
+    def test_systeme_simulation_sans_effet(self):
+        w = self.add_wf("Sim", [self.sys("if", value="task_status=en cours", target="t1"), self.sys("set_task_status", target="t1", value="terminée"),
+                                self.sys("inconnue"), self.step(text="Vérifie")])
+        engine.wf_simulate("u", "p1", w)
+        txt = proj()["log"][-1]["text"]
+        for frag in ("actuellement VRAIE", "confirmation de l’utilisateur demandée", "PROBLÈME", "[agent, consomme des tokens]"):
+            self.assertIn(frag, txt)
+        self.assertEqual((proj()["tasks"][0]["status"], proj().get("wf_runs", [])), ("en cours", []))
+
+    def test_systeme_v2_coherence(self):
+        self.add_wf("Contrôle2", [self.sys("if", value="n_importe_quoi"), self.sys("set_task_dependency", target="t1", value="add:t1"), self.sys("run_workflow", value="Contrôle2"),
+                                  self.sys("link_modules", target="t1", value="Zzz"), self.sys("close_subtasks", target="t1", value="terminée", confirm="0")])
+        txt = " ¦ ".join(i["text"] for i in engine.prules.lint(proj()) if "Contrôle2" in i["where"])
+        for frag in ("Condition inconnue", "identique à la cible", "ne peut pas se relancer lui-même", "Module(s) inconnu(s)", "sans confirmation"):
+            self.assertIn(frag, txt)
+
 
 class Http(unittest.TestCase):
     """Routes HTTP réelles : comptes, état révisionné avec fusion, travaux."""

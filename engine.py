@@ -2540,6 +2540,15 @@ def workflow_start(u, pid, wfid, trigger, requester="", task="", note=""):
     return rid
 
 
+def wf_simulate(u, pid, wfid, task=""):
+    """Essai à blanc d'un workflow : décrit les étapes dans l'historique sans rien exécuter ni modifier (aucun token)."""
+    p = snap(u, pid)
+    wf = by_id(p.get("workflows", []), wfid)
+    if not wf:
+        return
+    log(u, pid, "Système", "Vous", "Simulation du workflow « %s » (rien n’est exécuté) :\n%s" % (wf["name"], "\n".join(sysact.simulate(p, wf, task)) or "aucune étape"))
+
+
 def wf_user_run(u, pid, wfid, task, note):
     try:
         workflow_start(u, pid, wfid, "utilisateur", task=task, note=note)
@@ -2558,7 +2567,7 @@ def wf_resume(u, pid, rid):
 
 def wf_after(u, pid, rid, i, st, outcome, comment):
     """Enregistre le résultat d'une étape et décide de la suite : next (étape suivante ou saut), stop, ou wait (question à l'utilisateur)."""
-    ko, policy = outcome != "ok", st.get("on_ko") or ("ask_user" if st.get("kind") == "system" else "stop")
+    ko, policy = outcome != "ok", st.get("on_ko") or (sysact.default_ko(st) if st.get("kind") == "system" else "stop")
 
     def f(pp):
         run = by_id(pp["wf_runs"], rid)
@@ -4141,6 +4150,7 @@ def start(u, j):
             "reset_usage": lambda: reset_usage(u, pid),
             "rules_changed": lambda: rules_changed(u, pid),
             "rules_check": lambda: rules_check(u, pid),
+            "workflow_sim": lambda: wf_simulate(u, pid, j.get("wfId"), j.get("task") or ""),
             "workflow_run": lambda: wf_user_run(u, pid, j.get("wfId"), j.get("task") or "", str(j.get("note", ""))),
             "wf_resume": lambda: wf_resume(u, pid, j.get("runId")),
             "wf_stop": lambda: _wf_end(u, pid, j.get("runId"), "arrêté", "arrêté par l’utilisateur"),

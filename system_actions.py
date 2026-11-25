@@ -36,12 +36,30 @@ ACTIONS = {
     "notify_user": ("Informer l’utilisateur", None, None, False, True, "texte"),
     "wait": ("Attendre", None, "seconds", False, False, "valeur = secondes (max %d)" % WAIT_MAX),
     "end_workflow": ("Terminer le workflow", None, "outcome", False, True, "valeur = ok ou ko"),
+    # lot v2
+    "if": ("Condition : réussit si elle est vraie, échoue sinon (aiguillage par « si réussite » / « si échec »)", None, "condition", True, False,
+           "valeur = task_status=<statut>, bug_status=<statut>, subtasks_done, mr_active, agent_free, decision_pending ou release_open ; cible : tâche ou bug"),
+    "create_subtask": ("Créer une sous-tâche", "task", None, True, True, "cible = tâche parente ; texte = titre ; acteur = agent assigné"),
+    "create_bug_fix_subtask": ("Créer une sous-tâche de correction d’un bug", "bug", None, True, True, "texte = titre ; acteur = agent assigné"),
+    "link_modules": ("Rattacher une tâche ou un bug à des modules", None, "modules", False, False, "cible = tâche ou bug ; valeur = noms de modules séparés par des virgules"),
+    "set_task_dependency": ("Ajouter ou retirer une dépendance d’une tâche", "task", "dep", False, False, "valeur = add:<id de tâche> ou remove:<id de tâche>"),
+    "close_subtasks": ("Changer le statut de toutes les sous-tâches d’une tâche", "task", "task_status", False, False, "valeur = statut"),
+    "sync_all_agent_branches": ("Intégrer une branche de référence dans la branche de tous les agents", None, "source", False, False, "valeur = release, develop ou main"),
+    "stop_agent": ("Arrêter le travail d’un agent", None, None, True, False, "acteur = nom ou rôle"),
+    "run_workflow": ("Lancer un autre workflow", "task", "workflow", False, False, "valeur = nom du workflow ; cible = tâche concernée (facultatif)"),
 }
+
+CONDITIONS = ("task_status", "bug_status", "subtasks_done", "mr_active", "agent_free", "decision_pending", "release_open")
+
+
+def default_ko(st):
+    """Comportement par défaut d'un échec : question à l'utilisateur ; pour une condition, l'échec est une réponse « faux » : on continue."""
+    return "continue" if st.get("action") == "if" else "ask_user"
 
 
 def sensitive(st):
     """Action qui contourne un contrôle : confirmation de l'utilisateur par défaut (décochable par étape)."""
-    return (st.get("action") == "set_task_status" and st.get("value") == "terminée") or (st.get("action") == "set_bug_status" and st.get("value") == "vérifié")
+    return (st.get("action") in ("set_task_status", "close_subtasks") and st.get("value") == "terminée") or (st.get("action") == "set_bug_status" and st.get("value") == "vérifié")
 
 
 def needs_confirm(st):
@@ -86,7 +104,7 @@ def describe(p, st):
                      ("%s %s" % ({"task": "tâche", "bug": "bug", "mr": "MR"}[tk], st.get("target")) if st.get("target") else "la cible du déroulement"))
     if vk:
         parts.append({"source": SOURCES.get(st.get("value") or "", "?"), "seconds": "%s s" % st.get("value", "?")}.get(vk, "« %s »" % st.get("value", "?")))
-    if ACTIONS[act][3]:
+    if ACTIONS[act][3] and (act != "if" or str(st.get("value") or "").startswith("agent_free")):
         who = st.get("who") or "principal"
         a = prules.resolve_actor(p, st) if who not in ("assignee", "requester") else None
         parts.append({"principal": "l’agent principal", "assignee": "l’agent assigné", "requester": "l’agent demandeur"}.get(who) or (a or {}).get("name") or
@@ -96,7 +114,7 @@ def describe(p, st):
     return "%s%s" % (lab, (" — " + " ; ".join(parts)) if parts else "")
 
 
-def lint_step(p, st, timer):
+def lint_step(p, st, timer, wf=None):
     """[(niveau, message)] pour une étape système."""
     out, act = [], st.get("action")
     if act not in ACTIONS:
@@ -125,6 +143,38 @@ def lint_step(p, st, timer):
             out.append(("erreur", "Durée invalide : entre 1 et %d secondes." % WAIT_MAX))
     if vk == "outcome" and st.get("value") not in ("ok", "ko"):
         out.append(("erreur", "Verdict invalide : ok ou ko."))
+    if vk == "condition":
+        name, _, arg = str(st.get("value") or "").partition("=")
+        if name not in CONDITIONS:
+            out.append(("erreur", "Condition inconnue : %s." % (st.get("value") or "—")))
+        elif name == "task_status" and arg not in rights.STATUS:
+            out.append(("erreur", "Statut de tâche invalide dans la condition : %s." % arg))
+        elif name == "bug_status" and arg not in rights.BUG_STATUS:
+            out.append(("erreur", "Statut de bug invalide dans la condition : %s." % arg))
+        elif name in ("task_status", "subtasks_done", "mr_active") and not st.get("target") and timer:
+            out.append(("erreur", "La condition porte sur la tâche cible, que la minuterie ne fournit pas."))
+        elif name == "bug_status" and not by_id(p.get("bugs", []), st.get("target")):
+            out.append(("erreur", "Aucun bug valide désigné pour la condition."))
+    if vk == "dep":
+        m = re.match(r"^(add|remove):(\S+)$", str(st.get("value") or ""))
+        if not m:
+            out.append(("erreur", "Valeur attendue : add:<id de tâche> ou remove:<id de tâche>."))
+        elif not by_id(p.get("tasks", []), m.group(2)) or m.group(2) == st.get("target"):
+            out.append(("erreur", "Tâche de dépendance introuvable ou identique à la cible."))
+    if vk == "workflow":
+        w2 = prules.find_workflow(p, st.get("value") or "")
+        if not w2:
+            out.append(("erreur", "Workflow à lancer introuvable : %s." % (st.get("value") or "—")))
+        elif wf and w2.get("id") == wf.get("id"):
+            out.append(("erreur", "Un workflow ne peut pas se relancer lui-même."))
+    if vk == "modules":
+        names = [x.strip() for x in str(st.get("value") or "").split(",") if x.strip()]
+        if not names or len(rights.mod_ids(p, names)) != len(names):
+            out.append(("erreur", "Module(s) inconnu(s) : %s." % (st.get("value") or "—")))
+        if not (by_id(p.get("tasks", []), st.get("target")) or by_id(p.get("bugs", []), st.get("target"))):
+            out.append(("erreur", "Aucune tâche ni aucun bug désigné."))
+    if act in ("create_subtask", "create_bug_fix_subtask", "link_modules") and not st.get("target") and timer and act != "create_bug_fix_subtask":
+        out.append(("erreur", "L’étape vise la tâche cible, que la minuterie ne fournit pas."))
     if xk and act not in ("launch_task", "end_workflow") and not prules.norm(st.get("text")):
         out.append(("erreur", "Texte vide."))
     if wk:
@@ -257,7 +307,11 @@ def _assign_bug_fix(E, u, pid, p, wf, run, st):
 
 
 def _sync_agent_branch(E, u, pid, p, wf, run, st):
-    a, src = _actor(p, run, st), st.get("value") or ""
+    return "ok", _sync_one(E, u, pid, p, _actor(p, run, st), st.get("value") or "")
+
+
+def _sync_one(E, u, pid, p, a, src):
+    """Intègre la branche de référence dans celle de l'agent ; retourne un compte rendu, ou lève Err (conflit, modifications non commitées…)."""
     if src not in SOURCES:
         raise Err(400, "branche source inconnue : %s" % src)
     if E.git_agent(p, a):                                   # git local : worktree de l'agent
@@ -269,7 +323,7 @@ def _sync_agent_branch(E, u, pid, p, wf, run, st):
         if r["state"] == "conflict":
             lg.abort(wt)
             raise Err(409, "conflit entre %s et la branche de %s dans : %s (intégration annulée)" % (ref, a["name"], ", ".join(r["files"][:8])))
-        return "ok", "%s : %s" % (a["name"], "déjà à jour avec %s" % ref if r["state"] == "uptodate" else "%s intégrée" % ref)
+        return "%s : %s" % (a["name"], "déjà à jour avec %s" % ref if r["state"] == "uptodate" else "%s intégrée" % ref)
     if E.local_agent(p, a):
         raise Err(409, "%s travaille dans un répertoire local sans git : pas de branche à synchroniser" % a["name"])
     rp = github.Repo(p)                                     # mode GitHub : fusion côté dépôt central
@@ -278,7 +332,7 @@ def _sync_agent_branch(E, u, pid, p, wf, run, st):
     r = rp.merge_branch(a["branch"], ref)
     if r["state"] == "conflict":
         raise Err(409, "conflit entre %s et la branche de %s" % (ref, a["name"]))
-    return "ok", "%s : %s" % (a["name"], "déjà à jour avec %s" % ref if r["state"] == "uptodate" else "%s intégrée" % ref)
+    return "%s : %s" % (a["name"], "déjà à jour avec %s" % ref if r["state"] == "uptodate" else "%s intégrée" % ref)
 
 
 def _sync_mrs(E, u, pid, p, wf, run, st):
@@ -319,6 +373,180 @@ def _end(E, u, pid, p, wf, run, st):
     return "end", "%s|%s" % (st.get("value") or "ok", render(st.get("text"), p, run).strip())
 
 
-HANDLERS = {"set_task_status": _set_task_status, "assign_task": _assign_task, "add_task_note": _add_task_note, "launch_task": _launch_task,
+def _descendants(p, tid):
+    out, todo = [], [tid]
+    while todo:
+        cur = todo.pop()
+        for t in p["tasks"]:
+            if t.get("parent") == cur and t not in out:
+                out.append(t)
+                todo.append(t["id"])
+    return out
+
+
+def eval_condition(p, run, st):
+    """(vrai?, explication) d'une condition, en lecture seule."""
+    name, _, arg = str(st.get("value") or "").partition("=")
+    tid = st.get("target") or (run or {}).get("task")
+    t = by_id(p.get("tasks", []), tid)
+    if name in ("task_status", "subtasks_done", "mr_active") and not t:
+        raise Err(404, "tâche introuvable pour la condition")
+    if name == "task_status":
+        return t["status"] == arg, "« %s » est « %s »" % (t["title"], t["status"])
+    if name == "subtasks_done":
+        ch = _descendants(p, t["id"])
+        return bool(ch) and all(c["status"] == "terminée" for c in ch), "%d/%d sous-tâche(s) terminée(s)" % (sum(1 for c in ch if c["status"] == "terminée"), len(ch))
+    if name == "mr_active":
+        n = sum(1 for m in p.get("mrs", []) if m.get("id") and m.get("task") == t["id"] and m.get("status") in ("ouverte", "conflit"))
+        return n > 0, "%d merge request(s) active(s)" % n
+    if name == "bug_status":
+        b = by_id(p.get("bugs", []), st.get("target"))
+        if not b:
+            raise Err(404, "bug introuvable pour la condition")
+        return b["status"] == arg, "bug « %s » : %s" % (b["t"], b["status"])
+    if name == "agent_free":
+        a = prules.resolve_actor(p, {"who": st.get("who") or "principal"}, run)
+        if not a:
+            raise Err(404, "agent introuvable pour la condition")
+        busy = [x["title"] for x in p["tasks"] if x.get("who") == a["id"] and x.get("running")]
+        return not busy, "%s %s" % (a["name"], ("travaille sur « %s »" % busy[0]) if busy else "est libre")
+    if name == "decision_pending":
+        n = sum(1 for d in p.get("decisions", []) if d.get("status") == "attente")
+        return n > 0, "%d décision(s) en attente" % n
+    if name == "release_open":
+        return bool(p.get("cycle")), "release en cours" if p.get("cycle") else "aucune release en cours"
+    raise Err(400, "condition inconnue : %s" % st.get("value"))
+
+
+def _if(E, u, pid, p, wf, run, st):
+    ok, why = eval_condition(p, run, st)
+    return ("ok" if ok else "ko"), ("vrai : " if ok else "faux : ") + why
+
+
+def _create_subtask(E, u, pid, p, wf, run, st):
+    parent, a = _task(p, run, st), _actor(p, run, st)
+    if rights.depth(p, parent) >= rights.MAX_TASK_DEPTH:
+        raise Err(409, "profondeur maximale des sous-tâches atteinte (%d niveaux)" % rights.MAX_TASK_DEPTH)
+    title = render(st.get("text"), p, run).strip()
+    t = E.mp(u, pid, lambda pp: rights.create_task(pp, title, "", parent=parent["id"], who=a["id"], modules=parent.get("modules", []), by="Workflow"))
+    E.spawn(E.tick, u, pid)
+    return "ok", "sous-tâche « %s » créée sous « %s » (%s)" % (t["title"], parent["title"], a["name"])
+
+
+def _create_bug_fix_subtask(E, u, pid, p, wf, run, st):
+    b, a = _bug(p, st), _actor(p, run, st)
+    title = render(st.get("text"), p, run).strip()
+    t = E.mp(u, pid, lambda pp: rights.add_fix_task(pp, by_id(pp["bugs"], b["id"]), title, "", a["id"], "Workflow"))
+    E.spawn(E.tick, u, pid)
+    return "ok", "correction « %s » créée pour le bug « %s » (%s)" % (t["title"], b["t"], a["name"])
+
+
+def _link_modules(E, u, pid, p, wf, run, st):
+    ids = rights.mod_ids(p, [x.strip() for x in str(st.get("value") or "").split(",") if x.strip()])
+    coll = "tasks" if by_id(p["tasks"], st.get("target")) else "bugs"
+    it = by_id(p[coll], st.get("target"))
+    if not it:
+        raise Err(404, "tâche ou bug introuvable : %s" % (st.get("target") or "—"))
+    E.mp(u, pid, lambda pp: by_id(pp[coll], it["id"]).__setitem__("modules", ids))
+    return "ok", "modules de « %s » : %s" % (it.get("title") or it.get("t"), ", ".join(E.mod_names(p, ids)) or "aucun (global)")
+
+
+def _set_task_dependency(E, u, pid, p, wf, run, st):
+    t = _task(p, run, st)
+    op, _, did = str(st.get("value") or "").partition(":")
+    d = by_id(p["tasks"], did)
+    if op not in ("add", "remove") or not d or d["id"] == t["id"]:
+        raise Err(400, "dépendance invalide : %s" % st.get("value"))
+    if op == "add" and t["id"] in (d.get("deps") or []):
+        raise Err(409, "dépendance circulaire : « %s » dépend déjà de « %s »" % (d["title"], t["title"]))
+
+    def f(pp):
+        x = by_id(pp["tasks"], t["id"])
+        deps = [i for i in (x.get("deps") or []) if i != d["id"]] + ([d["id"]] if op == "add" else [])
+        x["deps"] = deps
+        if not deps:
+            x.pop("deps", None)
+    E.mp(u, pid, f)
+    E.spawn(E.tick, u, pid)
+    return "ok", "« %s » %s « %s »" % (t["title"], "dépend maintenant de" if op == "add" else "ne dépend plus de", d["title"])
+
+
+def _close_subtasks(E, u, pid, p, wf, run, st):
+    t, s = _task(p, run, st), st.get("value")
+    if s not in rights.STATUS:
+        raise Err(400, "statut invalide : %s" % s)
+    todo = [c for c in _descendants(p, t["id"]) if c["status"] != s and not c.get("running")]
+    if not todo:
+        return "ok", "aucune sous-tâche à modifier"
+    for c in todo:
+        if s == "terminée":
+            E.apply_review(u, pid, c["id"], "Workflow", "accepted", "Clôturée par le workflow « %s »" % wf["name"])
+        else:
+            E.mp(u, pid, lambda pp, i=c["id"]: by_id(pp["tasks"], i).update(status=s, touched=time.time()))
+    return "ok", "%d sous-tâche(s) de « %s » : %s" % (len(todo), t["title"], s)
+
+
+def _sync_all(E, u, pid, p, wf, run, st):
+    src, done, bad = st.get("value") or "", [], []
+    for a in p["agents"]:
+        try:
+            done.append(_sync_one(E, u, pid, p, a, src))
+        except Err as e:
+            if "sans git" in e.msg:
+                continue                                    # agent en répertoire local sans git : rien à synchroniser
+            bad.append("%s : %s" % (a["name"], e.msg))
+    if bad:
+        return "ko", "%d échec(s) : %s" % (len(bad), " ; ".join(bad))[:280]
+    return "ok", "%d agent(s) synchronisé(s)" % len(done)
+
+
+def _stop_agent(E, u, pid, p, wf, run, st):
+    a = _actor(p, run, st)
+    return "ok", E.stop_agent(u, pid, a["id"], False, "Workflow « %s »" % wf["name"], "étape système du workflow « %s »" % wf["name"])
+
+
+def _run_workflow(E, u, pid, p, wf, run, st):
+    w2 = prules.find_workflow(p, st.get("value") or "")
+    if not w2 or w2.get("id") == wf.get("id"):
+        raise Err(400, "workflow à lancer introuvable (ou identique) : %s" % st.get("value"))
+    if not w2.get("enabled", True):
+        raise Err(409, "le workflow « %s » est désactivé" % w2["name"])
+    tid = st.get("target") or (run or {}).get("task") or ""
+    E.workflow_start(u, pid, w2["id"], "workflow « %s »" % wf["name"], requester=(run or {}).get("requester", ""), task=tid)
+    return "ok", "workflow « %s » lancé" % w2["name"]
+
+
+HANDLERS = {"if": _if, "create_subtask": _create_subtask, "create_bug_fix_subtask": _create_bug_fix_subtask, "link_modules": _link_modules,
+            "set_task_dependency": _set_task_dependency, "close_subtasks": _close_subtasks, "sync_all_agent_branches": _sync_all, "stop_agent": _stop_agent,
+            "run_workflow": _run_workflow, "set_task_status": _set_task_status, "assign_task": _assign_task, "add_task_note": _add_task_note, "launch_task": _launch_task,
             "set_bug_status": _set_bug_status, "assign_bug_fix": _assign_bug_fix, "sync_agent_branch": _sync_agent_branch, "sync_mrs": _sync_mrs,
             "mark_mr_done": _mark_mr_done, "notify_agent": _notify_agent, "notify_user": _notify_user, "wait": _wait, "end_workflow": _end}
+
+
+def simulate(p, wf, task=""):
+    """Essai à blanc : décrit chaque étape sans rien modifier. Les conditions sont évaluées sur l'état actuel ; les sauts ne sont pas suivis."""
+    run, L = {"task": task if by_id(p.get("tasks", []), task) else "", "requester": ""}, []
+    timer = (wf.get("schedule") or {}).get("mode", "off") != "off"
+    for i, st in enumerate(wf.get("steps", []), 1):
+        kind = st.get("kind", "ask")
+        if kind == "system":
+            line = "[système] " + describe(p, st)
+            if needs_confirm(st):
+                line += " — confirmation de l’utilisateur demandée"
+            if st.get("action") == "if":
+                try:
+                    ok, why = eval_condition(p, run, st)
+                    line += " — actuellement %s (%s)" % ("VRAIE" if ok else "FAUSSE", why)
+                except Err as e:
+                    line += " — évaluation impossible (%s)" % e.msg
+            probs = [m for lvl, m in lint_step(p, st, timer, wf) if lvl == "erreur"]
+            if probs:
+                line += " — PROBLÈME : " + " ".join(probs)
+        elif kind == "start_tasks":
+            line = "[système] démarrer les tâches prêtes"
+        elif kind == "ask_user":
+            line = "[utilisateur] question : %s" % st.get("text", "")[:100]
+        else:
+            line = "[agent, consomme des tokens] %s" % prules.step_text(p, st, i).split(". ", 1)[-1][:140]
+        L.append("%d. %s" % (i, line))
+    return L

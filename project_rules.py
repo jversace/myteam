@@ -72,7 +72,7 @@ def step_text(p, st, i):
         import system_actions
         body = "[automatique, sans IA — aucune action de ta part] " + system_actions.describe(p, st)
     ko = {"stop": "arrêter", "continue": "continuer", "ask_user": "demander à l’utilisateur", "goto": "aller à l’étape %s" % st.get("goto", "?")}.get(
-        st.get("on_ko") or ("ask_user" if kind == "system" else "stop"), "arrêter")
+        st.get("on_ko") or (__import__("system_actions").default_ko(st) if kind == "system" else "stop"), "arrêter")
     return "%d. %s (si échec : %s%s)" % (i, body, ko, (" ; si réussite : aller à l’étape %s" % st.get("goto_ok", "?")) if st.get("on_ok") == "goto" else "")
 
 
@@ -224,7 +224,7 @@ def lint(p):
                 add("erreur", wh, "Instruction vide.")
             if kind == "system":
                 import system_actions
-                for lvl, msg in system_actions.lint_step(p, st, timer):
+                for lvl, msg in system_actions.lint_step(p, st, timer, w):
                     add(lvl, wh, msg)
             if kind == "ask":
                 actor = resolve_actor(p, st)
@@ -242,7 +242,7 @@ def lint(p):
                     add("avertissement", wh, "%s est en chat manuel : cette étape attendra votre intervention (jusqu’à 24 h)." % actor.get("name", "L’agent"))
             if kind == "start_tasks" and p.get("autopilot") != "off":
                 add("info", wh, "Le lancement automatique des tâches est déjà actif : cette étape ne sert qu’à forcer un démarrage immédiat.")
-            ko = st.get("on_ko") or ("ask_user" if kind == "system" else "stop")
+            ko = st.get("on_ko") or (__import__("system_actions").default_ko(st) if kind == "system" else "stop")
             if st.get("on_ok") == "goto":
                 try:
                     g = int(st.get("goto_ok"))
