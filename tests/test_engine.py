@@ -1499,6 +1499,17 @@ class Integration(unittest.TestCase):
         self.assertNotIn("Merge request #", r[1])                                                  # plus de blocage fantôme dans la réponse de l'outil
         self.assertEqual(proj()["mrs"][0]["status"], "fusionnée")
 
+    def test_mr_introuvable_avertit_l_utilisateur_sans_rien_conclure(self):
+        m = self.open_mr()
+        del PRS[m["n"]]                                                                             # GitHub répond 404 : accès ou numéro
+        for _ in range(engine.MISSING_WARN + 2):
+            engine.sync_mrs("u", "p1", force=True)
+        p = proj()
+        self.assertEqual(p["mrs"][0]["status"], "ouverte")                                         # rien n'est conclu à la légère
+        avert = [x for x in p["log"] if "introuvable sur GitHub" in x["text"]]
+        self.assertEqual(len(avert), 1)                                                            # un seul avertissement
+        self.assertIn("introuvable sur GitHub", self.blockers())                                   # et visible dans get_blockers
+
     def test_bouton_marquer_terminee_libere_tout(self):
         m = self.open_mr()
         self.set_task_status("t1", "terminée")

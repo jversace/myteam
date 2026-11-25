@@ -37,6 +37,7 @@ MAX_ROUNDS, MAX_ROUND_STEPS, MAX_AUTO = 6, 8, 8   # tours par tâche, étapes pa
 NUDGE = ("Tu n’as pas déclaré la tâche terminée. Si le travail demandé est réellement fait, conclus avec task_status « à vérifier » et un compte rendu précis. "
          "Sinon poursuis-le maintenant avec les actions ; si tu es bloqué, écris à l’agent concerné (message) ou pose la question à l’utilisateur (ask_user). "
          "Ne t’arrête pas sur une erreur : analyse-la, corrige et continue.")
+MISSING_WARN = 3                                    # vérifications « MR introuvable sur GitHub » avant d'avertir l'utilisateur
 MAX_RESUME = 3                                      # reprises automatiques d'une tâche après une interruption (message, workflow…) avant d'attendre l'utilisateur
 OPEN_CONFLICT, RECONCILE_EVERY = ("ouvert", "escalade", "pause"), 300   # statuts « actifs » d'un conflit ; délai entre deux vérifications (s)
 CONFLICT_OPTS = ["L’auteur de la branche résout", "L’agent principal résout", "Je m’en occupe (mettre en pause)"]
@@ -2988,7 +2989,7 @@ def diagnose(p):
             out.append({"who": name(c["agent"]), "level": "bloquant", "conflict": c["id"], "text": describe_conflict(p, c)})
     for m in p.get("mrs", []):
         if m.get("id") and m.get("status") in ("ouverte", "conflit"):
-            out.append({"who": m.get("by", "?"), "level": "attente", "text": "Merge request #%s « %s » : %s." % (m.get("n", "?"), m.get("title", ""), "en attente de validation" if m["status"] == "ouverte" else "en conflit")})
+            out.append({"who": m.get("by", "?"), "level": "attente", "text": "Merge request #%s « %s » : %s." % (m.get("n", "?"), m.get("title", ""), ("en attente de validation" if m["status"] == "ouverte" else "en conflit") + (" — introuvable sur GitHub : vérifiez le token du projet ou marquez-la terminée" if m.get("missing_warned") else ""))})
     for t in p["tasks"]:
         who = name(t.get("who"))
         if t.get("retry_at"):
@@ -3799,7 +3800,21 @@ def sync_mrs(u, pid, force=False, only=None):
                 st = rp.pr_state(int(m["n"]))
         except (Err, ValueError):
             continue
-        if st in ("open", "missing"):
+        if st == "missing":                                  # introuvable (accès, numéro) : rien n'est conclu, mais l'utilisateur doit le savoir (sinon blocage invisible)
+            def miss(pp, i=m["id"]):
+                cur = by_id(pp["mrs"], i)
+                if not cur or cur["status"] not in MR_ACTIVE:
+                    return 0
+                cur["missing_n"] = cur.get("missing_n", 0) + 1
+                if cur["missing_n"] >= MISSING_WARN and not cur.get("missing_warned"):
+                    cur["missing_warned"] = True
+                    return cur["missing_n"]
+                return 0
+            if mp(u, pid, miss):
+                log(u, pid, "Système", "Vous", "Merge request #%s « %s » : introuvable sur GitHub après %d vérifications (token sans accès au dépôt, ou numéro invalide). Elle continue de bloquer les agents : vérifiez le token du projet, ou utilisez « Marquer terminée »." % (m["n"], m.get("title", ""), MISSING_WARN))
+            continue
+        if st == "open":
+            mp(u, pid, lambda pp, i=m["id"]: [(by_id(pp["mrs"], i) or {}).pop(k, None) for k in ("missing_n", "missing_warned")])
             continue
         where = "dans git" if m.get("git") else "sur GitHub"
         status, why = (("fusionnée", "Fusionnée %s (détectée automatiquement)." % where) if st == "merged"
