@@ -328,13 +328,38 @@ def snap(u, pid):
     return p
 
 
+_TL = threading.local()                                     # _TL.src : workflow en train d'agir (ses changements ne le redéclenchent pas)
+
+
+def _ev_state(p):
+    return ({t["id"]: t.get("status") for t in p.get("tasks", [])}, {m.get("id") for m in p.get("mrs", [])}, {b.get("id") for b in p.get("bugs", [])}, bool(p.get("cycle")))
+
+
+def _ev_diff(b, a, p):
+    """Événements apparus entre deux états : changement de statut d'une tâche, MR ouverte, bug déclaré, release démarrée."""
+    out = [{"e": "task_status:" + s, "task": i} for i, s in a[0].items() if i in b[0] and b[0][i] != s]
+    out += [{"e": "mr_opened", "task": (by_id(p.get("mrs", []), i) or {}).get("task", "")} for i in a[1] - b[1] if i]
+    out += [{"e": "bug_declared", "bug": i} for i in a[2] - b[2] if i]
+    return out + ([{"e": "release_started"}] if a[3] and not b[3] else [])
+
+
 def mp(u, pid, fn):
+    evs = []
+
     def f(st):
         p = by_id(st.get("projects", []), pid)
         if p is None:
             raise Err(404, "Projet introuvable")
-        return fn(p)
-    return mutate(u, f)
+        if not any(w.get("events") and w.get("enabled", True) for w in p.get("workflows", [])):
+            return fn(p)
+        before = _ev_state(p)
+        r = fn(p)
+        evs.extend(_ev_diff(before, _ev_state(p), p))
+        return r
+    r = mutate(u, f)
+    if evs:
+        spawn(fire_events, u, pid, evs, getattr(_TL, "src", ""))
+    return r
 
 
 def log(u, pid, frm, to, text):
@@ -2512,7 +2537,7 @@ def _wf_end(u, pid, rid, status, why):
     log(u, pid, "Système", "Vous", "Workflow « %s » : %s%s." % (run["name"], status, (" — " + why) if why else ""))
 
 
-def workflow_start(u, pid, wfid, trigger, requester="", task="", note=""):
+def workflow_start(u, pid, wfid, trigger, requester="", task="", note="", bug=""):
     """Crée un déroulement de workflow et le lance en arrière-plan. Retourne son identifiant."""
     p = snap(u, pid)
     wf = by_id(p.get("workflows", []), wfid)
@@ -2529,6 +2554,8 @@ def workflow_start(u, pid, wfid, trigger, requester="", task="", note=""):
     rid = uid()
     run = {"id": rid, "wf": wfid, "name": wf["name"], "trigger": trigger, "requester": requester, "task": task, "note": note, "ts": time.time(),
            "started": now(), "status": "en cours", "step": 0, "results": [], "count": 0}
+    if bug and by_id(p.get("bugs", []), bug):
+        run["bug"] = bug
 
     def f(pp):
         pp.setdefault("wf_runs", []).append(run)
@@ -2538,6 +2565,20 @@ def workflow_start(u, pid, wfid, trigger, requester="", task="", note=""):
     log(u, pid, "Système", "Vous", "Workflow « %s » démarré (%s)%s." % (wf["name"], trigger, (" sur la tâche « %s »" % t["title"]) if t else ""))
     spawn(wf_continue, u, pid, rid)
     return rid
+
+
+def fire_events(u, pid, evs, src=""):
+    """Déclenche les workflows abonnés aux événements `evs` (sauf celui dont l'action les a provoqués). Un doublon en cours est ignoré en silence."""
+    p = snap(u, pid)
+    for ev in evs:
+        for w in p.get("workflows", []):
+            if not w.get("enabled", True) or ev["e"] not in (w.get("events") or []) or w["id"] == src:
+                continue
+            try:
+                workflow_start(u, pid, w["id"], "événement : " + sysact.event_label(ev["e"]), task=ev.get("task", ""), bug=ev.get("bug", ""))
+            except Err as x:
+                if x.code != 409:
+                    log(u, pid, "Système", "Vous", "Workflow « %s » : déclenchement par événement impossible (%s)." % (w.get("name"), x.msg))
 
 
 def wf_simulate(u, pid, wfid, task=""):

@@ -769,6 +769,9 @@ class Integration(unittest.TestCase):
     def set(self, **kw):
         st = store.load("u"); st["projects"][0].update(kw); store.wj(store.state_path("u"), st)
 
+    def set_wf(self, wfid, **kw):
+        st = store.load("u"); next(w for w in st["projects"][0]["workflows"] if w["id"] == wfid).update(kw); store.wj(store.state_path("u"), st)
+
     def logs(self):
         return " ¦ ".join(m["text"] for m in proj()["log"])
 
@@ -1632,6 +1635,9 @@ class Regles(unittest.TestCase):
         store.wj(store.state_path("u"), st)
         return w["id"]
 
+    def set_wf(self, wfid, **kw):
+        st = store.load("u"); next(w for w in st["projects"][0]["workflows"] if w["id"] == wfid).update(kw); store.wj(store.state_path("u"), st)
+
     def logs(self):
         return " ¦ ".join(m["text"] for m in proj()["log"])
 
@@ -2186,6 +2192,85 @@ class Regles(unittest.TestCase):
         txt = " ¦ ".join(i["text"] for i in engine.prules.lint(proj()) if "Contrôle2" in i["where"])
         for frag in ("Condition inconnue", "identique à la cible", "ne peut pas se relancer lui-même", "Module(s) inconnu(s)", "sans confirmation"):
             self.assertIn(frag, txt)
+
+    # -- lot v3
+    def test_systeme_v3_fusion_de_mr_et_confirmations(self):
+        self.set(mrs=[{"id": "m1", "n": 7, "title": "Login", "task": "t1", "status": "ouverte", "by_id": "a2"}])
+
+        def fake_merge(u, pid, mid):
+            engine.mp(u, pid, lambda pp: by_id(pp["mrs"], mid).update(status="fusionnée"))
+            return "MR #7 fusionnée"
+        by_id = engine.by_id
+        w = self.add_wf("Fusion", [self.sys("merge_mr"), self.sys("log_history", text="MR de {task.title} fusionnée")])
+        with mock.patch.object(engine, "merge_mr", fake_merge):
+            run = self.run_wf(w, self.no_ai(), task="t1")
+        self.assertEqual((run["status"], proj()["mrs"][0]["status"], run["results"][0]["comment"]), ("terminé", "fusionnée", "MR #7 fusionnée"))
+        self.assertTrue(any("Workflow « Fusion »" in m["from"] and "Login" in m["text"] for m in proj()["log"]))
+        for act, v in (("release_publish", ""), ("push_release", ""), ("cleanup_merged_branches", ""), ("force_unlock", "a.txt"), ("reset_usage", "")):
+            self.assertTrue(engine.sysact.needs_confirm({"action": act, "value": v}), act)
+        self.assertFalse(engine.sysact.needs_confirm({"action": "merge_mr"}))
+        self.assertFalse(engine.sysact.needs_confirm({"action": "reset_usage", "confirm": "0"}))
+
+    def test_systeme_v3_release_et_reset(self):
+        calls = []
+        w = self.add_wf("Release", [self.sys("release_start", value="1.2"), self.sys("release_publish", value="", text="Notes {task.id}", confirm="0"), self.sys("reset_usage", confirm="0")])
+
+        def start(u, pid, v):
+            calls.append(("start", v)); engine.mp(u, pid, lambda pp: pp.__setitem__("cycle", {"version": v, "branch": "release/" + v}))
+        def publish(u, pid, v, notes):
+            calls.append(("pub", v, notes)); engine.mp(u, pid, lambda pp: pp.pop("cycle", None)); engine.log(u, pid, "Système", "Vous", "Release publiée")
+        with mock.patch.object(engine, "cycle_start", start), mock.patch.object(engine, "release", publish):
+            run = self.run_wf(w, self.no_ai(), task="t1")
+        self.assertEqual((run["status"], calls, proj().get("usage")), ("terminé", [("start", "1.2"), ("pub", "1.2", "Notes t1")], {}))
+        w2 = self.add_wf("Refus", [self.sys("release_start", value="2.0", on_ko="stop")])
+        with mock.patch.object(engine, "cycle_start", lambda u, pid, v: engine.log(u, pid, "Système", "Vous", "Version vide : release non démarrée.")):
+            run = self.run_wf(w2, self.no_ai())
+        self.assertEqual(run["status"], "arrêté")
+
+    def test_systeme_v3_boucle_sur_les_sous_taches(self):
+        st = store.load("u"); st["projects"][0]["tasks"] += [{"id": "t2", "parent": "t1", "title": "A", "desc": "", "who": "a3", "status": "à faire", "modules": [], "by": ""},
+                                                             {"id": "t3", "parent": "t1", "title": "B", "desc": "", "who": "a3", "status": "terminée", "modules": [], "by": ""},
+                                                             {"id": "t4", "parent": "t1", "title": "C", "desc": "", "who": "a3", "status": "en cours", "modules": [], "by": ""}]
+        store.wj(store.state_path("u"), st)
+        self.add_wf("Par sous-tâche", [self.sys("notify_user", text="{task.title}")])
+        w = self.add_wf("Boucle", [self.sys("for_each_subtask", target="t1", value="Par sous-tâche")])
+        run = self.run_wf(w, self.no_ai())
+        runs = [r for r in proj()["wf_runs"] if r["name"] == "Par sous-tâche"]
+        self.assertEqual((run["status"], sorted(r["task"] for r in runs)), ("terminé", ["t2", "t4"]))
+        self.assertIn("2 sous-tâche(s)", run["results"][0]["comment"])
+
+    def test_evenements_declenchent_les_workflows_abonnes(self):
+        w = self.add_wf("Réaction", [self.sys("notify_user", text="{task.title} à vérifier")])
+        self.set_wf(w, events=["task_status:à vérifier", "bug_declared"])
+        spawned = []
+        with mock.patch.object(engine, "spawn", lambda fn, *a, **k: spawned.append((fn.__name__, a))):
+            engine.mp("u", "p1", lambda pp: pp["tasks"][0].update(status="à vérifier"))
+            engine.mp("u", "p1", lambda pp: pp["bugs"].append({"id": "b9", "t": "Nouveau", "status": "ouvert", "modules": []}))
+            engine.mp("u", "p1", lambda pp: pp["tasks"][0].update(status="à vérifier"))      # inchangé : aucun événement
+        self.assertEqual([x[0] for x in spawned], ["fire_events", "fire_events"])
+        self.assertEqual([[e["e"] for e in x[1][2]] for x in spawned], [["task_status:à vérifier"], ["bug_declared"]])
+        with mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            engine.fire_events("u", "p1", spawned[0][1][2])
+            engine.fire_events("u", "p1", spawned[1][1][2])
+        runs = proj()["wf_runs"]
+        self.assertEqual([(r["trigger"], r["task"], r.get("bug")) for r in runs], [("événement : une tâche passe à « à vérifier »", "t1", None), ("événement : un bug est déclaré", "", "b9")])
+
+    def test_evenements_pas_de_boucle_sur_soi_meme_et_coherence(self):
+        w = self.add_wf("Auto", [self.sys("set_task_status", target="t1", value="à vérifier", confirm="0")])
+        self.set_wf(w, events=["task_status:à vérifier"])
+        fired = []
+        with mock.patch.object(engine, "spawn", lambda fn, *a, **k: fired.append(a)):
+            engine.sysact.run_step(engine, "u", "p1", proj(), proj()["workflows"][0], {"id": "r", "task": "t1"}, 0, proj()["workflows"][0]["steps"][0])
+        self.assertEqual([(x[2][0]["e"], x[3]) for x in fired if len(x) > 3 and isinstance(x[2], list)], [("task_status:à vérifier", w)])   # l'événement porte son origine
+        with mock.patch.object(engine, "spawn", lambda *a, **k: None):
+            engine.fire_events("u", "p1", [{"e": "task_status:à vérifier", "task": "t1"}], src=w)       # le workflow à l'origine du changement est ignoré
+        self.assertEqual(proj().get("wf_runs", []), [])
+        self.add_wf("Mauvais", [self.sys("set_task_status", value="terminée", confirm="0")])
+        self.set_wf(proj()["workflows"][1]["id"], events=["n_importe_quoi", "bug_declared"])
+        txt = " ¦ ".join(i["text"] for i in engine.prules.lint(proj()) if "Mauvais" in i["where"])
+        for frag in ("Événement de déclenchement inconnu", "n’en fournit aucune"):
+            self.assertIn(frag, txt)
+        self.assertIn("quand un bug est déclaré", engine.prules.trigger_text({"events": ["bug_declared"], "allow_agent": False}))
 
 
 class Http(unittest.TestCase):

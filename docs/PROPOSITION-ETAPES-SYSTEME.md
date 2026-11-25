@@ -1,6 +1,6 @@
 # Proposition — étapes de workflow exécutées par le système (sans IA)
 
-*Statut : validée le 25 nov. 2026. **Lots MVP et v2 (partiel) implémentés** : voir § 10 et § 11. Le reste du catalogue (v3) n'est pas implémenté.*
+*Statut : validée le 25 nov. 2026. **Lots MVP, v2 et v3 implémentés** : voir § 10 à § 12. Seul `export_recap` n'est pas fait (voir § 12).*
 
 ## 1. Problème
 
@@ -193,6 +193,31 @@ Voir § 11 pour ce qui a été livré ensuite.
 - **Simulation** : bouton « Simuler » sur un workflow. Il décrit chaque étape dans l'historique, sans rien exécuter ni modifier : confirmation demandée, conditions évaluées sur l'état actuel, problèmes détectés, étapes d'agent signalées comme consommatrices de tokens. Les sauts ne sont pas suivis.
 - **Tests** : 6 nouveaux ; 421 au total.
 
-### Reste à faire (v3 et au-delà)
+## 12. Lot v3, livré le 25 nov. 2026
 
-`merge_mr`, `run_checks`, `push_branch`, `create_task_branch`, nettoyage des branches fusionnées, `release_start` / `release_publish` / poussée de `main`, `develop` et des tags, `force_unlock`, `reset_usage`, `refresh_agent_context`, `log_history`, `export_recap`, boucle sur les sous-tâches, déclencheurs sur événement (§ 8).
+**Actions (35 au total)**
+
+- `merge_mr` : réutilise la fusion du moteur (règle de conflit du projet comprise). Réussit seulement si la MR est réellement « fusionnée » ensuite.
+- `run_checks` : contrôles « validation » dans le worktree git d'un agent. Échec seulement si un contrôle bloquant échoue.
+- `push_branch` (un agent ou `all`), `create_task_branch` (branche de l'agent assigné à la tâche : git local ou GitHub), `cleanup_merged_branches` (branches de MR fusionnées, git local).
+- `release_start`, `release_publish`, `push_release` : réussite vérifiée sur l'état du projet (release démarrée ou terminée), pas sur un simple « appel fait ».
+- `force_unlock` (refusé si le détenteur travaille encore), `reset_usage`, `refresh_agent_context` (git local), `log_history`.
+- `for_each_subtask` : lance un workflow sur chaque sous-tâche directe non terminée. Lancement asynchrone : l’étape n’attend pas la fin des workflows lancés, et les limites existantes (un seul déroulement par tâche, maximum par heure) s'appliquent, avec un ko listant les refus.
+- **Confirmation par défaut** (en plus de la clôture de tâche et du bug « vérifié ») : `release_publish`, `push_release`, `cleanup_merged_branches`, `force_unlock`, `reset_usage`. Décochable par étape.
+
+**Déclencheurs sur événement**
+
+- Un workflow peut s'abonner à : une tâche passe à un statut donné, une merge request est ouverte, un bug est déclaré, une release démarre.
+- La tâche (ou le bug) concerné est fourni au déroulement : pour `bug_declared`, une cible de bug vide désigne le bug déclaré ; `{bug.id}` et `{bug.title}` sont disponibles dans les textes. Une release démarrée ne fournit ni tâche ni bug.
+- Détection centrale dans `engine.mp` (comparaison avant/après, uniquement si un workflow actif est abonné). Les événements viennent donc du moteur (agents, workflows, validations), **pas des modifications faites à la main dans l'interface**.
+- Anti-boucle : un workflow n'est pas redéclenché par les changements de ses propres étapes. Un autre workflow abonné peut réagir ; les limites par heure bornent ces chaînes.
+- Un doublon en cours est ignoré en silence ; un refus par limite horaire est écrit dans l'historique.
+- Le contrôle de cohérence vérifie les événements et signale les étapes qui attendent une tâche que l'événement ne fournit pas.
+
+**Non fait**
+
+- `export_recap` : aucun récapitulatif n'est produit côté serveur (il est calculé par l'interface). À faire avec la fonction de récapitulatif elle-même si on veut l'exporter.
+- `run_checks` à l'intégration (worktree d'intégration) : seule la validation est couverte.
+- `cleanup_merged_branches`, `push_branch`, `push_release`, `refresh_agent_context`, `run_checks` : git local uniquement (en mode GitHub, l'étape échoue avec un message clair).
+
+**Tests** : 5 nouveaux ; 426 au total.

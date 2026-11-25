@@ -59,6 +59,9 @@ def trigger_text(w):
         parts.append("tous les jours à %s%s" % (sc.get("time", "?"), (" (jours : %s)" % ",".join("lun mar mer jeu ven sam dim".split()[d] for d in sorted(sc.get("days") or []) if 0 <= d <= 6)) if sc.get("days") else ""))
     elif sc.get("mode") == "interval":
         parts.append("toutes les %s minutes" % sc.get("every", "?"))
+    if w.get("events"):
+        import system_actions
+        parts.append("quand " + " ou ".join(system_actions.event_label(e) for e in w["events"]))
     return ", ".join(parts)
 
 
@@ -139,7 +142,7 @@ def subject_rules_text(p, a, h="#"):
 
 def snapshot(p):
     """État comparable des règles (pour détecter ce qui a changé entre deux communications)."""
-    keep = ("name", "desc", "enabled", "allow_agent", "schedule", "steps")
+    keep = ("name", "desc", "enabled", "allow_agent", "schedule", "events", "steps")
     return {"global": (p.get("rules") or "").strip(),
             "agents": {a["id"]: (a.get("rules") or "").strip() for a in p.get("agents", [])},
             "wf": {w["id"]: {k: w.get(k) for k in keep} for w in p.get("workflows", [])}}
@@ -198,6 +201,12 @@ def lint(p):
         steps, sc = w.get("steps", []), w.get("schedule") or {}
         mode = sc.get("mode", "off")
         timer = mode != "off"
+        import system_actions
+        for ev in w.get("events") or []:
+            if not system_actions.valid_event(ev):
+                add("erreur", where, "Événement de déclenchement inconnu : %s." % ev)
+        if w.get("events") and any(st.get("kind") == "system" and st.get("action") in ("set_task_status", "close_subtasks", "create_subtask", "run_workflow") for st in steps):
+            add("info", where, "Ce workflow se déclenche sur événement et modifie des tâches : ses propres changements ne le redéclenchent pas, mais un autre workflow abonné peut réagir (boucles bornées à %d déclenchements par heure)." % WF_MAX_PER_HOUR)
         if not steps:
             add("erreur", where, "Aucune étape définie : le workflow ne fait rien.")
         if mode == "daily" and not _valid_time(sc.get("time")):
