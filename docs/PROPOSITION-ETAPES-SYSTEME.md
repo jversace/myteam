@@ -1,6 +1,6 @@
 # Proposition — étapes de workflow exécutées par le système (sans IA)
 
-*Statut : proposition du 24 nov. 2026, en attente de validation. Rien n'est implémenté.*
+*Statut : validée le 25 nov. 2026. **Première livraison (« mécanique simple ») implémentée** : voir § 10. Le reste du catalogue (lots v2 et v3) n'est pas implémenté.*
 
 ## 1. Problème
 
@@ -164,8 +164,24 @@ Ces actions réutilisent `gitlocal.py` (mode local) et `github.py` (mode GitHub)
 
 Aujourd'hui un workflow se déclenche par l'utilisateur, un agent ou une minuterie. On pourrait ajouter des événements : tâche passée « à vérifier », MR soumise, bug déclaré, release démarrée. Combinés aux étapes système, ils automatisent des enchaînements complets sans aucun appel IA. À traiter après le MVP.
 
-## 9. Points à trancher
+## 9. Points tranchés (25 nov. 2026)
 
-1. **Confirmation par défaut** des actions sensibles : à garder (recommandé), ou autonomie totale ?
-2. **Périmètre du MVP** : mécanique simple (statuts, affectation, notifications, attente, MR et branches) puis conditions en v2, ou conditions dès le MVP ?
-3. **Échec d'une étape système** : par défaut question à l'utilisateur (recommandé), ou arrêt du workflow ?
+1. **Confirmation par défaut des actions sensibles** : conservée. Case décochable par étape (« Ne jamais demander »).
+2. **Périmètre** : mécanique simple d'abord. Les conditions (`if`), sous-workflows, boucles et actions git avancées restent en v2 / v3.
+3. **Échec d'une étape système** : par défaut question à l'utilisateur (continuer, relancer l'étape, arrêter) ; « Arrêter le workflow » est sélectionnable par étape.
+
+## 10. Livré (première livraison)
+
+- **Module `system_actions.py`** : catalogue `ACTIONS`, exécution (`run_step`), validation (`lint_step`), description (`describe`), variables (`render`). Aucun appel d'IA.
+- **Étape `kind: "system"`** : `action`, `target` (tâche, bug ou MR ; vide = tâche cible du déroulement), `value`, `who`, `text`, `confirm`, `on_ko` (défaut `ask_user`), `on_ok` (`next` ou `goto`) et `goto_ok`.
+- **Actions** : `set_task_status`, `assign_task`, `add_task_note`, `launch_task`, `set_bug_status`, `assign_bug_fix`, `sync_agent_branch` (git local et GitHub, source `release`, `develop` ou `main` ; un conflit annule l'intégration et rend un ko), `sync_mrs`, `mark_mr_done`, `notify_agent`, `notify_user`, `wait` (1 à 600 s), `end_workflow`.
+- **Confirmation** : par défaut pour une clôture de tâche (`set_task_status` → « terminée », qui contourne la vérification) et pour un bug « vérifié ». Décision « Exécuter / Arrêter le workflow », posée une seule fois par étape.
+- **Moteur** : `engine.wf_do_step` (branche système), `wf_after` (`on_ok`, échec par défaut = question), `wf_continue` (action `end_workflow`), reprise après confirmation (`wf_after: sysconfirm`).
+- **Prompts des agents** : l'étape est décrite « [automatique, sans IA — aucune action de ta part] » et n'est jamais proposée comme étape à réaliser.
+- **Contrôle de cohérence** : action inconnue, statut invalide, cible disparue, minuterie sans tâche cible, acteur introuvable, durée, saut invalide, action sensible sans confirmation.
+- **Interface** : type d'étape « Le système exécute une action », liste d'actions avec aide, cible, valeur, confirmation, « si réussite » (suite ou saut).
+- **Tests** : 8 nouveaux (statuts, affectation, notes, bug, clôture avec confirmation, refus, échec par défaut ou arrêt, saut et fin, MR, synchronisation GitHub, cohérence et prompt) ; 415 au total.
+
+### Reste à faire
+
+Lots v2 et v3 du § 3 : conditions `if`, `create_subtask`, `link_*_modules`, `merge_mr`, `run_checks`, `push_branch`, nettoyage de branches, release, sous-workflows, boucle sur les sous-tâches ; essai à blanc (« simuler ») ; déclencheurs sur événement (§ 8).

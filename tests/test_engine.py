@@ -2012,6 +2012,116 @@ class Regles(unittest.TestCase):
         self.assertTrue(any("Aucune étape définie" in i["text"] for i in rr["static"]) and rr["ai"])
         self.assertEqual(proj().get("rules_log", []), [])                                           # un simple contrôle ne notifie personne
 
+    # -- étapes système (sans IA)
+    def sys(self, action, on_ko=None, **kw):
+        self.n += 1
+        st = dict({"id": "s%d" % self.n, "kind": "system", "action": action}, **kw)
+        if on_ko:
+            st["on_ko"] = on_ko
+        return st
+
+    @staticmethod
+    def no_ai():
+        calls = []
+
+        def f(s, system, msgs):
+            calls.append(msgs[-1]["content"])
+            raise AssertionError("une étape système ne doit appeler aucune IA")
+        f.calls = calls
+        return f
+
+    def test_systeme_statut_affectation_notes_sans_ia(self):
+        self.set(bugs=[{"id": "b1", "t": "Plantage", "status": "ouvert", "modules": []}])
+        w = self.add_wf("Sys", [self.sys("set_task_status", target="t1", value="en attente"), self.sys("assign_task", target="t1", who="agent:a3"),
+                                self.sys("add_task_note", text="Repris par {task.assignee} : {step.1.comment}", target="t1"),
+                                self.sys("set_bug_status", target="b1", value="en correction"), self.sys("notify_user", text="Fini pour {task.title}"),
+                                self.sys("notify_agent", who="agent:a2", text="Info")])
+        ai = self.no_ai()
+        run = self.run_wf(w, ai, task="t1")
+        t = proj()["tasks"][0]
+        self.assertEqual((run["status"], len(ai.calls), [r["outcome"] for r in run["results"]]), ("terminé", 0, ["ok"] * 6))
+        self.assertEqual((t["status"], t["who"]), ("en attente", "a3"))
+        self.assertIn("« Login » : en attente", t["result"])
+        self.assertEqual(proj()["bugs"][0]["status"], "en correction")
+        self.assertIn("Fini pour Login", self.logs())
+        self.assertTrue(any(m["to"] == "Bob" and "Info" in m["text"] for m in proj()["log"]))
+
+    def test_systeme_cloture_exige_confirmation_par_defaut(self):
+        w = self.add_wf("Clôture", [self.sys("set_task_status", target="t1", value="terminée"), self.sys("notify_user", text="fait")])
+        ai = self.no_ai()
+        run = self.run_wf(w, ai)
+        d = proj()["decisions"][0]
+        self.assertEqual((run["waiting"], d["options"], d["wf_after"], proj()["tasks"][0]["status"]), (d["id"], ["Exécuter", "Arrêter le workflow"], "sysconfirm", "en cours"))
+        with mock.patch.object(engine, "call_ai", ai):
+            engine.decide("u", "p1", d["id"], "answer", answer="Exécuter")
+        run = proj()["wf_runs"][0]
+        self.assertEqual((run["status"], proj()["tasks"][0]["status"], len(proj()["decisions"])), ("terminé", "terminée", 1))   # confirmée une seule fois
+        self.assertIn("Clôturée par le workflow", proj()["tasks"][0]["reviewed"]["note"])
+
+    def test_systeme_confirmation_refusee_ou_decochee(self):
+        w = self.add_wf("Clôture", [self.sys("set_task_status", target="t1", value="terminée")])
+        run = self.run_wf(w, self.no_ai())
+        engine.decide("u", "p1", proj()["decisions"][0]["id"], "answer", answer="Arrêter le workflow")
+        self.assertEqual((proj()["wf_runs"][0]["status"], proj()["tasks"][0]["status"]), ("arrêté", "en cours"))
+        st = store.load("u"); st["projects"][0].update(workflows=[], wf_runs=[], decisions=[]); store.wj(store.state_path("u"), st)
+        w = self.add_wf("Clôture2", [self.sys("set_task_status", target="t1", value="terminée", confirm="0")])
+        run = self.run_wf(w, self.no_ai())
+        self.assertEqual((run["status"], proj()["tasks"][0]["status"], proj()["decisions"]), ("terminé", "terminée", []))
+
+    def test_systeme_echec_question_par_defaut_ou_arret(self):
+        w = self.add_wf("Défaut", [self.sys("set_bug_status", target="inconnu", value="vérifié", confirm="0"), self.sys("notify_user", text="suite")])
+        run = self.run_wf(w, self.no_ai())
+        d = proj()["decisions"][0]
+        self.assertEqual((run["status"], run["waiting"], d["wf_after"]), ("en cours", d["id"], "ko"))
+        self.assertIn("bug introuvable", d["question"])
+        st = store.load("u"); st["projects"][0].update(workflows=[], wf_runs=[], decisions=[]); store.wj(store.state_path("u"), st)
+        w = self.add_wf("Arrêt", [self.sys("set_bug_status", on_ko="stop", target="inconnu", value="corrigé"), self.sys("notify_user", text="suite")])
+        run = self.run_wf(w, self.no_ai())
+        self.assertEqual((run["status"], len(run["results"]), proj()["decisions"]), ("arrêté", 1, []))
+
+    def test_systeme_on_ok_saut_et_fin(self):
+        w = self.add_wf("Saut", [self.sys("notify_user", text="un", on_ok="goto", goto_ok=3), self.sys("notify_user", text="deux"),
+                                 self.sys("end_workflow", value="ok", text="terminé tôt"), self.sys("notify_user", text="quatre")])
+        run = self.run_wf(w, self.no_ai())
+        self.assertEqual((run["status"], [r["i"] for r in run["results"]]), ("terminé", [1, 3]))
+        self.assertNotIn("deux", self.logs().replace("Workflow « Saut »", ""))
+        self.assertIn("terminé tôt", run["note"])
+
+    def test_systeme_synchronisation_des_mr_et_marquage(self):
+        self.set(mrs=[{"id": "m1", "n": 7, "title": "Login", "task": "t1", "status": "ouverte", "from": "Bob"}])
+        w = self.add_wf("MR", [self.sys("mark_mr_done"), self.sys("sync_mrs")])
+        with mock.patch.object(engine, "sync_mrs", lambda *a, **k: []):
+            run = self.run_wf(w, self.no_ai(), task="t1")
+        self.assertEqual((run["status"], proj()["mrs"][0]["status"]), ("terminé", "terminée"))
+        self.assertIn("aucune merge request à retirer", run["results"][1]["comment"])
+
+    def test_systeme_synchro_branche_github(self):
+        calls = []
+
+        class Rp:
+            base, work = "main", "release/1"
+            def ensure_branch(self, b): calls.append(("ensure", b))
+            def merge_branch(self, into, src): calls.append((into, src)); return {"state": "merged"} if src == "main" else {"state": "conflict"}
+        w = self.add_wf("Sync", [self.sys("sync_agent_branch", who="agent:a2", value="main", on_ko="continue"), self.sys("sync_agent_branch", who="agent:a2", value="release", on_ko="continue")])
+        with mock.patch.object(engine.sysact.github, "Repo", lambda p: Rp()):
+            run = self.run_wf(w, self.no_ai())
+        self.assertEqual([r["outcome"] for r in run["results"]], ["ok", "ko"])
+        self.assertIn(("agent/bob", "main"), calls)
+        self.assertIn("conflit", run["results"][1]["comment"])
+
+    def test_systeme_coherence_et_prompt(self):
+        w = self.add_wf("Contrôle", [self.sys("inconnue"), self.sys("set_task_status", target="t1", value="nimporte"), self.sys("wait", value="9999"),
+                                      self.sys("set_task_status", value="terminée", confirm="0"), self.sys("assign_task", target="t1", who="agent:zz"),
+                                      self.sys("notify_user", text="ok", on_ok="goto", goto_ok=42)],
+                       schedule={"mode": "interval", "every": 60})
+        txt = " ¦ ".join(i["text"] for i in engine.prules.lint(proj()) if "Contrôle" in i["where"])
+        for frag in ("Action système inconnue", "Statut de tâche invalide", "Durée invalide", "minuterie", "sans confirmation", "n’existe plus", "étape inexistante"):
+            self.assertIn(frag, txt)
+        self.add_wf("Visible", [self.sys("set_task_status", target="t1", value="à faire")])
+        prompt = engine.sys_prompt(proj(), proj()["agents"][1])
+        self.assertIn("[automatique, sans IA", prompt)
+        self.assertIn("Changer le statut d’une tâche", prompt)
+
 
 class Http(unittest.TestCase):
     """Routes HTTP réelles : comptes, état révisionné avec fusion, travaux."""

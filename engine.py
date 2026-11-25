@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import threading
 import time
 from datetime import datetime
@@ -17,6 +18,7 @@ import gitlocal
 import checks
 import locks
 import project_rules as prules
+import system_actions as sysact
 import rights
 import rulebook
 from ai import call_ai, System
@@ -1244,8 +1246,10 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
                 if ans == "Arrêter le workflow":
                     run.update(status="arrêté", note="arrêté par l’utilisateur", ended=now())
                     return "stop"
-                if d.get("wf_after") == "ko" and ans == "Relancer cette étape":
+                if (d.get("wf_after") == "ko" and ans == "Relancer cette étape") or d.get("wf_after") == "sysconfirm":
                     run["step"] = i
+                    if d.get("wf_after") == "sysconfirm":
+                        run["confirmed"] = i               # confirmée : l'étape système s'exécute sans redemander
                     return "next"
                 if d.get("wf_after") != "ko":
                     run.setdefault("results", []).append({"i": i + 1, "outcome": "ok", "comment": full[:300], "d": now()})
@@ -2554,12 +2558,20 @@ def wf_resume(u, pid, rid):
 
 def wf_after(u, pid, rid, i, st, outcome, comment):
     """Enregistre le résultat d'une étape et décide de la suite : next (étape suivante ou saut), stop, ou wait (question à l'utilisateur)."""
-    ko, policy = outcome != "ok", st.get("on_ko") or "stop"
+    ko, policy = outcome != "ok", st.get("on_ko") or ("ask_user" if st.get("kind") == "system" else "stop")
 
     def f(pp):
         run = by_id(pp["wf_runs"], rid)
         run["results"].append({"i": i + 1, "outcome": outcome, "comment": str(comment)[:300], "d": now()})
         run.pop("cur", None)
+        if not ko and st.get("on_ok") == "goto":
+            try:
+                g = int(st.get("goto_ok")) - 1
+            except (TypeError, ValueError):
+                g = -1
+            if g >= 0:
+                run["step"] = g
+                return "next"
         if not ko or policy == "continue":
             run["step"] = i + 1
             return "next"
@@ -2591,6 +2603,8 @@ def wf_after(u, pid, rid, i, st, outcome, comment):
 def wf_do_step(u, pid, p, wf, run, i, st):
     """Exécute une étape. Retourne (issue ok|ko, commentaire, attente)."""
     kind = st.get("kind", "ask")
+    if kind == "system":                                   # étape exécutée par l'application, sans IA (system_actions.py)
+        return sysact.run_step(sys.modules[__name__], u, pid, p, wf, run, i, st)
     if kind == "start_tasks":
         n = dispatch(u, pid, snap(u, pid), time.time(), force=True)
         return "ok", "%d tâche(s) démarrée(s)" % n, False
@@ -2656,6 +2670,10 @@ def wf_continue(u, pid, rid):
             return _wf_end(u, pid, rid, "échoué", "étape %d : %s" % (i + 1, e.msg))
         if wait:
             return
+        if outcome == "end":                                # action système « terminer le workflow »
+            res, _, txt = comment.partition("|")
+            mp(u, pid, lambda pp: by_id(pp["wf_runs"], rid)["results"].append({"i": i + 1, "outcome": "ok", "comment": txt[:300], "d": now()}))
+            return _wf_end(u, pid, rid, "terminé" if res == "ok" else "échoué", txt or "terminé par une étape système")
         if wf_after(u, pid, rid, i, wf["steps"][i], outcome, comment) != "next":
             return
 

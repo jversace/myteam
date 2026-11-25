@@ -7,7 +7,7 @@ from datetime import datetime
 
 import rulebook
 
-STEP_KINDS = ("ask", "start_tasks", "ask_user")
+STEP_KINDS = ("ask", "start_tasks", "ask_user", "system")
 ON_KO = ("stop", "continue", "ask_user", "goto")
 WF_LATE = 6 * 3600          # une minuterie quotidienne manquée de plus de 6 h n'est pas rattrapée
 WF_MAX_STEPS = 20           # garde-fou : nombre maximal d'étapes exécutées par déroulement (boucles)
@@ -68,8 +68,12 @@ def step_text(p, st, i):
         or ((a or {}).get("name", "?") if (st.get("who") or "").startswith("agent:") else "un agent du rôle %s" % ((by_id(roles_of(p), (st.get("who") or "")[5:]) or {}).get("name", "?")))
     kind = st.get("kind", "ask")
     body = {"start_tasks": "démarrer les tâches prêtes (assignées, à faire, dépendances satisfaites)", "ask_user": "demander à l’utilisateur : %s" % st.get("text", "")}.get(kind, "%s : %s" % (who, st.get("text", "")))
-    ko = {"stop": "arrêter", "continue": "continuer", "ask_user": "demander à l’utilisateur", "goto": "aller à l’étape %s" % st.get("goto", "?")}.get(st.get("on_ko") or "stop", "arrêter")
-    return "%d. %s (si échec : %s)" % (i, body, ko)
+    if kind == "system":
+        import system_actions
+        body = "[automatique, sans IA — aucune action de ta part] " + system_actions.describe(p, st)
+    ko = {"stop": "arrêter", "continue": "continuer", "ask_user": "demander à l’utilisateur", "goto": "aller à l’étape %s" % st.get("goto", "?")}.get(
+        st.get("on_ko") or ("ask_user" if kind == "system" else "stop"), "arrêter")
+    return "%d. %s (si échec : %s%s)" % (i, body, ko, (" ; si réussite : aller à l’étape %s" % st.get("goto_ok", "?")) if st.get("on_ok") == "goto" else "")
 
 
 def workflows_text(p, a, h="#"):
@@ -79,7 +83,7 @@ def workflows_text(p, a, h="#"):
         return ""
     L = []
     for w in wfs:
-        mine = [str(i) for i, st in enumerate(w.get("steps", []), 1) if (resolve_actor(p, st) or {}).get("id") == a["id"] or st.get("who") in ("assignee", "requester")]
+        mine = [str(i) for i, st in enumerate(w.get("steps", []), 1) if st.get("kind") != "system" and ((resolve_actor(p, st) or {}).get("id") == a["id"] or st.get("who") in ("assignee", "requester"))]
         L.append("- « %s »%s — %s\n  Déclenchement : %s.%s\n  Étapes :\n%s" % (
             w.get("name", "?"), (" : " + w["desc"]) if w.get("desc") else "", "ouvert aux agents" if w.get("allow_agent", True) else "réservé à l’utilisateur et à la minuterie",
             trigger_text(w), ("\n  Tu interviens (ou peux intervenir) aux étapes : " + ", ".join(mine) + ".") if mine else "",
@@ -218,6 +222,10 @@ def lint(p):
                 continue
             if kind in ("ask", "ask_user") and not norm(st.get("text")):
                 add("erreur", wh, "Instruction vide.")
+            if kind == "system":
+                import system_actions
+                for lvl, msg in system_actions.lint_step(p, st, timer):
+                    add(lvl, wh, msg)
             if kind == "ask":
                 actor = resolve_actor(p, st)
                 if who == "principal" and not main:
@@ -234,7 +242,16 @@ def lint(p):
                     add("avertissement", wh, "%s est en chat manuel : cette étape attendra votre intervention (jusqu’à 24 h)." % actor.get("name", "L’agent"))
             if kind == "start_tasks" and p.get("autopilot") != "off":
                 add("info", wh, "Le lancement automatique des tâches est déjà actif : cette étape ne sert qu’à forcer un démarrage immédiat.")
-            ko = st.get("on_ko") or "stop"
+            ko = st.get("on_ko") or ("ask_user" if kind == "system" else "stop")
+            if st.get("on_ok") == "goto":
+                try:
+                    g = int(st.get("goto_ok"))
+                except (TypeError, ValueError):
+                    g = 0
+                if not 1 <= g <= len(steps):
+                    add("erreur", wh, "Saut (si réussite) vers une étape inexistante (%s)." % st.get("goto_ok", ""))
+                elif g <= i:
+                    add("avertissement", wh, "Retour vers l’étape %d après réussite : boucle possible (limitée à %d étapes exécutées)." % (g, WF_MAX_STEPS))
             if ko not in ON_KO:
                 add("erreur", wh, "Comportement en cas d’échec inconnu : %s." % ko)
             elif ko == "goto":
