@@ -5,6 +5,7 @@ import hashlib, hmac, json, mimetypes, os, re, secrets, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import engine
+import rights
 import store
 from ai import call_ai
 from store import Err, LOCK, SESSIONS, USERS, rj, wj
@@ -78,7 +79,7 @@ class H(BaseHTTPRequestHandler):
             if ser is not None and not store.changed(u, int(ser)):
                 return self.out(200, {"same": True})
             rev, ser, st = store.get(u)
-            return self.out(200, {"rev": rev, "ser": ser, "state": st})
+            return self.out(200, {"rev": rev, "ser": ser, "state": st, "defcaps": rights.DEFAULT_CAPS, "defbase": rights.BASE_CAPS})
         if p == "/api/diagnostic":
             u, _ = self.auth()
             pid = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("project", [""])[0]

@@ -157,6 +157,17 @@ def effective(mode, dropped=()):
     return locked_core() + agent_rules(mode, dropped)
 
 
+def analysis_lines(modes=None, overridden=()):
+    """Règles par défaut à soumettre à l'analyse de cohérence : verrouillées, modifiables non remplacées pour tous les agents,
+    et seulement les modules des modes réellement utilisés par le projet."""
+    ov = set(overridden or ())
+    out = [t for (_i, s, locked, t) in CORE if locked or s not in ov]
+    ms = [m for m in MODES if m in set(modes or MODES)]
+    for m in ms:
+        out += [t if len(ms) == 1 else "[mode %s] %s" % (MODE_LABEL[m], t) for (_i, _s, t) in MODULES[m]]
+    return out
+
+
 def all_lines():
     """Toutes les règles par défaut, tous modes confondus (analyse de cohérence)."""
     out = [t for (_i, _s, _l, t) in CORE]

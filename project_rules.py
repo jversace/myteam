@@ -95,6 +95,26 @@ def _untagged(text):
     return "\n".join(i["raw"] for i in items if not i["subject"]).strip()
 
 
+def resolved_lines(p):
+    """Règles à sujet retenues pour chaque agent (arbitrées par le code, pas par l'IA) : une ligne par règle gagnante."""
+    import rights
+    seen = {}
+    for a in p.get("agents", []):
+        for sj, c in rights.subject_winners(p, a).items():
+            seen.setdefault((sj, c["scope"], c["text"]), []).append(a.get("name", "?"))
+    return ["- « %s » [%s] pour %s : %s" % (rulebook.SUBJECTS.get(sj, sj), sc, ", ".join(names), tx) for (sj, sc, tx), names in seen.items()]
+
+
+def has_material(p):
+    """Y a-t-il quelque chose que seule une IA peut vérifier ? Les règles à sujet sont arbitrées par le code ; restent les règles
+    sans sujet (textes libres, instructions) et les workflows."""
+    if shared_rules_text(p) or p.get("workflows"):
+        return True
+    if any(_untagged(a.get("rules")) for a in p.get("agents", [])):
+        return True
+    return any(i.get("active", True) and not rulebook.clean_subject(i.get("subject")) for i in p.get("instructions", []))
+
+
 def shared_rules_text(p):
     """Règles du projet communes à tous les agents (bloc de prompt partagé) : sans les règles à sujet, envoyées au cas par cas."""
     return _untagged(p.get("rules"))
@@ -298,17 +318,19 @@ def _policy_text(p):
 def dump(p, builtin_rules):
     """Texte complet des règles, pour l'analyse de cohérence par un agent."""
     L = ["## Règles intégrées (non modifiables, appliquées à tous les agents)", "\n".join("- " + r for r in builtin_rules), "",
-         "## Règles globales du projet (écrites par l'utilisateur)", (p.get("rules") or "(aucune)").strip(), "", "## Règles spécifiques par agent"]
+         "## Règles globales du projet (écrites par l'utilisateur)", shared_rules_text(p) or "(aucune)", "", "## Règles spécifiques par agent"]
     for a in p.get("agents", []):
         role = (by_id(roles_of(p), a.get("role")) or {}).get("name", "?")
-        L.append("- %s (rôle : %s%s, mode : %s) : %s" % (a["name"], role, ", agent principal" if a["id"] == p.get("mainId") else "", a.get("mode", "api"), (a.get("rules") or "(aucune)").strip()))
+        L.append("- %s (rôle : %s%s, mode : %s) : %s" % (a["name"], role, ", agent principal" if a["id"] == p.get("mainId") else "", a.get("mode", "api"), _untagged(a.get("rules")) or "(aucune)"))
     L += ["", "## Workflows"]
     for w in p.get("workflows", []):
         L.append("- « %s » (%s) : %s\n  Déclenchement : %s\n%s" % (w.get("name", "?"), "actif" if w.get("enabled", True) else "désactivé", w.get("desc", ""), trigger_text(w),
                                                                   "\n".join("  " + step_text(p, st, i) for i, st in enumerate(w.get("steps", []), 1))))
-    ins = [i for i in p.get("instructions", []) if i.get("active", True)]
+    ins = [i for i in p.get("instructions", []) if i.get("active", True) and not rulebook.clean_subject(i.get("subject"))]
     L += ["", "## Instructions et décisions de l'utilisateur (PLUS RÉCENTES que les règles ci-dessus : elles les précisent ou les remplacent)"]
     L += ["- n°%s [%s] %s" % (i.get("n", "?"), i.get("scope", "global"), i.get("text", "")) for i in ins[-40:]] or ["(aucune)"]
+    L += ["", "## Sujets tranchés AUTOMATIQUEMENT par l'application (priorité agent > rôle ou module > global > règle intégrée ; ne les signale PAS)"]
+    L += resolved_lines(p) or ["(aucun)"]
     L += ["", "## Réglages du projet",
           "- Autonomie des agents : %s ; règle des conflits de fusion : %s ; lancement automatique : %s ; suivi automatique : %s" % (
               p.get("autonomy", "balanced"), _policy_text(p), p.get("autopilot", "on"), p.get("supervision", "on")),

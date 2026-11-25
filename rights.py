@@ -15,8 +15,8 @@ STATUS = ("à faire", "en cours", "en attente", "à vérifier", "terminée")
 BUG_STATUS = ("ouvert", "en correction", "corrigé", "vérifié", "rouvert")
 BUG_CLOSED = ("vérifié", "résolu")        # « résolu » : ancien statut conservé
 
-_BASE = {"subtask": FREE, "task_top": NO, "module": NO, "bug": FREE, "bug_update": FREE, "bug_verify": NO, "mr_review": NO, "link": FREE, "check": APPROVE}
-# Capacités par défaut des rôles standard (à garder synchronisées avec DEF_CAPS de static/index.html)
+BASE_CAPS = _BASE = {"subtask": FREE, "task_top": NO, "module": NO, "bug": FREE, "bug_update": FREE, "bug_verify": NO, "mr_review": NO, "link": FREE, "check": APPROVE}
+# Capacités par défaut des rôles standard : source unique, servie à l'interface avec l'état (GET /api/state : defcaps, defbase)
 DEFAULT_CAPS = {
     "Chef de projet": {**_BASE, "task_top": APPROVE, "module": APPROVE, "bug_verify": FREE, "mr_review": FREE},
     "Architecte": {**_BASE, "task_top": APPROVE, "module": APPROVE, "bug_verify": FREE, "mr_review": FREE},

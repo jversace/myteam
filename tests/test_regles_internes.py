@@ -293,3 +293,165 @@ class RegleEnTexte(unittest.TestCase):
 
 def prules_shared(p):
     return engine.prules.shared_rules_text(p)
+
+
+def names(txt):
+    return set(re.findall(r'\{"do":"(\w+)"', txt))
+
+
+class ActionsFiltrees(unittest.TestCase):
+    def setUp(self):
+        self.p = pr()
+        self.alice, self.bob, self.carl = self.p["agents"]       # Alice : agent principal (Chef de projet) ; Bob, Carl : développeurs
+
+    def acts(self, a, source, git=False):
+        a["source"] = source
+        with mock.patch.object(engine, "git_mode", lambda _p, g=git: g):
+            return names(engine.actions_text(self.p, a))
+
+    def test_mode_github(self):
+        n = self.acts(self.bob, "")
+        self.assertTrue({"pull", "merge_request", "resolve_merge", "read_file", "edit_file", "ask_user", "task_status"} <= n)
+        self.assertFalse(n & {"lock_file", "unlock_file", "get_locks", "status", "commit", "sync", "propose_check", "mr_review"})
+
+    def test_mode_local(self):
+        n = self.acts(self.bob, "local")
+        self.assertTrue({"lock_file", "unlock_file", "get_locks"} <= n)
+        self.assertFalse(n & {"pull", "merge_request", "resolve_merge", "mr_review", "status", "commit"})
+
+    def test_mode_git(self):
+        n = self.acts(self.bob, "local", git=True)
+        self.assertTrue({"status", "commit", "diff", "search", "sync", "git_log", "git_show", "propose_check", "resolve_merge"} <= n)
+        self.assertFalse(n & {"lock_file", "pull", "merge_request"})
+
+    def test_agent_principal(self):
+        n = self.acts(self.alice, "")
+        self.assertTrue({"instruction", "spec", "stop_agent", "relaunch", "task_review", "mr_review", "module"} <= n)
+        self.assertFalse(names(engine.actions_text(self.p, self.bob)) & {"instruction", "spec", "stop_agent", "relaunch", "task_review"})
+
+    def test_actions_selon_les_droits(self):
+        self.p["roles"].append({"id": "r9", "name": "Rédacteur technique"})
+        self.carl["role"] = "r9"
+        n = self.acts(self.carl, "")
+        self.assertFalse(n & {"bug", "bug_status", "module", "propose_check"})
+        self.assertIn("bug", self.acts(self.bob, ""))
+
+    def test_workflows_et_messages(self):
+        self.assertFalse(self.acts(self.bob, "") & {"run_workflow", "wf_step"})
+        self.p["workflows"] = [{"id": "w", "name": "Revue", "enabled": True, "steps": []}]
+        self.assertTrue({"run_workflow", "wf_step"} <= self.acts(self.bob, ""))
+        self.bob["talk"] = ["none"]
+        self.assertNotIn("message", self.acts(self.bob, ""))
+        self.assertIn("message", self.acts(self.alice, ""))
+
+    def test_instr_rewrite_jamais_dans_le_prompt(self):
+        self.assertNotIn("instr_rewrite", self.acts(self.alice, ""))
+        self.assertIn("instr_rewrite", engine.ACTIONS)
+
+    def test_toute_action_est_classee(self):
+        for line in engine.ACTION_LINES:
+            engine.action_applies(self.p, self.bob, engine._aname(line))      # ne lève pas
+        extra = {engine._aname(l) for l in engine.ACTION_LINES} - set(engine.ACTIONS_ALWAYS) - set(engine.ACTIONS_HIDDEN)
+        self.assertEqual(len(extra) + len(engine.ACTIONS_ALWAYS) + len(engine.ACTIONS_HIDDEN), len(engine.ACTION_LINES))
+
+    def test_moins_de_tokens(self):
+        full = len(engine.ACTIONS)
+        for a, src, git in ((self.bob, "", False), (self.bob, "local", False), (self.bob, "local", True)):
+            a["source"] = src
+            with mock.patch.object(engine, "git_mode", lambda _p, g=git: g):
+                n = len(engine.actions_text(self.p, a))
+            self.assertLess(n, full * 0.8)
+
+    def test_bloc_partage_inchange(self):
+        s1 = engine.sys_prompt(self.p, self.bob)
+        self.bob["source"] = ""
+        s2 = engine.sys_prompt(self.p, self.bob)
+        self.assertEqual(s1.blocks[0], s2.blocks[0])
+        self.assertIn("edit_file", s1.blocks[0])
+        self.assertNotIn("merge_request", s1.blocks[0])
+        self.assertIn("merge_request", s2)
+
+
+class AnalyseCiblee(unittest.TestCase):
+    def setUp(self):
+        self.p = pr()
+
+    def test_rien_pour_l_ia_si_tout_est_arbitre_par_le_code(self):
+        self.p["rules"] = "- [langue] Anglais"
+        self.p["agents"][1]["rules"] = "- [coordination] Écris peu"
+        self.assertFalse(engine.prules.has_material(self.p))
+        self.p["rules"] += "\n- Commits courts"
+        self.assertTrue(engine.prules.has_material(self.p))
+
+    def test_dump_sans_les_regles_a_sujet_ni_les_modes_inutiles(self):
+        self.p["rules"] = "Commits courts\n- [langue] Anglais"
+        self.p["agents"][1]["rules"] = "- [langue] Allemand"
+        for a in self.p["agents"]:
+            a["source"] = "local"
+        txt = engine.prules.dump(self.p, engine.analysis_builtin(self.p))
+        self.assertIn("Commits courts", txt)
+        self.assertIn("Sujets tranchés AUTOMATIQUEMENT", txt)
+        self.assertIn("[agent:Bob] pour Bob : Allemand", txt)
+        self.assertIn("[global] pour Alice, Carl : Anglais", txt)
+        builtin = "\n".join(engine.analysis_builtin(self.p))
+        self.assertIn("lock_file", builtin)                        # mode local utilisé
+        self.assertNotIn("merge_request vers", builtin)            # mode github inutilisé
+        self.assertNotIn("Worktree", builtin)
+
+    def test_regle_remplacee_pour_tous_absente_des_regles_integrees(self):
+        self.p["rules"] = "- [langue] Anglais"
+        self.assertNotIn("Réponds en français", "\n".join(engine.analysis_builtin(self.p)))
+        self.p["agents"][1]["rules"] = ""
+        self.p["instructions"] = []
+        self.p["rules"] = ""
+        self.assertIn("Réponds en français", "\n".join(engine.analysis_builtin(self.p)))
+
+    def test_pas_de_nouvel_appel_si_le_texte_n_a_pas_change(self):
+        store.wj(store.state_path("u"), make_state(tempfile.mkdtemp()))
+        st = store.load("u")
+        st["projects"][0]["rules"] = "Commits courts"
+        store.wj(store.state_path("u"), st)
+        calls = []
+
+        def fake_ask(u, pid, aid, *a, **k):                     # l'agent répond par l'action rules_report (rapport structuré)
+            calls.append(1)
+            engine.mp(u, pid, lambda pp: pp["rules_report"].update(analyzing="", ai=[], ai_ts="x"))
+            return "ok"
+        with mock.patch.object(engine, "ask", fake_ask):
+            engine.rules_analysis("u", "p1")
+            self.assertEqual(len(calls), 1)
+            engine.rules_analysis("u", "p1")                       # même texte : pas d'appel
+            self.assertEqual(len(calls), 1)
+            engine.rules_analysis("u", "p1", force=True)           # demande explicite
+            self.assertEqual(len(calls), 2)
+            st = store.load("u")
+            st["projects"][0]["rules"] = "Commits courts et clairs"
+            store.wj(store.state_path("u"), st)
+            engine.rules_analysis("u", "p1")                       # texte modifié : nouvelle analyse
+            self.assertEqual(len(calls), 3)
+
+    def test_la_consolidation_conserve_le_sujet(self):
+        store.wj(store.state_path("u"), make_state(tempfile.mkdtemp()))
+        engine.instr_add("u", "p1", "global", "Tous en anglais", (), "langue")
+        n = proj()["instructions"][0]["n"]
+        st = store.load("u")
+        st["projects"][0]["instr_consol"] = {"analyzing": "a1"}
+        store.wj(store.state_path("u"), st)
+        engine.do_act("u", "p1", "a1", {"do": "instr_rewrite", "items": [{"text": "Anglais pour tous", "scope": "global", "subject": "langue", "replaces": [n]}]}, 0, {"n": 0, "t0": 0})
+        act = [i for i in proj()["instructions"] if i.get("active", True)]
+        self.assertEqual([(i["text"], i.get("subject")) for i in act], [("Anglais pour tous", "langue")])
+
+
+class DroitsParDefaut(unittest.TestCase):
+    def test_front_sans_copie_des_droits(self):
+        html = (Path(engine.__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("DEF_CAPS", html)
+        self.assertNotIn("DEF_BASE", html)
+        self.assertIn("r.defcaps", html)
+
+    def test_serveur_fournit_les_droits(self):
+        src = (Path(engine.__file__).parent / "server.py").read_text(encoding="utf-8")
+        self.assertIn('"defcaps": rights.DEFAULT_CAPS', src)
+        self.assertIn('"defbase": rights.BASE_CAPS', src)
+        self.assertEqual(rights.BASE_CAPS["check"], "approve")
+        self.assertEqual(rights.DEFAULT_CAPS["Chef de projet"]["mr_review"], "free")

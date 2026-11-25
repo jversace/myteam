@@ -48,7 +48,8 @@ F = "`" * 3
 # Règles par défaut : socle commun + module par mode, avec sujets (voir rulebook.py). Les agents reçoivent rulebook.locked_core()
 # (bloc partagé) puis rulebook.agent_rules(mode, sujets remplacés) ; RULES = tout, pour l'analyse de cohérence.
 RULES = rulebook.all_lines()
-ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n".join([
+ACTION_HEAD = "Actions (un objet JSON par bloc %saction ... %s) :" % (F, F)
+ACTION_LINES = [
     '{"do":"list_files","path":"<dossier, vide pour la racine>","agent":"<prénom ou base, facultatif>"} : lister un dossier du dépôt (ta branche, ou en lecture seule celle d’un autre agent)',
     '{"do":"read_file","path":"...","agent":"<prénom ou base, facultatif>","from_line":1,"to_line":80} : lire un fichier du dépôt (ta branche, ou en lecture seule celle d’un autre agent) ; 12 000 caractères maximum par lecture : au-delà, lis la suite avec from_line/to_line ou offset/limit (en caractères)',
     '{"do":"write_file","path":"...","content":"<contenu complet>","message":"<message de commit>"} : créer ou remplacer un fichier sur ta branche (refusé si le contenu est bien plus court que le fichier existant : c’est probablement une troncature ; utilise edit_file, ou confirm_shrink:true si c’est voulu)',
@@ -90,7 +91,18 @@ ACTIONS = "Actions (un objet JSON par bloc %saction ... %s) :\n" % (F, F) + "\n"
     '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>","replaces":[<n° des décisions en attente auxquelles cette question répond aussi>]} : poser une question à l’utilisateur (ambiguïté, décision structurante) ; si elle répond aussi à une question déjà en attente, indique son numéro dans replaces : l’ancienne est annulée et remplacée',
     '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>","subject":"<sujet facultatif>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur ; subject (langue, ambiguite, interruption, coordination, fichier_contexte, fichiers) fait remplacer la règle par défaut correspondante',
     '{"do":"instr_rewrite","items":[...],"obsolete":[...]} : (uniquement lors d’une consolidation demandée par l’application) liste consolidée des instructions',
-    '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications'])
+    '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications']
+ACTIONS = ACTION_HEAD + "\n" + "\n".join(ACTION_LINES)           # liste complète (référence) : les agents reçoivent la liste filtrée, voir actions_text
+
+
+def _aname(line):
+    return re.match(r'\{"do":"(\w+)"', line).group(1)
+
+
+# Actions toujours proposées (bloc de prompt partagé) ; les autres dépendent des droits, du mode et du projet (voir action_applies).
+ACTIONS_ALWAYS = ("list_files", "read_file", "write_file", "edit_file", "write_chunk", "delete_file", "get_blockers", "context", "task_status", "ask_user")
+ACTIONS_HIDDEN = ("instr_rewrite",)                # décrite dans la demande de consolidation, jamais dans le prompt courant
+GIT_ONLY = ("status", "commit", "diff", "search", "sync", "git_log", "git_show")
 
 
 def local_agent(p, a):
@@ -120,6 +132,72 @@ def git_agent(p, a):
 def agent_mode(p, a):
     """Mode de travail de l'agent pour le choix du module de règles : git, local ou github."""
     return rulebook.mode_of(local_agent(p, a), git_agent(p, a))
+
+
+def action_applies(p, a, name):
+    """L'action `name` est-elle utile à cet agent ? Selon son mode (github / local / git), ses droits, son statut d'agent principal et
+    le projet (autres agents joignables, workflows). Une action non proposée reste traitée par le code, qui la refuse avec un motif."""
+    mn = p.get("mainId") == a.get("id")
+    mode = agent_mode(p, a)
+    lv = lambda cap: rights.level(p, a, cap, mn)
+    others = [x for x in p.get("agents", []) if x.get("id") != a.get("id")]
+    if name in ACTIONS_ALWAYS:
+        return True
+    if name in ACTIONS_HIDDEN:
+        return False
+    if name in ("lock_file", "unlock_file", "get_locks"):
+        return mode == "local"
+    if name == "force_unlock":
+        return mn and any(local_agent(p, x) and not git_agent(p, x) for x in p.get("agents", []))
+    if name in ("stop_agent", "relaunch", "instruction", "spec"):
+        return mn
+    if name in GIT_ONLY:
+        return mode == "git"
+    if name == "propose_check":
+        return mode == "git" and lv("check") != rights.NO
+    if name in ("pull", "merge_request"):
+        return mode == "github"
+    if name == "resolve_merge":
+        return mode != "local"
+    if name == "mr_review":
+        return mode != "local" and lv("mr_review") == rights.FREE
+    if name == "message":
+        return any(can_talk(a, x, mn) for x in others)
+    if name == "get_progress":
+        return bool(others)
+    if name in ("run_workflow", "wf_step"):
+        return any(w.get("enabled", True) for w in p.get("workflows", []))
+    if name == "task":
+        return lv("subtask") != rights.NO or lv("task_top") != rights.NO
+    if name == "task_review":
+        return mn or lv("bug_verify") == rights.FREE
+    if name == "module":
+        return lv("module") != rights.NO
+    if name == "link_modules":
+        return lv("link") != rights.NO
+    if name == "bug":
+        return lv("bug") != rights.NO
+    if name == "bug_fix":
+        return mn or lv("bug") != rights.NO or lv("subtask") != rights.NO
+    if name == "bug_status":
+        return lv("bug_update") != rights.NO or lv("bug_verify") != rights.NO
+    return True                                        # action inconnue de cette liste : proposée par prudence
+
+
+def actions_common():
+    """Actions proposées à tous les agents : identiques pour tous, donc dans le bloc de prompt partagé (mis en cache)."""
+    return ACTION_HEAD + "\n" + "\n".join(l for l in ACTION_LINES if _aname(l) in ACTIONS_ALWAYS)
+
+
+def actions_extra(p, a):
+    """Autres actions utiles à cet agent (bloc propre à l'agent)."""
+    L = [l for l in ACTION_LINES if _aname(l) not in ACTIONS_ALWAYS and action_applies(p, a, _aname(l))]
+    return ("Autres actions à ta disposition :\n" + "\n".join(L)) if L else ""
+
+
+def actions_text(p, a):
+    """Liste complète des actions de cet agent (fichier de contexte)."""
+    return ACTION_HEAD + "\n" + "\n".join(l for l in ACTION_LINES if action_applies(p, a, _aname(l)))
 
 
 def agent_rules_lines(p, a):
@@ -287,7 +365,7 @@ def ctx_text(p, a):
         "\n## Mon rôle\n%s — %s" % (r["name"], r["desc"]),
         ("\n## Mon espace de travail\nWorktree git local personnel (branche %s) : pas de verrou, tes modifications ne comptent qu'après commit." % git_branch_hint(p, a)) if git_agent(p, a) else ("\n## Mon espace de travail\nRépertoire local du projet : %s (partagé : verrouille les fichiers avant de les modifier). Pas de branche, pas de pull ni de merge request." % (p.get("localdir") or "non défini")) if local_agent(p, a) else "\n## Ma branche\n" + a["branch"] + ("\n\nAgent principal : écrit à tous les agents, crée les tâches, tient SPEC.md à jour, réalise les merge requests et le tag à chaque release." if mn else ""),
         "\n## Droits\n%s\n- Agents joignables : %s" % (rights.rights_text(p, a, mn), talk),
-        "\n## " + ACTIONS, "\n## Notes de l’agent (à tenir à jour)\n" + (a.get("notes") or "(vides)")])
+        "\n## " + actions_text(p, a), "\n## Notes de l’agent (à tenir à jour)\n" + (a.get("notes") or "(vides)")])
 
 
 def can_talk(a, t, mn):
@@ -374,12 +452,12 @@ def sys_prompt(p, a):
         ("# Bugs ouverts (id | titre | gravité | statut | modules)\n" + bs) if bs else "",
         ("# Décisions en attente de l’utilisateur\n" + "\n".join("- %s (%s)" % (d.get("question") or (d["payload"].get("title") or d["payload"].get("name")), d["byName"]) for d in pend)) if pend else "",
         ("# Spécifications actuelles\n" + p["spec"][:6000]) if p.get("spec") else "",
-        "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), ACTIONS, focus_text(p, a),
-        "# Règles de l’équipe propres à ton mode de travail\n" + "\n".join(agent_rules_lines(p, a)), prules.subject_rules_text(p, a)]
+        "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), actions_common(), focus_text(p, a),
+        "# Règles de l’équipe propres à ton mode de travail\n" + "\n".join(agent_rules_lines(p, a)), prules.subject_rules_text(p, a), actions_extra(p, a)]
     # Blocs du plus stable au plus changeant (prompt caching Anthropic : les deux premiers sont mis en cache) :
     # 1) commun à tous les agents, 2) propre à l'agent mais rarement modifié, 3) change à presque chaque tour.
     shared = [parts[0], parts[18], parts[1], parts[11], parts[12], parts[16]]
-    per_agent = [parts[20], parts[21], parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
+    per_agent = [parts[20], parts[21], parts[22], parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
     volatile = [parts[19], parts[5], parts[10], parts[13], parts[14], parts[15], parts[17]]
     return System.of(["\n\n".join(x for x in grp if x) for grp in (shared, per_agent, volatile)])
 
@@ -1035,7 +1113,7 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                     sc = str(it.get("scope") or "global")
                     sc = sc if sc == "global" or sc.split(":")[0] in ("role", "agent", "module") else "global"
                     reps = [int(m.group()) for r in (it.get("replaces") or []) for m in [re.search(r"\d+", str(r))] if m and int(m.group()) in actifs]
-                    items.append({"text": str(it["text"]).strip()[:1500], "scope": sc, "replaces": reps})
+                    items.append({"text": str(it["text"]).strip()[:1500], "scope": sc, "replaces": reps, "subject": rights.clean_subject(it.get("subject"))})
             for r in x.get("obsolete") or []:
                 m = re.search(r"\d+", str(r))
                 if m and int(m.group()) in actifs:
@@ -1049,7 +1127,10 @@ def do_act(u, pid, aid, x, depth, ctx=None):
                             i.update(active=False)
                             res["off"].add(i["n"])
                 for it in items:
-                    res["off"].update(rights.add_instruction(pp, {"id": uid(), "by": a["name"] + " (consolidation)", "scope": it["scope"], "text": it["text"]}, it["replaces"]))
+                    ni = {"id": uid(), "by": a["name"] + " (consolidation)", "scope": it["scope"], "text": it["text"]}
+                    if it["subject"]:
+                        ni["subject"] = it["subject"]
+                    res["off"].update(rights.add_instruction(pp, ni, it["replaces"]))
                     res["added"] += 1
                 pp.setdefault("instr_consol", {}).update(analyzing="", ts=now(), note="%d instruction(s) consolidée(s), %d désactivée(s)." % (res["added"], len(res["off"])))
             mp(u, pid, f)
@@ -1238,11 +1319,11 @@ def instr_consolidate(u, pid):
         return mp(u, pid, lambda pp: pp.setdefault("instr_consol", {}).update(analyzing="", ts=now(), note="Aucune instruction à consolider." if not ins else "Impossible : aucun agent en mode API."))
     mp(u, pid, lambda pp: pp.setdefault("instr_consol", {}).update(analyzing=an["id"], note="Consolidation en cours…"))
     log(u, pid, "Système", an["name"], "Consolidation des instructions demandée à %s (%d instructions actives)." % (an["name"], len(ins)))
-    liste = "\n".join("- n°%s [%s] %s" % (i.get("n"), i.get("scope", "global"), i["text"]) for i in ins)
+    liste = "\n".join("- n°%s [%s]%s %s" % (i.get("n"), i.get("scope", "global"), (" {sujet : %s}" % i["subject"]) if i.get("subject") else "", i["text"]) for i in ins)
     msg = ("[Consolidation des instructions] Voici TOUTES les instructions actives de l'utilisateur, de la plus ancienne à la plus récente. Elles se sont accumulées : certaines sont des doublons, "
            "d'autres sont contredites ou rendues obsolètes par une plus récente (la plus récente l'emporte), d'autres ne sont que des décisions ponctuelles déjà appliquées. "
            "Produis la liste MINIMALE et sans contradiction qui conserve toute l'intention actuelle de l'utilisateur, sans rien inventer ni perdre de contrainte encore valable. "
-           "Réponds par UNE action instr_rewrite {\"items\":[{\"text\":\"...\",\"scope\":\"global|role:<rôle>|agent:<prénom>|module:<module>\",\"replaces\":[<n° remplacés>]}],\"obsolete\":[<n° simplement obsolètes, à supprimer sans remplaçant>]}. "
+           "Réponds par UNE action instr_rewrite {\"items\":[{\"text\":\"...\",\"scope\":\"global|role:<rôle>|agent:<prénom>|module:<module>\",\"subject\":\"<sujet, à conserver s’il y en avait un>\",\"replaces\":[<n° remplacés>]}],\"obsolete\":[<n° simplement obsolètes, à supprimer sans remplaçant>]}. "
            "Une instruction non citée dans replaces ni obsolete reste inchangée.\n\n" + liste)
     try:
         ask(u, pid, an["id"], msg, "Consolidation des instructions", relog=False, fresh=True)
@@ -2373,13 +2454,27 @@ def rules_check(u, pid):
     """Contrôle de cohérence à la demande (sans communication aux agents)."""
     lint = prules.lint(snap(u, pid))
     mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(static=lint, ts=now()))
-    rules_analysis(u, pid)
+    rules_analysis(u, pid, force=True)
 
 
-def rules_analysis(u, pid):
-    """Un agent (le principal, sinon un agent en mode API) analyse la cohérence des règles ; résultat dans p.rules_report.ai."""
+def analysis_builtin(p):
+    """Règles intégrées à soumettre à l'analyse : seulement les modules des modes utilisés et les règles non remplacées pour tous les agents."""
+    ags = p.get("agents", [])
+    ov = set.intersection(*[rights.overridden_subjects(p, a) for a in ags]) if ags else set()
+    return rulebook.analysis_lines({agent_mode(p, a) for a in ags}, ov)
+
+
+def rules_analysis(u, pid, force=False):
+    """Un agent (le principal, sinon un agent en mode API) analyse la cohérence des règles ; résultat dans p.rules_report.ai.
+    L'IA ne voit que ce que le code ne sait pas trancher : les règles à sujet sont arbitrées par l'application (priorité), et
+    l'analyse n'est pas relancée si le texte à analyser n'a pas changé depuis la dernière (sauf demande explicite)."""
     p = snap(u, pid)
-    nothing = not (p.get("rules") or "").strip() and not p.get("workflows") and not any((a.get("rules") or "").strip() for a in p["agents"])
+    nothing = not prules.has_material(p)
+    text = prules.dump(p, analysis_builtin(p))
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    rr0 = p.get("rules_report") or {}
+    if not nothing and not force and rr0.get("ai_hash") == h and rr0.get("ai") is not None and not rr0.get("analyzing"):
+        return mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(ai_note="Aucun changement à analyser depuis la dernière analyse (aucun appel à l’IA)."))
     an = next((g for g in [by_id(p["agents"], p.get("mainId"))] + p["agents"] if g and g.get("mode") != "manual"), None)
     if nothing or not an:
         return mp(u, pid, lambda pp: pp.setdefault("rules_report", {}).update(ai=[], ai_ts=now(), analyzing="", ai_note="Aucune règle à analyser." if nothing else "Analyse automatique impossible : aucun agent en mode API."))
@@ -2390,7 +2485,7 @@ def rules_analysis(u, pid):
            "{\"issues\":[{\"severity\":\"erreur|avertissement|info\",\"where\":\"...\",\"text\":\"...\",\"suggestion\":\"...\"}]} (liste vide si tout est cohérent). "
            "Ne signale que ce qui découle du texte ci-dessous, sans rien inventer. Ce texte est l'état ACTUEL et complet : ignore toute version antérieure des règles. "
            "Les instructions et décisions de l'utilisateur sont plus récentes que les règles et les complètent ou les remplacent : un point qu'elles précisent n'est PLUS ambigu, ne le signale pas. "
-           "Entre deux instructions de même sujet qui se contredisent, la plus spécifique (agent > rôle ou module > global) l'emporte, puis à portée égale la plus RÉCENTE (n° le plus élevé) : ce n'est pas une incohérence, signale seulement l'autre comme « instruction obsolète n°X » (niveau info). Les règles intégrées « par défaut » cèdent devant toute règle de l'utilisateur de même sujet.\n\n" + prules.dump(p, RULES))
+           "Entre deux instructions de même sujet qui se contredisent, la plus spécifique (agent > rôle ou module > global) l'emporte, puis à portée égale la plus RÉCENTE (n° le plus élevé) : ce n'est pas une incohérence, signale seulement l'autre comme « instruction obsolète n°X » (niveau info). Les règles intégrées « par défaut » cèdent devant toute règle de l'utilisateur de même sujet.\n\n" + text)
     try:
         reply = ask(u, pid, an["id"], msg, "Analyse des règles", relog=False, fresh=True)
     except Err as e:
@@ -2400,6 +2495,8 @@ def rules_analysis(u, pid):
         rr = pp.setdefault("rules_report", {})
         if rr.get("analyzing"):                            # pas de rapport structuré
             rr.update(analyzing="", ai=[{"level": "info", "where": "Analyse", "text": (reply or "(aucune réponse)")[:600], "suggestion": ""}], ai_ts=now(), ai_note="Réponse non structurée de l’agent.")
+        else:
+            rr["ai_hash"] = h                              # rapport structuré reçu : inutile de refaire la même analyse
     mp(u, pid, fin)
 
 
