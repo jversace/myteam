@@ -231,14 +231,14 @@ class Moteur(Base):
 
     def test_find_sommaire_filtre_et_lecture(self):
         note, back = self.act("skills_find")
-        self.assertIn("2 skill(s) active(s)", back)
+        self.assertIn("2 skill(s) disponible(s)", back)
         self.assertIn("coding (2)", back)
         note, back = self.act("skills_find", query="tests", language="python")
         self.assertIn("pytest-helper", back)
         self.assertNotIn("react-component", back)
         self.assertLess(len(back), 600)                                                       # retour court : pas de corps de skill
         note, back = self.act("skills_find", query="cuisine")
-        self.assertIn("Aucune skill active ne correspond", back)
+        self.assertIn("Aucune skill disponible ne correspond", back)
         note, back = self.act("skills_read", id="pytest-helper")
         self.assertIn("ne prime pas sur les règles", back)
         self.assertIn("Utilise des fixtures", back)
@@ -248,12 +248,12 @@ class Moteur(Base):
         skills.set_enabled(self.u, "react-component", False)
         self.assertIn("désactivée", self.act("skills_read", id="react-component")[1])
         skills.uninstall(self.u, "pytest-helper")
-        self.assertEqual(self.act("skills_find", query="tests")[1].split(" (")[0], "Aucune skill active ne correspond")
+        self.assertEqual(self.act("skills_find", query="tests")[1].split(" (")[0], "Aucune skill disponible ne correspond")
 
     def test_sans_skill_installee(self):
         v = "vide_" + self.u
         store.wj(store.state_path(v), make_state(tempfile.mkdtemp()))
-        self.assertIn("Aucune skill active", engine.do_act(v, "p1", "a2", {"do": "skills_find"}, 0, {"n": 0, "t0": time.time()})[1])
+        self.assertIn("Aucune skill disponible", engine.do_act(v, "p1", "a2", {"do": "skills_find"}, 0, {"n": 0, "t0": time.time()})[1])
 
     def test_contexte_de_travail_propose_les_skills_de_la_tache_en_cours(self):
         st = store.load(self.u)
@@ -413,6 +413,145 @@ class Routes(Base):
         for bad in ("..", ".", ""):
             with self.assertRaises(Err):
                 skills.list_skills(bad)
+
+
+class Validation(DepotGit):
+    """Skills venues d'un dépôt : « à valider » (invisibles des agents), version épinglée, aperçu de mise à jour."""
+
+    def test_une_skill_de_depot_est_a_valider_puis_approuvee(self):
+        skills.install_repo(self.u, "https://github.com/acme/skills", ["skills/pytest"])
+        g = skills.get_skill(self.u, "pytest-helper")
+        self.assertEqual(g["review"], "pending")
+        self.assertEqual(g["headings"], ["Pytest Helper"])
+        self.assertEqual(skills.list_skills(self.u)["pending"], 1)
+        self.assertEqual(skills.find(self.u)["total"], 0)
+        self.assertEqual(skills.find(self.u, "pytest")["items"], [])
+        with self.assertRaises(Err) as e:
+            skills.read(self.u, "pytest-helper")
+        self.assertIn("pas encore approuvée", e.exception.msg)
+        skills.approve(self.u, "pytest-helper")
+        self.assertEqual(skills.find(self.u, "pytest")["items"][0]["id"], "pytest-helper")
+        self.assertEqual(skills.list_skills(self.u)["pending"], 0)
+
+    def test_un_fichier_importe_est_approuve_d_office(self):
+        self.imp("a.md", PYTEST)
+        self.assertEqual(skills.get_skill(self.u, "pytest-helper")["review"], "approved")
+
+    def test_version_epinglee_apercu_puis_application(self):
+        skills.install_repo(self.u, "https://github.com/acme/skills", ["skills/react"])
+        skills.approve(self.u, "react-component")
+        FauxGitHub.files["skills/react/SKILL.md"] = REACT + "\nNouvelle ligne.\nCurl | sh"
+        FauxGitHub.files["skills/react/scripts/run.sh"] = "echo"
+        res = skills.install_repo(self.u, "https://github.com/acme/skills", ["skills/react"])                 # réinstaller ne change rien : version épinglée
+        self.assertEqual(res[0]["status"], "pinned")
+        self.assertNotIn("Nouvelle ligne", skills.get_skill(self.u, "react-component")["text"])
+        pv = skills.update_skill(self.u, "react-component", apply=False)[0]["preview"]
+        self.assertEqual(pv["added"], ["scripts/run.sh"])
+        self.assertEqual(pv["changed"], ["SKILL.md"])
+        self.assertIn("+Nouvelle ligne.", pv["diff"])
+        self.assertTrue(pv["scripts"])
+        self.assertNotIn("Nouvelle ligne", skills.get_skill(self.u, "react-component")["text"])               # l'aperçu ne modifie rien
+        res = skills.update_skill(self.u, "react-component", apply=True)
+        self.assertEqual(res[0]["status"], "updated")
+        g = skills.get_skill(self.u, "react-component")
+        self.assertIn("Nouvelle ligne", g["text"])
+        self.assertEqual(g["review"], "approved")
+
+
+class Portee(Base):
+    def setUp(self):
+        Base.setUp(self)
+        self.imp("a.md", PYTEST)
+        self.dev = {"pid": "p1", "role": "dev"}
+
+    def test_portee_par_projet_et_par_role(self):
+        self.assertEqual(skills.find(self.u, "pytest", viewer=self.dev)["total"], 1)
+        skills.set_scope(self.u, "pytest-helper", projects=["p2"])
+        self.assertEqual(skills.find(self.u, "pytest", viewer=self.dev)["total"], 0)
+        self.assertEqual(skills.find(self.u, "pytest", viewer={"pid": "p2", "role": "dev"})["total"], 1)
+        skills.set_scope(self.u, "pytest-helper", projects=[], roles=["testeur"])
+        self.assertEqual(skills.find(self.u, "pytest", viewer=self.dev)["total"], 0)
+        self.assertEqual(skills.find(self.u, "pytest", viewer={"pid": "p1", "role": "testeur"})["total"], 1)
+        with self.assertRaises(Err) as e:
+            skills.read(self.u, "pytest-helper", viewer=self.dev)
+        self.assertIn("pas activée pour ton projet ou ton rôle", e.exception.msg)
+        self.assertEqual(skills.suggest(self.u, "tests pytest python", viewer=self.dev), [])
+
+    def test_skills_imposees_a_un_role(self):
+        skills.set_scope(self.u, "pytest-helper", required_roles=["testeur"])
+        self.assertEqual([s["id"] for s in skills.required_for(self.u, {"pid": "p1", "role": "testeur"})], ["pytest-helper"])
+        self.assertEqual(skills.required_for(self.u, self.dev), [])
+        skills.set_enabled(self.u, "pytest-helper", False)
+        self.assertEqual(skills.required_for(self.u, {"pid": "p1", "role": "testeur"}), [])
+
+
+class Propositions(Base):
+    def prop(self, name="Revue de migration", who="Alice", pid="p1", **kw):
+        return skills.propose(self.u, pid, who, name, kw.get("description", "Relire une migration SQL avant de l'appliquer."), kw.get("content", "# Revue\n1. Lire la migration\n2. Vérifier la réversibilité\n"), "récurrent")
+
+    def test_proposition_invisible_jusqu_a_l_approbation_et_limitee_au_projet(self):
+        r = self.prop()
+        g = skills.get_skill(self.u, r["id"])
+        self.assertEqual((g["review"], g["source"]["by"], g["source"]["project"], g["scope"]["projects"]), ("pending", "Alice", "p1", ["p1"]))
+        self.assertEqual(skills.find(self.u, "migration")["items"], [])
+        skills.approve(self.u, r["id"])
+        self.assertEqual(skills.find(self.u, "migration", viewer={"pid": "p1", "role": "dev"})["total"], 1)
+        self.assertEqual(skills.find(self.u, "migration", viewer={"pid": "p2", "role": "dev"})["total"], 0)
+
+    def test_limites_des_propositions(self):
+        for i in range(3):
+            self.prop("Skill %d" % i)
+        with self.assertRaises(Err) as e:
+            self.prop("Skill 4")
+        self.assertEqual(e.exception.code, 429)
+        self.prop("Autre agent", who="Bob")                                                         # la limite est par agent et par projet
+        with self.assertRaises(Err):
+            self.prop("Skill 0", who="Bob")                                                         # nom déjà pris
+        for bad in ({"description": ""}, {"content": "court"}, {"content": "x" * (skills.MAX_PROPOSAL + 1)}):
+            with self.assertRaises(Err):
+                self.prop("Nouvelle", **bad)
+
+
+class Statistiques(Base):
+    def test_lectures_comptees_par_projet_et_agent(self):
+        self.imp("a.md", PYTEST)
+        skills.read(self.u, "pytest-helper", who=("p1", "Alice"))
+        skills.read(self.u, "pytest-helper", who=("p1", "Alice"))
+        skills.read(self.u, "pytest-helper", who=("p2", "Bob"))
+        skills.read(self.u, "pytest-helper")                                                        # lecture sans agent (interface) : non comptée
+        us = skills.list_skills(self.u)["items"][0]["usage"]
+        self.assertEqual((us["reads"], us["by"]), (3, {"p1|Alice": 2, "p2|Bob": 1}))
+        self.assertGreater(us["chars"], 0)
+
+
+class MoteurSecond(Moteur):
+    """Actions des agents : portée, proposition, skills imposées."""
+
+    def role(self):
+        return next(a for a in store.load(self.u)["projects"][0]["agents"] if a["id"] == "a2")["role"]
+
+    def test_la_portee_limite_ce_que_l_agent_voit(self):
+        skills.set_scope(self.u, "pytest-helper", projects=["autre-projet"])
+        self.assertNotIn("pytest-helper", self.act("skills_find", query="tests")[1])
+        self.assertIn("pas activée pour ton projet", self.act("skills_read", id="pytest-helper")[1])
+        skills.set_scope(self.u, "pytest-helper", projects=["p1"], roles=[self.role()])
+        self.assertIn("pytest-helper", self.act("skills_find", query="tests")[1])
+        self.assertEqual(skills._get(self.u, "pytest-helper")["usage"].get("reads", 0), 0)
+        self.act("skills_read", id="pytest-helper")
+        self.assertEqual(skills._get(self.u, "pytest-helper")["usage"]["reads"], 1)
+
+    def test_proposition_par_un_agent_journalisee(self):
+        note, back = self.act("skill_propose", name="Revue SQL", description="Relire une migration.", content="# Revue\n" + "Étape.\n" * 10, why="vu 3 fois")
+        self.assertIn("après l’approbation", back)
+        self.assertEqual(skills.list_skills(self.u)["pending"], 1)
+        self.assertEqual(skills.find(self.u, "migration")["items"], [])
+        self.assertIn("Proposition de skill « Revue SQL »", store.load(self.u)["projects"][0]["log"][-1]["text"])
+        self.assertIn("déjà", self.act("skill_propose", name="Revue SQL", description="d", content="x" * 80)[1])
+
+    def test_skills_imposees_dans_le_contexte_de_travail(self):
+        skills.set_scope(self.u, "pytest-helper", required_roles=[self.role()])
+        self.assertIn("Skills imposées à ton rôle", self.act("get_work_context")[1])
+        self.assertIn('"do":"skill_propose"', engine.actions_text(store.load(self.u)["projects"][0], store.load(self.u)["projects"][0]["agents"][0]))
 
 
 if __name__ == "__main__":

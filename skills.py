@@ -331,8 +331,23 @@ def _warnings(files, body, desc):
     return w
 
 
-def install(u, cand, reader, source):
-    """Écrit la skill `cand` (lue par `reader(chemin) -> octets`) : crée ou met à jour (même `ident`). Retourne {id, name, status}."""
+def _diff(u, sid, rel):
+    """Différences entre la skill installée et la nouvelle version `rel` : fichiers ajoutés / supprimés / modifiés + diff de SKILL.md."""
+    import difflib
+    d, old = _dir(u, sid), {}
+    for p in d.rglob("*"):
+        if p.is_file():
+            old[str(p.relative_to(d)).replace("\\", "/")] = p.read_bytes()
+    a, b = _decode(old.get("SKILL.md", b"")).splitlines(), _decode(rel["SKILL.md"]).splitlines()
+    ud = "\n".join(list(difflib.unified_diff(a, b, "installée", "distante", lineterm="", n=2))[:300])
+    return {"added": sorted(set(rel) - set(old)), "removed": sorted(set(old) - set(rel)), "changed": sorted(f for f in rel if f in old and old[f] != rel[f]), "diff": ud[:12000]}
+
+
+def install(u, cand, reader, source, review="approved", scope=None, dry=False, pin=False):
+    """Écrit la skill `cand` (lue par `reader(chemin) -> octets`) : crée ou met à jour (même `ident`). Retourne {id, name, status}.
+    `review` : état de validation d'une NOUVELLE skill (« approved » ou « pending » : invisible des agents jusqu'à l'approbation) ; une skill déjà
+    installée garde le sien. `pin` : une skill déjà installée dont le contenu a changé n'est pas modifiée (statut « pinned » : version épinglée).
+    `dry` : ne rien écrire, retourner l'aperçu des changements."""
     c = cand
     raw, size, blobs = {}, 0, {}
     for f in c["files"]:
@@ -373,6 +388,12 @@ def install(u, cand, reader, source):
                 sid = "%s-%d" % (base, n)
             status = "installed"
         d = _dir(u, sid)
+        if cur and status == "updated" and pin:
+            return {"id": sid, "name": cur.get("name", name), "status": "pinned"}
+        if dry:
+            pv = _diff(u, sid, rel) if cur else {"added": sorted(rel), "removed": [], "changed": [], "diff": ""}
+            pv.update(warnings=_warnings(list(rel), body, desc), scripts=any(f.lower().endswith(SCRIPT_EXT) or f.lower().startswith("scripts/") for f in rel))
+            return {"id": sid, "name": name, "status": status, "preview": pv}
         if status != "unchanged":
             tmp = d.with_name(sid + ".tmp")
             shutil.rmtree(tmp, ignore_errors=True)
@@ -389,11 +410,13 @@ def install(u, cand, reader, source):
                 "source": {k2: v for k2, v in source.items() if k2 != "ident"}, "hash": th, "files": len(rel), "size": sum(len(b) for b in rel.values()),
                 "scripts": any(f.lower().endswith(SCRIPT_EXT) or f.lower().startswith("scripts/") for f in rel), "warnings": _warnings(list(rel), body, desc),
                 "installed": (cur or {}).get("installed") or int(time.time()), "updated": int(time.time()) if status != "unchanged" else (cur or {}).get("updated", int(time.time())),
-                "overrides": ov}
+                "overrides": ov, "review": (cur.get("review", "approved") if cur else review), "scope": (cur or {}).get("scope") or scope or {"projects": [], "roles": []},
+                "required_roles": (cur or {}).get("required_roles") or [], "usage": (cur or {}).get("usage") or {}}
+        meta["approved_hash"] = th if meta["review"] == "approved" else (cur or {}).get("approved_hash")
         meta.update({kk: ov.get(kk, v) for kk, v in k.items()})
         idx["skills"][sid] = meta
         _save(u, idx)
-    return {"id": sid, "name": name, "status": status}
+    return {"id": sid, "name": name, "status": status, "review": meta["review"]}
 
 
 # --------------------------------------------------------------------------- import de fichiers
@@ -550,7 +573,7 @@ def list_repo(u, url, token=""):
     return {"kind": "skills", "repo": "%s/%s" % (pu["owner"], pu["repo"]), "ref": ref, "path": sub, "items": items, "truncated": trunc}
 
 
-def install_repo(u, url, keys=None, token=""):
+def install_repo(u, url, keys=None, token="", pin=True, dry=False):
     """Installe les skills `keys` (toutes si `keys` est None) d'un dépôt GitHub. Retourne la liste des résultats."""
     pu = parse_git_url(url)
     if pu["kind"] != "repo":
@@ -573,7 +596,10 @@ def install_repo(u, url, keys=None, token=""):
             return cache[f]
         try:
             r = install(u, c, reader, {"type": "git", "repo": "%s/%s" % (pu["owner"], pu["repo"]), "ref": ref, "path": c["key"], "url": "https://github.com/%s/%s" % (pu["owner"], pu["repo"]),
-                                      "ident": "%s/%s@%s" % (pu["owner"], pu["repo"], c["key"])})
+                                      "ident": "%s/%s@%s" % (pu["owner"], pu["repo"], c["key"])}, review="pending", pin=pin, dry=dry)
+            if dry or r["status"] == "pinned":
+                out.append(r)
+                continue
             with LOCK:
                 idx = _idx(u)
                 if r["id"] in idx["skills"]:
@@ -606,12 +632,14 @@ def check_updates(u, token=""):
     return res
 
 
-def update_skill(u, sid, token=""):
+def update_skill(u, sid, token="", apply=True):
+    """Met à jour une skill de dépôt. `apply=False` : aperçu des changements seulement (rien n'est modifié) ; la version installée reste épinglée tant que
+    l'utilisateur n'a pas appliqué la mise à jour après l'avoir relue."""
     s = _get(u, sid)
     src = s.get("source") or {}
     if src.get("type") != "git":
         raise Err(400, "Cette skill vient d'un fichier : réimportez le fichier mis à jour (elle sera remplacée, état et catégories conservés)")
-    return install_repo(u, "https://github.com/%s/tree/%s" % (src["repo"], src["ref"]), [src["path"]], token)
+    return install_repo(u, "https://github.com/%s/tree/%s" % (src["repo"], src["ref"]), [src["path"]], token, pin=False, dry=not apply)
 
 
 # --------------------------------------------------------------------------- gestion (liste, état, catégories, suppression)
@@ -625,7 +653,29 @@ def _get(u, sid):
 
 
 def public(s):
-    return {k: v for k, v in s.items() if k not in ("ident", "overrides", "remote_hash", "hash")}
+    d = {k: v for k, v in s.items() if k not in ("ident", "overrides", "remote_hash", "hash", "approved_hash")}
+    d["review"] = s.get("review", "approved")
+    d.setdefault("scope", {"projects": [], "roles": []})
+    d.setdefault("required_roles", [])
+    d.setdefault("usage", {})
+    return d
+
+
+def visible(s, viewer=None):
+    """Une skill est consultable par un agent si elle est active, approuvée par l'utilisateur, et activée pour son projet et son rôle (portée vide = tous)."""
+    if not s.get("enabled", True) or s.get("review", "approved") != "approved":
+        return False
+    sc = s.get("scope") or {}
+    if viewer and sc.get("projects") and viewer.get("pid") not in sc["projects"]:
+        return False
+    if viewer and sc.get("roles") and viewer.get("role") not in sc["roles"]:
+        return False
+    return True
+
+
+def required_for(u, viewer):
+    """Skills consultables imposées au rôle de l'agent (à lire avant de commencer une tâche)."""
+    return [s for s in _idx(u)["skills"].values() if viewer.get("role") in (s.get("required_roles") or []) and visible(s, viewer)]
 
 
 def facets(items):
@@ -640,7 +690,7 @@ def facets(items):
 
 def list_skills(u):
     items = sorted(_idx(u)["skills"].values(), key=lambda s: (s.get("domain") or "", s.get("name", "").lower()))
-    return {"items": [public(s) for s in items], "facets": facets(items)}
+    return {"items": [public(s) for s in items], "facets": facets(items), "pending": sum(1 for s in items if s.get("review", "approved") == "pending")}
 
 
 def get_skill(u, sid):
@@ -651,7 +701,8 @@ def get_skill(u, sid):
         text = (d / "SKILL.md").read_text(encoding="utf-8", errors="replace")
     except OSError:
         text = ""
-    return {**public(s), "text": text, "file_list": files}
+    heads = [m.group(2).strip() for m in re.finditer(r"^(#{1,3})\s+(.+)$", parse_front(text)[1], re.M)][:14]
+    return {**public(s), "text": text, "file_list": files, "headings": heads}
 
 
 def set_enabled(u, sid, on):
@@ -662,6 +713,72 @@ def set_enabled(u, sid, on):
         idx["skills"][sid]["enabled"] = bool(on)
         _save(u, idx)
     return {"id": sid, "enabled": bool(on)}
+
+
+def approve(u, sid):
+    """Approuve une skill « à valider » (import depuis un dépôt, proposition d'un agent) : elle devient consultable selon sa portée. Seul l'utilisateur le peut."""
+    with LOCK:
+        idx = _idx(u)
+        s = idx["skills"].get(sid)
+        if not s:
+            raise Err(404, "Skill introuvable")
+        s["review"], s["approved_hash"], s["approved"] = "approved", s.get("hash"), int(time.time())
+        _save(u, idx)
+    return public(s)
+
+
+def set_scope(u, sid, projects=None, roles=None, required_roles=None):
+    """Portée d'une skill : projets et rôles pour lesquels elle est disponible (liste vide = tous) ; `required_roles` : rôles à qui elle est imposée."""
+    lst = lambda v: [str(x)[:60] for x in (v or [])][:200] if isinstance(v or [], list) else []
+    with LOCK:
+        idx = _idx(u)
+        s = idx["skills"].get(sid)
+        if not s:
+            raise Err(404, "Skill introuvable")
+        s["scope"] = {"projects": lst(projects), "roles": lst(roles)}
+        s["required_roles"] = lst(required_roles)
+        _save(u, idx)
+    return public(s)
+
+
+MAX_PROPOSAL = 20000
+MAX_PENDING_BY_AGENT = 3
+
+
+def propose(u, pid, who, name, description, content, why=""):
+    """Proposition d'un agent : crée une skill « à valider » limitée à son projet. Rien n'est utilisable avant l'approbation de l'utilisateur."""
+    name, description, content = " ".join(str(name or "").split())[:80], " ".join(str(description or "").split())[:300], str(content or "").strip()
+    if not name or not description or len(content) < 40:
+        raise Err(400, "Proposition incomplète : name, description (quand l'utiliser) et content (le texte de la skill, au moins quelques lignes) sont requis.")
+    if len(content) > MAX_PROPOSAL:
+        raise Err(400, "Proposition trop longue (%d caractères, maximum %d) : condense-la ou scinde-la." % (len(content), MAX_PROPOSAL))
+    with LOCK:
+        idx = _idx(u)
+        mine = [x for x in idx["skills"].values() if x.get("review") == "pending" and (x.get("source") or {}).get("type") == "agent" and (x["source"].get("by"), x["source"].get("project")) == (who, pid)]
+        if len(mine) >= MAX_PENDING_BY_AGENT:
+            raise Err(429, "Tu as déjà %d propositions en attente de validation : attends la décision de l'utilisateur." % len(mine))
+        if any(slug(x.get("name")) == slug(name) for x in idx["skills"].values()):
+            raise Err(409, "Une skill portant ce nom existe déjà : choisis un autre nom.")
+        text = "---\nname: %s\ndescription: %s\n---\n\n%s\n" % (name, description, content)
+        return install(u, {"key": "SKILL.md", "kind": "skill", "root": "", "entry": "SKILL.md", "files": ["SKILL.md"]}, lambda f: text.encode("utf-8"),
+                       {"type": "agent", "by": who, "project": pid, "why": str(why or "")[:300], "ident": "%s/%s" % (pid, slug(name))}, review="pending", scope={"projects": [pid], "roles": []})
+
+
+def record(u, sid, pid, who, chars):
+    """Statistiques d'usage : une lecture par un agent (nombre, caractères fournis, dernière lecture, par projet et agent)."""
+    with LOCK:
+        idx = _idx(u)
+        s = idx["skills"].get(sid)
+        if not s:
+            return
+        us = s.setdefault("usage", {})
+        us["reads"], us["chars"], us["last"] = us.get("reads", 0) + 1, us.get("chars", 0) + int(chars), int(time.time())
+        by = us.setdefault("by", {})
+        k = "%s|%s" % (pid, who)
+        by[k] = by.get(k, 0) + 1
+        for extra in sorted(by, key=by.get)[:max(len(by) - 50, 0)]:
+            del by[extra]
+        _save(u, idx)
 
 
 def uninstall(u, sid):
@@ -715,10 +832,10 @@ def _score(s, toks):
 STOP = set("le la les un une des de du et ou pour avec dans sur the a an and or for with in on of to is est une faire utiliser use using".split())
 
 
-def find(u, query="", domain="", subdomain="", language="", functional="", limit=8):
+def find(u, query="", domain="", subdomain="", language="", functional="", limit=8, viewer=None):
     """Skills ACTIVES correspondant au besoin : filtres de catégories (tous cumulés) + mots de `query` (nom > catégories > description).
     Sans aucun critère : le sommaire des catégories (comptes), jamais la liste complète."""
-    act = [s for s in _idx(u)["skills"].values() if s.get("enabled", True)]
+    act = [s for s in _idx(u)["skills"].values() if visible(s, viewer)]
     crit = {"domain": domain, "subdomain": subdomain, "language": language, "functional": functional}
     if not (query or any(crit.values())):
         return {"summary": facets(act), "total": len(act), "items": []}
@@ -732,19 +849,19 @@ def find(u, query="", domain="", subdomain="", language="", functional="", limit
     return {"items": items, "total": len(act), "shown": len(items)}
 
 
-def suggest(u, text, n=3):
+def suggest(u, text, n=3, viewer=None):
     """Skills actives les plus proches d'un texte (tâche en cours) : seulement si la correspondance est nette (nom ou catégorie)."""
     toks = [w for w in dict.fromkeys(_words(text)) if w not in STOP and len(w) > 2]
     out = []
     for s in _idx(u)["skills"].values():
-        if s.get("enabled", True) and toks:
+        if visible(s, viewer) and toks:
             sc = _score(s, toks)
             if sc >= 5:
                 out.append((sc, s))
     return [s for _, s in sorted(out, key=lambda t: (-t[0], t[1].get("name", "")))[:n]]
 
 
-def read(u, ref, file="", from_line=None, to_line=None):
+def read(u, ref, file="", from_line=None, to_line=None, viewer=None, who=None):
     """Texte d'une skill ACTIVE (SKILL.md par défaut, ou un fichier annexe : références, modèles…), par lignes, au plus READ_MAX caractères.
     Retourne (en-tête, texte, suite éventuelle)."""
     idx = _idx(u)["skills"]
@@ -753,6 +870,10 @@ def read(u, ref, file="", from_line=None, to_line=None):
         raise Err(404, "Skill « %s » introuvable : fais d'abord skills_find." % ref)
     if not idx[sid].get("enabled", True):
         raise Err(403, "La skill « %s » est désactivée par l'utilisateur." % idx[sid]["name"])
+    if idx[sid].get("review", "approved") != "approved":
+        raise Err(403, "La skill « %s » n'est pas encore approuvée par l'utilisateur." % idx[sid]["name"])
+    if not visible(idx[sid], viewer):
+        raise Err(403, "La skill « %s » n'est pas activée pour ton projet ou ton rôle." % idx[sid]["name"])
     d = _dir(u, sid)
     rel = _safe_rel(file) if file else "SKILL.md"
     if not rel:
@@ -778,6 +899,8 @@ def read(u, ref, file="", from_line=None, to_line=None):
         others = sorted(str(p.relative_to(d)).replace("\\", "/") for p in d.rglob("*") if p.is_file() and p.name != "SKILL.md")
         if others:
             extra = "Fichiers annexes (lecture avec file=\"…\") : " + ", ".join(others[:30])
+    if who:
+        record(u, sid, who[0], who[1], len(body))
     return idx[sid], rel, body.rstrip("\n"), nxt, extra
 
 
@@ -809,7 +932,11 @@ def handle(u, method, path, query, d):
         if sub == "uninstall":
             return uninstall(u, str(d.get("id")))
         if sub == "update":
-            return {"results": update_skill(u, str(d.get("id")), tok)}
+            return {"results": update_skill(u, str(d.get("id")), tok, apply=bool(d.get("apply")))}
+        if sub == "approve":
+            return approve(u, str(d.get("id")))
+        if sub == "scope":
+            return set_scope(u, str(d.get("id")), d.get("projects"), d.get("roles"), d.get("required_roles"))
         if sub == "check_updates":
             return {"updates": check_updates(u, tok)}
         if sub == "meta":
