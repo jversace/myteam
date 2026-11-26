@@ -1447,5 +1447,55 @@ class EconomieTokens(Base):
         self.assertIn("git_show", self.act("a2", "outline", path="", agent="Carl")[1])
 
 
+
+class SortiesCompactes(Base):
+    """Point 3 de l'économie de tokens : run_checks à la demande, sorties nettoyées et plafonnées."""
+    def test_run_checks_resume_compact_et_echecs_seuls(self):
+        self.act("a2", "write_file", path="x.py", content="print(1)\n")
+        self.assertNotIn("run_checks", engine.actions_extra(proj(), proj()["agents"][1]))      # aucun contrôle actif : action non proposée
+        self.assertIn("Aucun contrôle", self.act("a2", "run_checks")[0])
+        add_check("tests", OK_CMD)
+        add_check("lint", FAIL_CMD, blocking=False)
+        self.assertIn('"do":"run_checks"', engine.actions_extra(proj(), proj()["agents"][1]))
+        note, back = self.act("a2", "run_checks")
+        self.assertIn("1 réussi(s), 1 en échec", note)
+        self.assertIn("✔ tests", back)
+        self.assertIn("✖ lint", back)
+        self.assertNotIn("Tout est vert", back)
+        self.assertEqual(sum(1 for r in proj().get("check_runs", [])), 2)                        # historisé comme les autres exécutions
+
+    def test_run_checks_tout_vert_et_refus_hors_git(self):
+        add_check("tests", OK_CMD)
+        self.act("a2", "write_file", path="x.py", content="print(1)\n")
+        self.assertIn("Tout est vert", self.act("a2", "run_checks")[1])
+
+
+class Plafonds(unittest.TestCase):
+    def test_compact_retire_le_bruit_et_regroupe_les_repetitions(self):
+        import checks
+        raw = "\x1b[31mFAIL\x1b[0m test_a\n\n[=====>      ] 45%\n----------\n" + "warning: x\n" * 5 + "AssertionError: 1 != 2\n.....\n"
+        out = checks.compact(raw)
+        self.assertEqual(out, "FAIL test_a\nwarning: x  (×5)\nAssertionError: 1 != 2")
+        self.assertEqual(checks.compact("a\n" * 5000), "a  (×5000)")                       # 5 000 lignes identiques : une seule
+        self.assertTrue(checks.compact("".join("ligne %d\n" % i for i in range(5000)), 100).startswith("[…]"))
+
+    def test_cap_back(self):
+        self.assertEqual(engine.cap_back("abc"), "abc")
+        r = engine.cap_back("x" * (engine.BACK_MAX + 500))
+        self.assertTrue(r.startswith("x" * 100) and "tronqué" in r and len(r) < engine.BACK_MAX + 200)
+
+    def test_list_files_plafonne(self):
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp())
+        for i in range(engine.LIST_MAX + 40):
+            (tmp / ("f%04d.txt" % i)).write_text("x", encoding="utf-8")
+        from test_locks import make_state as ms
+        store.wj(store.state_path("u"), ms(tmp))
+        note, back = engine.do_act("u", "p1", "a2", {"do": "list_files", "path": ""}, 0, {"n": 0, "t0": time.time()})
+        self.assertEqual(back.count("f0"), engine.LIST_MAX)
+        self.assertIn("40 entrées de plus", back)
+
+
 if __name__ == "__main__":
     unittest.main()

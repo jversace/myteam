@@ -68,6 +68,7 @@ ACTION_LINES = [
     '{"do":"stop_agent","agent":"<prénom>","cancel":false,"reason":"..."} : (agent principal) arrêter le travail d’un agent et libérer tous ses verrous ; cancel=true annule aussi ses modifications sur les fichiers qu’il avait verrouillés (retour à l’état d’avant)',
     '{"do":"force_unlock","path":"<fichier>","reason":"..."} : (agent principal) libérer de force le verrou d’un fichier (détenteur inactif ou plantage) ; si le détenteur travaille encore, utilise stop_agent',
     '{"do":"propose_check","name":"tests","command":"python -m unittest discover -s tests","when":"both","blocking":true,"explain":"<explication SIMPLE, sans jargon : ce que ça vérifie, ce que ça modifie, pourquoi>","reason":"<pourquoi maintenant>"} : proposer un contrôle automatique (tests, lint) exécuté par l’application à ta soumission (when : validation | integration | both) ; l’utilisateur l’approuve, rien ne s’exécute avant ; proposer le même name avec une autre commande = demander une modification',
+    '{"do":"run_checks"} : (git local) lancer les contrôles automatiques approuvés (tests, lint, build) sur ton worktree : résumé compact ✔/✖ et fin de sortie des échecs seulement ; à faire avant submit_task',
     '{"do":"status"} : (git local) fichiers modifiés non commités de ton worktree',
     '{"do":"commit","message":"<message clair>"} : (git local) enregistrer tout ton worktree dans un commit (local)',
     '{"do":"diff"} : (git local) tes changements par rapport à la branche cible',
@@ -166,6 +167,8 @@ def action_applies(p, a, name):
         return mode == "git"
     if name == "propose_check":
         return mode == "git" and lv("check") != rights.NO
+    if name == "run_checks":
+        return mode == "git" and bool(checks_active(p, "validation"))
     if name in ("pull", "merge_request"):
         return mode == "github"
     if name == "resolve_merge":
@@ -684,7 +687,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
                 if note:
                     log(u, pid, "Système", a["name"], note)
                 if back:
-                    fb.append(back)
+                    fb.append(cap_back(back))
             if not fb:
                 break
             msg = "[Application] Résultats de tes actions :\n\n" + "\n\n".join(fb)
@@ -921,6 +924,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return spec_edit_act(u, pid, p, a, x, mn, depth, ctx)
         if kind == "propose_check":
             return propose_check(u, pid, p, a, x, mn, ctx)
+        if kind == "run_checks":
+            return check_act(u, pid, p, a)
         if kind in GIT_KINDS:
             if not git_agent(p, a):
                 return refuse("L’action %s n’existe qu’en mode git local (répertoire local versionné, un worktree par agent)." % kind)
@@ -1465,7 +1470,8 @@ def git_act(u, pid, p, a, x, kind, t0=0):
     if kind == "status":
         st = lg.status(wt)
         return "État du worktree (%d)" % len(st), "Branche %s, cible %s. %s" % (
-            lg.current_branch(wt) or "?", tgt, ("Modifications non commitées :\n" + "\n".join("%s %s" % (i["code"], i["path"]) for i in st)) if st else "Rien à committer.")
+            lg.current_branch(wt) or "?", tgt, ("Modifications non commitées :\n" + "\n".join("%s %s" % (i["code"], i["path"]) for i in st[:LIST_MAX // 3])
+                                                 + (("\n[… %d fichiers de plus]" % (len(st) - LIST_MAX // 3)) if len(st) > LIST_MAX // 3 else "")) if st else "Rien à committer.")
     if kind == "commit":
         locks.check_stop(u, pid, a["id"], t0)
         msg = str(x.get("message") or "").strip() or "Mise à jour"
@@ -1604,7 +1610,12 @@ def file_act(u, pid, p, a, x, kind, t0=0):
                 for kk in [kk for kk in READS if kk[:3] == (str(u), pid, a["id"]) and kk[3] == str(x.get("path"))]:
                     READS.pop(kk, None)
         return r
-    return repo_act(u, pid, p, a, x, kind, t0)
+    r = repo_act(u, pid, p, a, x, kind, t0)
+    if kind == "list_files" and r[1] is not None and r[0] is not r[1]:
+        L = r[1].split("\n")
+        if len(L) > LIST_MAX + 1:                          # dossier énorme : les premières entrées suffisent, le reste s'obtient par sous-dossier ou par outline
+            r = (r[0], "\n".join(L[:LIST_MAX + 1]) + "\n[… %d entrées de plus : liste un sous-dossier, ou utilise outline / find_symbol]" % (len(L) - LIST_MAX - 1))
+    return r
 
 
 def _file_write(u, pid, p, a, x, kind, t0=0):
@@ -1755,6 +1766,34 @@ def repo_act(u, pid, p, a, x, kind, t0=0):
 
 
 # ---------------------------------------------------------------- Économie de tokens : relecture différentielle, plan et lecture ciblée, actions « tout-en-un »
+
+BACK_MAX = 14000        # caractères maximum d'un retour d'action renvoyé à l'IA (une lecture fait au plus READ_MAX + en-tête : jamais touchée)
+LIST_MAX = 150          # entrées maximum d'un list_files (et LIST_MAX // 3 fichiers pour status)
+
+
+def cap_back(back):
+    """Plafonne un retour d'action : une sortie démesurée (diff, liste, réponse d'un autre agent) coûterait des tokens à chaque tour tant qu'elle reste dans l'historique."""
+    s = str(back)
+    return s if len(s) <= BACK_MAX else s[:BACK_MAX] + "\n[…résultat tronqué à %d caractères sur %d : demande une zone ou un sujet plus précis]" % (BACK_MAX, len(s))
+
+
+def check_act(u, pid, p, a):
+    """`run_checks` : l'agent lance lui-même, à la demande, les contrôles automatiques APPROUVÉS par l'utilisateur sur son worktree (mode git). Retour compact :
+    une ligne par contrôle (✔/✖, durée), puis la fin de sortie (nettoyée) des seuls échecs. 0 token d'IA pour l'exécution."""
+    refuse = lambda m: (m, m)
+    if not git_agent(p, a):
+        return refuse("run_checks n’existe qu’en mode git local (les contrôles s’exécutent dans ton worktree).")
+    if not checks_active(p, "validation"):
+        return "Aucun contrôle actif", "Aucun contrôle automatique n’est activé pour la validation (seul l’utilisateur les active, après ta proposition propose_check)."
+    try:
+        lg, wt = git_workspace(u, pid, p, a)
+    except Err as e:
+        return refuse("Espace git indisponible : %s" % e.msg)
+    ck = run_checks(u, pid, p, wt, "validation", a["name"])
+    rows = ["%s %s (%.1f s)%s" % ("✔" if e["ok"] else "✖", e["name"], e.get("secs") or 0, ", instable : réussi au 2e essai" if e.get("flaky") else "") for e in ck["results"]]
+    bad = checks_fail_text(ck["results"], only_blocking=False)
+    return "Contrôles : %d réussi(s), %d en échec" % (len(ck["results"]) - len(ck["failed"]), len(ck["failed"])), "\n".join(rows) + (("\n\n" + bad) if bad else "\nTout est vert : tu peux soumettre (submit_task).")
+
 
 REREAD_WINDOW = 20      # un extrait n'est déclaré « inchangé » que si sa lecture précédente est dans les 20 derniers messages (l'historique envoyé en garde 30)
 SYM_FILES, SYM_READS, SYM_DIRS, SYM_CAP = 400, 150, 150, 3000
@@ -3688,7 +3727,7 @@ def checks_fail_text(results, only_blocking=True):
     for e in results:
         if e["ok"] or (only_blocking and not e["blocking"]):
             continue
-        t = checks.tail(e["tail"], 1200)
+        t = checks.compact(e["tail"], 1200)
         out.append("✖ %s (code %s%s) :\n%s" % (e["name"], e["rc"], ", délai dépassé" if e["timed_out"] else "", t))
         used += len(t)
         if used > 3500:

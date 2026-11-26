@@ -102,6 +102,31 @@ def tail(text, n=TAIL):
     return text if len(text) <= n else "[…]\n" + text[-n:]
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+NOISE = re.compile(r"[\s.\-=_#*%\[\]()<>0-9/|\\:+~]*")
+
+
+def compact(text, n=1200):
+    """Sortie d'un contrôle réduite à l'utile pour l'agent : couleurs ANSI, lignes vides, barres de progression et séparateurs retirés, lignes consécutives
+    identiques regroupées (« ×N »), puis fin de la sortie (`n` caractères). Moins de tokens renvoyés à l'IA, sans perdre les messages d'erreur."""
+    out, prev, rep = [], None, 0
+    for line in ANSI.sub("", str(text or "")).replace("\r", "\n").splitlines():
+        s = line.rstrip()
+        if not s.strip() or (NOISE.fullmatch(s) and not re.search(r"[A-Za-z]", s)):
+            continue
+        if s == prev:
+            rep += 1
+            continue
+        if rep:
+            out[-1] += "  (×%d)" % (rep + 1)
+            rep = 0
+        out.append(s)
+        prev = s
+    if rep:
+        out[-1] += "  (×%d)" % (rep + 1)
+    return tail("\n".join(out), n)
+
+
 def _kill(proc):
     try:
         if os.name == "nt":
