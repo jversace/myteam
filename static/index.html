@@ -96,14 +96,14 @@ function logout(){clearTimeout(st);api("POST","/api/logout").catch(()=>{});TOK=U
 function render(){
   if(!U)return login();
   const open=D.projects.filter(p=>p.open);
-  let nav=`<nav><h1><img class="logo" src="/logo-myteam.png" alt="myTeam logo"><span>myTeam</span></h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><button data-v="roles" class="${view=="roles"?"on":""}">Rôles</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}${pendN(p)+(p.pending||[]).length?` <span class="tag wa">${pendN(p)+(p.pending||[]).length}</span>`:""}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
-  let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():view=="roles"?rolesView():projView();
+  let nav=`<nav><h1><img class="logo" src="/logo-myteam.png" alt="myTeam logo"><span>myTeam</span></h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><button data-v="roles" class="${view=="roles"?"on":""}">Rôles</button><button data-v="skills" class="${view=="skills"?"on":""}">Skills</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}${pendN(p)+(p.pending||[]).length?` <span class="tag wa">${pendN(p)+(p.pending||[]).length}</span>`:""}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
+  let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():view=="roles"?rolesView():view=="skills"?skillsView():projView();
   const keep={},ae=document.activeElement,fid=ae&&ae.id,fs=ae&&ae.selectionStart;document.querySelectorAll("[data-keep]").forEach(e=>{keep[e.id]=e.value});const sc={};document.querySelectorAll("[data-scroll]").forEach(e=>{sc[e.id]={t:e.scrollTop,b:e.scrollHeight-e.scrollTop-e.clientHeight<40}});
   $("#root").innerHTML=`<div id="app">${nav}<main>${body}</main></div>`;
   Object.keys(keep).forEach(i=>{const e=document.getElementById(i);if(e)e.value=keep[i]});document.querySelectorAll("[data-scroll]").forEach(e=>{const o=sc[e.id];e.scrollTop=(!o||o.b)?e.scrollHeight:o.t});const fe=fid&&document.getElementById(fid);if(fe){fe.focus();try{if(fs!=null)fe.setSelectionRange(fs,fs)}catch(e){}}
   document.querySelectorAll("nav [data-v]").forEach(b=>b.onclick=()=>{view=b.dataset.v;render()});
   document.querySelectorAll("nav [data-p]").forEach(b=>b.onclick=()=>{pid=b.dataset.p;view="p";tab="glob";render()});
-  $("#lo").onclick=logout;bind();
+  $("#lo").onclick=logout;bind();if(view=="skills")skBind();
 }
 function bind(){document.querySelectorAll("main [data-a]").forEach(b=>b.onclick=()=>act(b.dataset.a,b.dataset.i,b.dataset.j));
   document.querySelectorAll("main [data-t]").forEach(b=>b.onclick=()=>{tab=b.dataset.t;render()});
@@ -120,6 +120,96 @@ function projects(){
 }
 function rolesView(){
   return `<h2>Rôles</h2><div class="mu" style="margin-bottom:10px">Les rôles sont définis une seule fois, ici, et réutilisables dans tous les projets.</div><div class="row"><button class="b" data-a="newr">Nouveau rôle</button></div><table><tr><th>Rôle</th><th>Description</th><th>Droits des agents</th><th>Utilisé par</th><th></th></tr>`+D.roles.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.desc)}</td><td class="mu">${CAPS.map(c=>c[2]+" "+({free:"✔",approve:"✋",no:"—"}[(r.caps||DEFBASE)[c[0]]||"no"])).join(" · ")}</td><td class="mu">${D.projects.reduce((c,q)=>c+q.agents.filter(x=>x.role==r.id).length,0)} agent(s)</td><td><button class="g" data-a="editr" data-i="${r.id}">Modifier</button> <button class="g d" data-a="delr" data-i="${r.id}">Supprimer</button></td></tr>`).join("")+`</table><div class="mu" style="margin-top:8px">✔ libre · ✋ soumis à votre validation · — interdit. Le niveau d’autonomie de chaque projet (Vue globale) peut durcir ou assouplir ces droits.</div>`;
+}
+
+/* ---------- Skills (niveau application) : données côté serveur (data/skills/<utilisateur>), jamais dans l'état partagé ---------- */
+let SK={items:[],facets:{},loaded:false,loading:false,upd:{},msg:""},SKF={q:"",domain:"",subdomain:"",language:"",functional:"",state:""};
+const SKDOM={coding:"Développement",devops:"DevOps",data:"Données",docs:"Documentation",security:"Sécurité",design:"Design",product:"Produit",writing:"Rédaction",ai:"IA / agents",general:"Général"};
+const SKSUB={backend:"back-end",frontend:"front-end",integration:"intégration",database:"base de données",infra:"infrastructure",testing:"tests",review:"relecture",architecture:"architecture",performance:"performance",mobile:"mobile",git:"git",scripting:"scripts","ci-cd":"CI/CD"};
+const skDom=k=>SKDOM[k]||(k?k:"Non classé"),skSub=k=>SKSUB[k]||k;
+const skArr=v=>Array.isArray(v)?v:(v?[v]:[]);
+const skFormat={skill:"skill",command:"commande",rule:"règle"};
+const skSrc=s=>{const o=s.source||{};return o.type=="git"?"dépôt "+o.repo+(o.path&&o.path!="."?" / "+o.path:""):"fichier "+(o.name||"")};
+async function skLoad(){SK.loading=true;try{const r=await api("GET","/api/skills");SK.items=r.items;SK.facets=r.facets;SK.loaded=true;SK.msg=""}catch(e){SK.msg=e.message}SK.loading=false;render()}
+function skMatch(s){const f=SKF;if(f.state=="on"&&!s.enabled||f.state=="off"&&s.enabled||f.state=="upd"&&SK.upd[s.id]!="update")return false;
+  for(const k of["domain","subdomain","language","functional"])if(f[k]&&!skArr(s[k]).includes(f[k]))return false;
+  if(f.q){const t=(s.name+" "+s.description+" "+skArr(s.tags).join(" ")).toLowerCase();if(!f.q.toLowerCase().split(/\s+/).filter(Boolean).every(w=>t.includes(w)))return false}return true}
+function skSel(k,label,lab){const o=Object.entries(SK.facets[k]||{}).sort((a,b)=>b[1]-a[1]);return `<select data-skf="${k}"><option value="">${label} : tous</option>${o.map(([v,n])=>`<option value="${esc(v)}"${SKF[k]==v?" selected":""}>${esc(lab(v))} (${n})</option>`).join("")}</select>`}
+function skillsView(){
+  if(!SK.loaded&&!SK.loading)setTimeout(skLoad,0);
+  const L=SK.items.filter(skMatch),n=SK.items.length,upd=Object.values(SK.upd).filter(x=>x=="update").length;
+  const groups={};L.forEach(s=>(groups[s.domain||""]=groups[s.domain||""]||[]).push(s));
+  const card=s=>`<div class="card"><div class="row" style="margin:0;justify-content:space-between"><b>${esc(s.name)}</b><span>${s.enabled?'<span class="tag ok">active</span>':'<span class="tag">désactivée</span>'}${SK.upd[s.id]=="update"?' <span class="tag wa">mise à jour</span>':""}</span></div>
+    <div class="mu">${esc(skFormat[s.format]||"skill")} · ${esc(skSrc(s))}</div><p>${esc((s.description||"(pas de résumé)").slice(0,240))}${(s.description||"").length>240?"…":""}</p>
+    <div>${skArr(s.subdomain).map(x=>`<span class="tag">${esc(skSub(x))}</span>`).join(" ")} ${skArr(s.language).map(x=>`<span class="tag">${esc(x)}</span>`).join(" ")} ${skArr(s.functional).map(x=>`<span class="tag">⚙ ${esc(x)}</span>`).join(" ")}</div>
+    ${(s.warnings||[]).length?`<div class="mu" style="margin-top:6px" title="${esc(s.warnings.join("\n"))}">⚠ ${s.warnings.length} avertissement(s) — voir le détail</div>`:""}
+    <div class="row" style="margin:8px 0 0"><button class="g" data-sk="view" data-i="${s.id}">Voir</button><button class="g" data-sk="toggle" data-i="${s.id}">${s.enabled?"Désactiver":"Activer"}</button><button class="g" data-sk="update" data-i="${s.id}">Mettre à jour</button><button class="g" data-sk="meta" data-i="${s.id}">Catégories</button><button class="g d" data-sk="del" data-i="${s.id}">Désinstaller</button></div></div>`;
+  return `<h2>Skills</h2><div class="mu" style="margin-bottom:10px">Une skill est une fiche de méthode (markdown, point d'entrée <code>SKILL.md</code>) que les agents consultent à la demande, ciblée par catégorie ou par mots-clés, sans tout charger. Elles sont stockées dans <code>data/skills/${esc(U)}/</code>. Une skill reste une aide : elle ne prime jamais sur les règles du projet ni sur vos instructions, et ses scripts ne sont jamais exécutés.</div>
+  <div class="row"><button class="b" data-sk="add">Ajouter des skills</button><button class="g" data-sk="check">Vérifier les mises à jour</button><span class="mu">${n} installée(s), ${SK.items.filter(s=>s.enabled).length} active(s)${upd?` · <b>${upd} mise(s) à jour disponible(s)</b>`:""}</span></div>
+  ${SK.msg?`<div style="color:var(--er);margin:6px 0">${esc(SK.msg)}</div>`:""}
+  <div class="row"><input id="skq" placeholder="Rechercher (nom, résumé, mots-clés)" value="${esc(SKF.q)}" style="min-width:220px">${skSel("domain","Domaine",skDom)}${skSel("subdomain","Sous-domaine",skSub)}${skSel("language","Langage",x=>x)}${skSel("functional","Fonction",x=>x)}
+  <select data-skf="state"><option value="">État : tous</option><option value="on"${SKF.state=="on"?" selected":""}>actives</option><option value="off"${SKF.state=="off"?" selected":""}>désactivées</option><option value="upd"${SKF.state=="upd"?" selected":""}>à mettre à jour</option></select><button class="g" data-sk="reset">Réinitialiser</button></div>
+  ${!SK.loaded?'<div class="mu">Chargement…</div>':!n?'<div class="mu" style="margin-top:12px">Aucune skill installée. Utilisez « Ajouter des skills » : import d\'un fichier (.md, .zip, .skill) ou d\'un dépôt GitHub.</div>':!L.length?'<div class="mu" style="margin-top:12px">Aucune skill ne correspond à ces filtres.</div>':""}
+  ${Object.keys(groups).sort((a,b)=>skDom(a).localeCompare(skDom(b))).map(d=>`<h3>${esc(skDom(d))} <span class="mu">(${groups[d].length})</span></h3><div class="grid">${groups[d].map(card).join("")}</div>`).join("")}`;
+}
+function skBind(){
+  document.querySelectorAll("main [data-sk]").forEach(b=>b.onclick=()=>skAct(b.dataset.sk,b.dataset.i));
+  document.querySelectorAll("main [data-skf]").forEach(s=>s.onchange=()=>{SKF[s.dataset.skf]=s.value;render()});
+  const q=$("#skq");if(q)q.oninput=()=>{SKF.q=q.value;render()};
+}
+const skClose=()=>{$("#mod").style.display="none"};
+function skModal(h){$("#mb").innerHTML=`<div style="min-width:min(720px,88vw);max-height:84vh;overflow:auto">${h}</div>`;$("#mod").style.display="flex"}
+const skB64=buf=>{let s="";const u=new Uint8Array(buf);for(let i=0;i<u.length;i+=32768)s+=String.fromCharCode.apply(null,u.subarray(i,i+32768));return btoa(s)};
+const skStat={installed:"installée",updated:"mise à jour",unchanged:"déjà à jour",error:"échec"};
+async function skAct(a,id){
+  const s=SK.items.find(x=>x.id==id);
+  try{
+    if(a=="add")return skImport();
+    if(a=="reset"){SKF={q:"",domain:"",subdomain:"",language:"",functional:"",state:""};return render()}
+    if(a=="toggle"){await api("POST","/api/skills/toggle",{id,enabled:!s.enabled});s.enabled=!s.enabled;return render()}
+    if(a=="del"){if(!confirm("Désinstaller la skill « "+s.name+" » ? Ses fichiers seront supprimés."))return;await api("POST","/api/skills/uninstall",{id});return skLoad()}
+    if(a=="check"){const r=await api("POST","/api/skills/check_updates",{});SK.upd=r.updates;const n=Object.values(r.updates).filter(x=>x=="update").length,e=Object.values(r.updates).filter(x=>x=="error"||x=="missing").length;SK.msg="";alert(n?n+" mise(s) à jour disponible(s) (filtre « à mettre à jour »).":"Toutes les skills issues d'un dépôt sont à jour."+(e?"\n"+e+" n'ont pas pu être vérifiées (dépôt privé, supprimé ou limite GitHub atteinte).":""));return render()}
+    if(a=="update"){if((s.source||{}).type!="git")return alert("Cette skill vient d'un fichier : réimportez le fichier mis à jour (« Ajouter des skills »), elle sera remplacée en gardant son état et ses catégories.");const r=await api("POST","/api/skills/update",{id});delete SK.upd[id];alert("Skill « "+s.name+" » : "+(skStat[r.results[0].status]||r.results[0].status)+(r.results[0].error?" — "+r.results[0].error:""));return skLoad()}
+    if(a=="view"){const g=await api("GET","/api/skills/get?id="+encodeURIComponent(id));
+      return skModal(`<h3 style="margin-top:0">${esc(g.name)}</h3><div class="mu">${esc(skFormat[g.format]||"skill")} · ${esc(skSrc(g))} · ${g.files} fichier(s) · ${Math.round(g.size/1024*10)/10} Ko</div><p>${esc(g.description)}</p>
+      <div>${[g.domain].concat(skArr(g.subdomain),skArr(g.language),skArr(g.functional)).filter(Boolean).map(x=>`<span class="tag">${esc(x)}</span>`).join(" ")}</div>
+      ${(g.warnings||[]).map(w=>`<div style="color:var(--er);margin-top:6px">⚠ ${esc(w)}</div>`).join("")}
+      <div class="mu" style="margin-top:8px">Fichiers : ${g.file_list.map(esc).join(", ")}</div>
+      <pre style="white-space:pre-wrap;max-height:46vh;overflow:auto;border:1px solid var(--bd);border-radius:6px;padding:8px;margin-top:8px">${esc(g.text)}</pre><div class="row" style="justify-content:flex-end"><button class="g" id="skx">Fermer</button></div>`),$("#skx").onclick=skClose}
+    if(a=="meta"){const v=k=>esc(skArr(s[k]).join(", "));
+      skModal(`<h3 style="margin-top:0">Catégories de « ${esc(s.name)} »</h3><div class="mu">Vos corrections sont conservées lors des mises à jour. Séparez les valeurs par des virgules.</div>
+      <label>Domaine (ex. coding, devops, data, docs, security, design…)</label><input id="skm_domain" value="${esc(s.domain||"")}"><label>Sous-domaine (ex. backend, frontend, integration, database, testing…)</label><input id="skm_subdomain" value="${v("subdomain")}">
+      <label>Langage (ex. python, typescript, java…)</label><input id="skm_language" value="${v("language")}"><label>Fonction (ex. review, generate, debug, refactor, deploy…)</label><input id="skm_functional" value="${v("functional")}"><label>Mots-clés</label><input id="skm_tags" value="${v("tags")}">
+      <div class="row" style="margin:16px 0 0;justify-content:flex-end"><button class="g" id="skx">Annuler</button><button class="b" id="sko">Enregistrer</button></div>`);
+      $("#skx").onclick=skClose;$("#sko").onclick=async()=>{const f={};["domain","subdomain","language","functional","tags"].forEach(k=>f[k]=$("#skm_"+k).value);try{await api("POST","/api/skills/meta",{id,fields:f});skClose();skLoad()}catch(e){alert(e.message)}}}
+  }catch(e){alert(e.message)}
+}
+function skImport(){
+  skModal(`<h3 style="margin-top:0">Ajouter des skills</h3>
+  <b>1. Importer un fichier</b><div class="mu">Fichier <code>.md</code> / <code>.mdc</code> (une skill), ou archive <code>.zip</code> / <code>.skill</code> (une ou plusieurs skills avec leurs fichiers annexes).</div>
+  <div class="row"><input type="file" id="skfile" multiple accept=".md,.mdc,.markdown,.txt,.zip,.skill"><button class="b" id="skimp">Importer</button></div>
+  <hr style="border:0;border-top:1px solid var(--bd);margin:14px 0"><b>2. Depuis un dépôt git (GitHub)</b><div class="mu">Dépôt, dossier (<code>…/tree/main/.agents/skills</code>) ou page de sujet (<code>github.com/topics/claude-code-skills</code> : liste les dépôts à explorer).</div>
+  <input id="skurl" placeholder="https://github.com/compte/depot"><input id="sktok" type="password" placeholder="Jeton GitHub (facultatif : dépôt privé ou limite de débit ; transmis à GitHub, jamais conservé)" autocomplete="off">
+  <div class="row"><button class="b" id="skls">Lister les skills</button></div><div id="skres"></div><div id="skmsg" class="mu" style="margin-top:8px;white-space:pre-wrap"></div>
+  <div class="row" style="justify-content:flex-end;margin-bottom:0"><button class="g" id="skx">Fermer</button></div>`);
+  const msg=t=>{$("#skmsg").textContent=t},rep=r=>r.map(x=>(x.status=="error"?"✗ ":"✓ ")+x.name+" — "+(skStat[x.status]||x.status)+(x.error?" : "+x.error:"")).join("\n");
+  $("#skx").onclick=skClose;
+  $("#skimp").onclick=async()=>{const fs=[...$("#skfile").files];if(!fs.length)return msg("Choisissez un ou plusieurs fichiers.");let out=[];msg("Import en cours…");
+    for(const f of fs){try{const r=await api("POST","/api/skills/import",{filename:f.name,data:skB64(await f.arrayBuffer())});out.push(rep(r.results))}catch(e){out.push("✗ "+f.name+" : "+e.message)}}
+    msg(out.join("\n"));skLoad()};
+  const list=async()=>{const url=$("#skurl").value.trim();if(!url)return msg("Saisissez une adresse GitHub.");msg("Lecture du dépôt…");$("#skres").innerHTML="";
+    try{const r=await api("POST","/api/skills/discover",{url,token:$("#sktok").value.trim()});msg("");
+      if(r.kind=="repos"){$("#skres").innerHTML=`<div class="mu" style="margin:8px 0">Dépôts du sujet « ${esc(r.topic)} » (par étoiles). Choisissez-en un pour voir ses skills :</div>`+r.items.map(x=>`<div class="row" style="margin:4px 0;justify-content:space-between"><span><b>${esc(x.repo)}</b> ★${x.stars}<div class="mu">${esc(x.description)}</div></span><button class="g" data-url="${esc(x.url)}">Explorer</button></div>`).join("");
+        document.querySelectorAll("#skres [data-url]").forEach(b=>b.onclick=()=>{$("#skurl").value=b.dataset.url;list()});return}
+      const it=r.items;$("#skres").innerHTML=`<div class="mu" style="margin:8px 0">${it.length} skill(s) dans ${esc(r.repo)} (${esc(r.ref)})${r.truncated?" — dépôt très volumineux : liste possiblement incomplète":""}</div>
+      <div style="max-height:34vh;overflow:auto;border:1px solid var(--bd);border-radius:6px"><table><tr><th><input type="checkbox" id="skall"></th><th>Skill</th><th>Résumé</th><th>Classement</th></tr>${it.map(x=>`<tr><td><input type="checkbox" class="skc" value="${esc(x.key)}"></td><td><b>${esc(x.name)}</b><div class="mu">${esc(skFormat[x.kind]||x.kind)}${x.installed?' · <span class="tag ok">déjà installée</span>':""}</div></td><td>${esc(x.description)}</td><td class="mu">${esc([x.domain].concat(skArr(x.subdomain),skArr(x.language)).filter(Boolean).join(", "))}</td></tr>`).join("")}</table></div>
+      <div class="row" style="margin-top:8px"><button class="b" id="skinst">Installer la sélection (0)</button><button class="g" id="skinall">Installer toutes (${it.length})</button></div>`;
+      const cnt=()=>{const n=document.querySelectorAll(".skc:checked").length;$("#skinst").textContent="Installer la sélection ("+n+")";$("#skinst").disabled=!n};cnt();
+      $("#skall").onchange=e=>{document.querySelectorAll(".skc").forEach(c=>c.checked=e.target.checked);cnt()};document.querySelectorAll(".skc").forEach(c=>c.onchange=cnt);
+      const inst=async body=>{msg("Installation en cours…");try{const q=await api("POST","/api/skills/install",Object.assign({url,token:$("#sktok").value.trim()},body));msg(rep(q.results));skLoad()}catch(e){msg("✗ "+e.message)}};
+      $("#skinst").onclick=()=>inst({keys:[...document.querySelectorAll(".skc:checked")].map(c=>c.value)});$("#skinall").onclick=()=>{if(confirm("Installer les "+it.length+" skills de ce dépôt ?"))inst({all:true})};
+    }catch(e){msg("✗ "+e.message)}};
+  $("#skls").onclick=list;
 }
 function services(){
   return `<h2>Services IA</h2><div class="row"><button class="b" data-a="news">Ajouter un service</button></div><div class="grid">`+D.services.map(s=>`<div class="card"><b>${esc(s.name)}</b><div class="mu">${esc(s.url)}</div><div class="mu">Compte : ${esc(s.account||"—")} · modèle ${esc(s.model||"—")} · clé ${s.apiKey?"définie":"manquante"} · tarif ${price(s)?esc((s.pin||0)+" / "+(s.pout||0))+" $ par M tokens":"non renseigné"}</div><p><span class="tag ok">Forts</span> ${esc(s.pros)}</p><p><span class="tag er">Faibles</span> ${esc(s.cons)}</p><button class="g" data-a="keyset" data-i="${s.id}">${s.apiKey?"Changer la clé":"Configurer la clé"}</button> <button class="g" data-a="tests" data-i="${s.id}">Tester</button> <button class="g" data-a="edits" data-i="${s.id}">Modifier</button> <button class="g d" data-a="dels" data-i="${s.id}">Révoquer</button></div>`).join("")+`</div>`;

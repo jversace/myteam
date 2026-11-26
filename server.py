@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import engine
 import rights
+import skills
 import store
 from ai import call_ai
 from store import Err, LOCK, SESSIONS, USERS, rj, wj
@@ -89,6 +90,9 @@ class H(BaseHTTPRequestHandler):
             engine.sync_mrs(u, pid, force=True)               # état frais : pas de blocage fantôme dans le diagnostic
             pr = next((x for x in store.load(u).get("projects", []) if x.get("id") == pid), pr)
             return self.out(200, {"items": engine.diagnose(pr)})
+        if p == "/api/skills" or p.startswith("/api/skills/"):
+            u, _ = self.auth()
+            return self.out(200, skills.handle(u, "GET", p, urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query), {}))
         if p.startswith("/api/"):
             raise Err(404, "Route inconnue")
         f = (STATIC / ("index.html" if p == "/" else p.lstrip("/"))).resolve()
@@ -159,6 +163,8 @@ class H(BaseHTTPRequestHandler):
             pid = str(d.get("projectId", ""))
             engine.snap(u, pid)                            # 404 si le projet n'existe pas
             return self.out(200, {"items": engine.sync_all(u, pid)})
+        if p == "/api/skills" or p.startswith("/api/skills/"):
+            return self.out(200, skills.handle(u, "POST", p, {}, d))
         if p == "/api/job":
             engine.start(u, d)
             return self.out(200, {"ok": True})
