@@ -1497,5 +1497,51 @@ class Plafonds(unittest.TestCase):
         self.assertIn("40 entrées de plus", back)
 
 
+
+class DiffCompact(Base):
+    """Action diff : synthèse par fichier, diff compact, filtre par chemin, budget."""
+    def commit(self, **files):
+        for n, c in files.items():
+            self.act("a2", "write_file", path=n.replace("__", "/"), content=c)
+        self.act("a2", "commit", message="m")
+
+    def test_synthese_puis_diff_et_mention_du_non_commite(self):
+        self.commit(src__a="un\ndeux\n", src__b="x\n")
+        self.act("a2", "write_file", path="src/c", content="pas commité\n")
+        note, back = self.act("a2", "diff")
+        self.assertIn("2 fichier(s) modifié(s), +3/-0", back)
+        self.assertIn("A  src/a  +2/-0", back)
+        self.assertIn("+deux", back)
+        self.assertIn("1 fichier(s) modifié(s) NON commité(s)", back)
+        self.assertNotIn("pas commité", back)
+
+    def test_stat_seul_et_filtre_par_chemin(self):
+        self.commit(src__a="un\ndeux\n", doc__b="texte\n")
+        stat = self.act("a2", "diff", stat=True)[1]
+        self.assertIn("A  doc/b", stat)
+        self.assertNotIn("+deux", stat)                                       # pas de contenu en mode synthèse
+        one = self.act("a2", "diff", path="doc")[1]
+        self.assertIn("1 fichier(s)", one)
+        self.assertIn("+texte", one)
+        self.assertNotIn("deux", one)
+        self.assertIn("Aucune différence", self.act("a2", "diff", path="inexistant")[1])
+        self.assertIn("Chemin invalide", self.act("a2", "diff", path="../x")[1])
+
+    def test_budget_fichiers_non_detailles_puis_demande_unitaire(self):
+        self.commit(**{"f%d" % i: ("ligne %d\n" % i) * 300 for i in range(6)})            # ~ 2 700 car. chacun : 8 000 au total ne suffisent pas pour six
+        back = self.act("a2", "diff")[1]
+        self.assertIn("6 fichier(s) modifié(s)", back)
+        self.assertIn("Non détaillés (budget atteint)", back)
+        self.assertLess(len(back), 9500)
+        un = self.act("a2", "diff", path="f5")[1]
+        self.assertIn("+ligne 5", un)
+        self.assertNotIn("Non détaillés", un)
+
+    def test_fichier_unique_tres_long_recoit_tout_le_budget(self):
+        self.commit(g="".join("ligne %04d\n" % i for i in range(400)))                    # ~ 4 400 car. > per_file (2 500)
+        back = self.act("a2", "diff", path="g")[1]
+        self.assertIn("+ligne 0399", back)                                                # un seul fichier désigné : budget complet
+
+
 if __name__ == "__main__":
     unittest.main()

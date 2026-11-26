@@ -373,6 +373,50 @@ class LocalGit:
         t = self.g("diff", "%s...HEAD" % base, cwd=wt)[1]
         return t if len(t) <= budget else t[:budget] + "\n[…diff tronqué à %d caractères]" % budget
 
+    def diff_view(self, wt, base, path="", stat=False, context=3, budget=8000, per_file=2500):
+        """Diff COMPACT de la branche du worktree contre `base` (depuis l'ancêtre commun, commits seulement) pour un agent : en-tête de synthèse
+        (une ligne par fichier : statut, +ajouts/-suppressions), puis, sauf `stat`, le diff de chaque fichier tronqué à `per_file` caractères et à `budget` au total ;
+        les binaires et les fichiers qui ne tiennent plus sont listés pour être demandés un par un (`path`). `path` (fichier ou dossier) restreint le diff :
+        un seul fichier désigné obtient tout le budget. Retourne '' s'il n'y a aucune différence."""
+        spec, ps = "%s...HEAD" % base, (["--", path] if path else [])
+        ns = {}
+        for l in self.g("diff", "--name-status", spec, *ps, cwd=wt)[1].splitlines():
+            f = l.split("\t")
+            if len(f) >= 2:
+                ns[f[-1]] = f[0][:1]
+        if not ns:
+            return ""
+        nums = {}
+        for l in self.g("diff", "--numstat", spec, *ps, cwd=wt)[1].splitlines():
+            f = l.split("\t")
+            if len(f) >= 3:
+                nums[f[-1]] = (f[0], f[1])
+        add = sum(int(a) for a, _ in nums.values() if a.isdigit())
+        dele = sum(int(d) for _, d in nums.values() if d.isdigit())
+        rows = ["%s  %s  %s" % (ns[n], n, ("+%s/-%s" % nums[n]) if n in nums and nums[n][0] != "-" else "(binaire)") for n in sorted(ns)]
+        head = "%d fichier(s) modifié(s), +%d/-%d par rapport à %s :\n%s" % (len(ns), add, dele, base, "\n".join(rows[:60]) + (("\n[… %d fichiers de plus]" % (len(rows) - 60)) if len(rows) > 60 else ""))
+        if stat:
+            return head + "\n[le diff d'un fichier : diff avec path=\"<fichier>\"]"
+        if len(ns) == 1:
+            per_file = budget
+        ctx = max(0, min(int(context), 10))
+        full = self.g("diff", "-U%d" % ctx, spec, *ps, cwd=wt)[1]
+        out, used, omitted = [], 0, []
+        for blk in [b for b in re.split(r"(?m)^(?=diff --git )", full) if b.strip()]:
+            name = (re.match(r"diff --git a/(.*?) b/", blk) or [None, "?"])[1]
+            if "\nBinary files" in blk or "\nGIT binary patch" in blk:
+                continue
+            if len(blk) > per_file:
+                blk = blk[:per_file] + "\n[…diff de ce fichier tronqué : lis la zone avec read_file from_line/to_line]"
+            if used + len(blk) > budget:
+                omitted.append(name)
+                continue
+            used += len(blk)
+            out.append(blk.rstrip("\n"))
+        if omitted:
+            out.append("Non détaillés (budget atteint) : " + ", ".join(omitted) + " — demande-les un par un avec diff path=\"<fichier>\"")
+        return head + "\n\n" + "\n".join(out)
+
     def log(self, wt, n=20):
         return self.g("log", "-%d" % max(1, min(int(n), 100)), "--format=%h %an %ad %s", "--date=short", cwd=wt)[1].strip()
 

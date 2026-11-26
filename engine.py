@@ -71,7 +71,7 @@ ACTION_LINES = [
     '{"do":"run_checks"} : (git local) lancer les contrôles automatiques approuvés (tests, lint, build) sur ton worktree : résumé compact ✔/✖ et fin de sortie des échecs seulement ; à faire avant submit_task',
     '{"do":"status"} : (git local) fichiers modifiés non commités de ton worktree',
     '{"do":"commit","message":"<message clair>"} : (git local) enregistrer tout ton worktree dans un commit (local)',
-    '{"do":"diff"} : (git local) tes changements par rapport à la branche cible',
+    '{"do":"diff","path":"<fichier ou dossier, facultatif>","stat":false,"context":3} : (git local) tes changements COMMITÉS par rapport à la branche cible : synthèse par fichier (+/-) puis diff compact ; stat:true = synthèse seule ; path = un seul fichier avec tout le budget',
     '{"do":"search","pattern":"<texte>"} : (git local) chercher un texte dans les fichiers de ton worktree (évite de lire fichier par fichier)',
     '{"do":"sync"} : (git local) intégrer la branche cible (celle de la release, sinon develop) dans ta branche ; commit d’abord ; en cas de conflit, résous les marqueurs puis commit ; {"do":"sync","abort":true} pour renoncer',
     '{"do":"git_log","n":20} : (git local) derniers commits de ta branche',
@@ -1481,7 +1481,14 @@ def git_act(u, pid, p, a, x, kind, t0=0):
         record_commit(u, pid, a["name"], msg, sha)
         return "Commit %s : %s" % (sha[:7], msg), "Commit %s enregistré sur ta branche (local : il n’est poussé nulle part)." % sha[:7]
     if kind == "diff":
-        d = lg.diff(wt, tgt, budget=15000)
+        try:
+            ctxn = int(x.get("context") or 3)
+        except (TypeError, ValueError):
+            ctxn = 3
+        d = lg.diff_view(wt, tgt, safe_path(x.get("path")), bool(x.get("stat")), ctxn)
+        dirty = lg.status(wt)
+        if dirty:
+            d = (d or "Aucune différence commitée avec %s." % tgt) + "\n[%d fichier(s) modifié(s) NON commité(s), absents de ce diff : fais commit pour les inclure]" % len(dirty)
         return "Diff avec %s" % tgt, d or "Aucune différence avec %s." % tgt
     if kind == "search":
         r = lg.search(wt, x.get("pattern"))
