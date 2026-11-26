@@ -37,6 +37,7 @@ th,td{padding:8px 10px;border-bottom:1px solid var(--bd);text-align:left;vertica
 .tr{display:flex;gap:8px;align-items:center;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:6px 10px;flex-wrap:wrap}.tr .t{flex:1;min-width:140px}.tr select{width:auto}
 #mod{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;z-index:9;padding:16px}
 #mod>div{background:var(--sf);border-radius:12px;padding:18px;width:100%;max-width:440px;max-height:90vh;overflow:auto}
+#mod.wide>div{max-width:min(1100px,96vw)}
 #mod label{display:block;font-size:12px;color:var(--mu);margin:10px 0 3px}
 #login{max-width:340px;margin:12vh auto;padding:0 16px}#login .card{display:flex;flex-direction:column;gap:10px}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
@@ -82,6 +83,7 @@ function prog(p){const t=p.tasks.length;return t?Math.round(100*p.tasks.filter(x
 function modal(title,fields,cb,okLabel){
   const h=fields.map(f=>f.info?`<div class="mu" style="margin-top:8px">${f.info}</div>`:f.check?`<label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input data-k="${f.k}" type="checkbox"${f.v?" checked":""}> ${esc(f.l)}</label>`:`<label>${esc(f.l)}</label>`+(f.opts?`<select data-k="${f.k}"${f.multi?" multiple size=4":""}>${f.opts.map(o=>`<option value="${esc(o[0])}"${(f.multi?(f.v||[]).includes(o[0]):o[0]==f.v)?" selected":""}>${esc(o[1])}</option>`).join("")}</select>`:f.area?`<textarea data-k="${f.k}" rows="${f.rows||3}">${esc(f.v||"")}</textarea>`:`<input data-k="${f.k}" type="${f.type||"text"}" value="${esc(f.v||"")}">`)).join("");
   $("#mb").innerHTML=`<h3 style="margin-top:0">${esc(title)}</h3>${h}<div class="row" style="margin:16px 0 0;justify-content:flex-end"><button class="g" id="mc">Annuler</button><button class="b" id="mo">${okLabel||"Valider"}</button></div>`;
+  $("#mod").classList.remove("wide");
   $("#mod").style.display="flex";
   $("#mc").onclick=()=>$("#mod").style.display="none";
   $("#mo").onclick=()=>{const o={};document.querySelectorAll("#mb [data-k]").forEach(e=>o[e.dataset.k]=e.type=="checkbox"?e.checked:e.multiple?[...e.selectedOptions].map(x=>x.value):e.value);$("#mod").style.display="none";cb(o);save();render()};
@@ -164,7 +166,7 @@ function skBind(){
   const q=$("#skq");if(q)q.oninput=()=>{SKF.q=q.value;render()};
 }
 const skClose=()=>{$("#mod").style.display="none"};
-function skModal(h){$("#mb").innerHTML=`<div style="min-width:min(720px,88vw);max-height:84vh;overflow:auto">${h}</div>`;$("#mod").style.display="flex"}
+function skModal(h){$("#mb").innerHTML=`<div style="max-height:84vh;overflow:auto">${h}</div>`;$("#mod").classList.add("wide");$("#mod").style.display="flex"}
 const skB64=buf=>{let s="";const u=new Uint8Array(buf);for(let i=0;i<u.length;i+=32768)s+=String.fromCharCode.apply(null,u.subarray(i,i+32768));return btoa(s)};
 const skStat={installed:"installée",updated:"mise à jour",unchanged:"déjà à jour",pinned:"déjà installée, version épinglée (utilisez « Mettre à jour » pour relire les changements)",error:"échec"};
 async function skAct(a,id){
@@ -194,7 +196,7 @@ async function skAct(a,id){
       <p><b>Ce que dit la skill :</b> ${esc(g.description)}</p>${g.headings.length?`<div><b>Sections :</b> ${g.headings.map(esc).join(" · ")}</div>`:""}
       <div class="mu" style="margin-top:6px">${g.scripts?"⚠ Contient des scripts : l'application ne les exécute jamais.":"Aucun script."} Une fois approuvée, elle sera disponible pour : ${skScopeTxt(g)} (modifiable ensuite par « Portée »).</div>
       ${(g.warnings||[]).map(w=>`<div style="color:var(--er);margin-top:4px">⚠ ${esc(w)}</div>`).join("")}<div class="mu" style="margin-top:8px">Fichiers : ${g.file_list.map(esc).join(", ")}</div>
-      <pre style="white-space:pre-wrap;max-height:40vh;overflow:auto;border:1px solid var(--bd);border-radius:6px;padding:8px;margin-top:8px">${esc(g.text)}</pre>
+      <pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:40vh;overflow:auto;border:1px solid var(--bd);border-radius:6px;padding:8px;margin-top:8px">${esc(g.text)}</pre>
       <div class="row" style="margin:14px 0 0;justify-content:flex-end"><button class="g" id="skx">Plus tard</button><button class="g d" id="skr">Refuser (supprimer)</button><button class="b" id="sko">Approuver</button></div>`);
       $("#skx").onclick=skClose;$("#skr").onclick=async()=>{if(!confirm("Supprimer cette skill ?"))return;try{await api("POST","/api/skills/uninstall",{id});skClose();skLoad()}catch(e){alert(e.message)}};$("#sko").onclick=async()=>{try{await api("POST","/api/skills/approve",{id});skClose();skLoad()}catch(e){alert(e.message)}};return}
     if(a=="view"){const g=await api("GET","/api/skills/get?id="+encodeURIComponent(id));
