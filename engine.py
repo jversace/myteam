@@ -80,7 +80,8 @@ ACTION_LINES = [
     '{"do":"merge_request","title":"...","body":"...","task":"<id de la tâche, facultatif>"} : soumettre ta branche à la branche de travail de la release (l’agent principal la valide)',
     '{"do":"mr_review","id":"<id de la MR>","verdict":"approved|rejected","comment":"..."} : (agent principal, ou tout agent dont le rôle a le droit « valider les merge requests » ; jamais ta propre MR) valider (fusion) ou refuser une merge request',
     '{"do":"resolve_merge","conflict":"<id>","files":[{"path":"...","content":"<contenu final complet, ou null pour supprimer>"}],"message":"..."} : résoudre un conflit de fusion qui t’est confié (un élément par fichier en conflit)',
-    '{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable (sa réponse te revient)',
+    '{"do":"message","to":"<prénom>","text":"..."} : écrire à un agent joignable et OBTENIR SA RÉPONSE (déclenche un appel IA chez lui : à réserver aux questions qui attendent une réponse)',
+    '{"do":"notify","to":"<prénom>","kind":"info|done","text":"...","task":"<id, facultatif>"} : informer un agent joignable SANS réponse attendue (information, « terminé ») : aucun appel IA, il la lira au début de son prochain échange ; à préférer à message dès qu’aucune réponse n’est nécessaire',
     '{"do":"get_progress","agent":"<prénom ou all>"} : avancement d’un agent ou de toute l’équipe (sans coût)',
     '{"do":"run_workflow","workflow":"<nom du workflow>","task":"<id de la tâche cible, facultatif>","note":"..."} : déclencher un workflow du projet (s’il autorise le déclenchement par un agent)',
     '{"do":"wf_step","outcome":"ok|ko","comment":"..."} : conclure l’étape de workflow qui t’est confiée (ok = réalisée)',
@@ -101,8 +102,9 @@ ACTION_LINES = [
     '{"do":"ask_user","question":"...","options":["A","B"],"recommendation":"...","impact":"...","structural":true,"task":"<id de la tâche bloquée, ou vide>","replaces":[<n° des décisions en attente auxquelles cette question répond aussi>]} : poser une question à l’utilisateur (ambiguïté, décision structurante) ; si elle répond aussi à une question déjà en attente, indique son numéro dans replaces : l’ancienne est annulée et remplacée',
     '{"do":"instruction","text":"...","scope":"global|role:<rôle>|agent:<prénom>|module:<module>","subject":"<sujet facultatif>"} : (agent principal) enregistrer une nouvelle instruction de l’utilisateur ; subject (langue, ambiguite, interruption, coordination, fichier_contexte, fichiers) fait remplacer la règle par défaut correspondante',
     '{"do":"instr_rewrite","items":[...],"obsolete":[...]} : (uniquement lors d’une consolidation demandée par l’application) liste consolidée des instructions',
+    '{"do":"read_spec","section":"<titre de section, facultatif>","from_line":1,"to_line":80} : lire les spécifications : sans argument leur sommaire, ou une section par son titre, ou une zone par lignes (le prompt ne contient que le sommaire quand elles sont longues)',
     '{"do":"spec","text":"<spécifications complètes en markdown>"} : (agent principal) remplacer les spécifications',
-    '{"do":"spec_edit","edits":[{"old":"<texte exact>","new":"<remplacement>"}],"append":"<texte à ajouter à la fin, facultatif>"} : (agent principal) modifier les spécifications par remplacements ou ajout, sans les renvoyer en entier (préférable à spec)']
+    '{"do":"spec_edit","edits":[{"old":"<texte exact>","new":"<remplacement>"}],"append":"<texte à ajouter à la fin, facultatif>"} : (agent principal) modifier les spécifications par remplacements ou ajout, sans les renvoyer en entier (préférable à spec ; lis d’abord la section concernée avec read_spec)']
 ACTIONS = ACTION_HEAD + "\n" + "\n".join(ACTION_LINES)           # liste complète (référence) : les agents reçoivent la liste filtrée, voir actions_text
 
 
@@ -112,7 +114,7 @@ def _aname(line):
 
 # Actions toujours proposées (bloc de prompt partagé) ; les autres dépendent des droits, du mode et du projet (voir action_applies).
 ACTIONS_ALWAYS = ("list_files", "outline", "read_symbol", "find_symbol", "read_file", "write_file", "edit_file", "write_chunk", "delete_file", "get_blockers", "get_work_context",
-                  "context", "note", "task_status", "submit_task", "ask_user")
+                  "read_spec", "context", "note", "task_status", "submit_task", "ask_user")
 ACTIONS_HIDDEN = ("instr_rewrite",)                # décrite dans la demande de consolidation, jamais dans le prompt courant
 GIT_ONLY = ("status", "commit", "diff", "search", "sync", "git_log", "git_show")
 
@@ -175,7 +177,7 @@ def action_applies(p, a, name):
         return mode != "local"
     if name == "mr_review":
         return mode != "local" and lv("mr_review") == rights.FREE
-    if name == "message":
+    if name in ("message", "notify"):
         return any(can_talk(a, x, mn) for x in others)
     if name == "get_progress":
         return bool(others)
@@ -446,7 +448,7 @@ def repo_text(p, a):
         return ("Tu travailles sur le RÉPERTOIRE LOCAL du projet : %s (pas de branche, pas de pull ni de merge request).\n"
                 "Ce répertoire est partagé avec d’autres agents : verrouille un fichier (lock_file) avant de le modifier et libère-le (unlock_file) dès que tu as fini. "
                 "Un fichier verrouillé par un autre agent est inaccessible en écriture tant qu’il ne l’a pas libéré (ta demande attend).\n"
-                "Fichiers verrouillés actuellement :\n%s") % (p.get("localdir") or "non défini", locks.text(p, a["id"]))
+                "La liste des fichiers verrouillés en ce moment est donnée plus bas (section « Fichiers verrouillés actuellement ») et par get_locks.") % (p.get("localdir") or "non défini")
     rp, cy, pol = p.get("repo") or {}, p.get("cycle"), p.get("conflict_policy") or "ask"
     ptxt = {"ask": "l’utilisateur décide", "author": "l’auteur de la branche résout"}.get(pol) or "l’agent %s résout" % (by_id(p["agents"], pol[6:]) or {}).get("name", "?")
     return "Branche principale : %s (réservée à la release finale).\n%s\nTa branche : %s.\nConflits de fusion : %s." % (
@@ -490,14 +492,15 @@ def sys_prompt(p, a):
         "# Tâches (id | titre | statut | agent | parent | modules)\n" + (ts or "(aucune)"),
         ("# Bugs ouverts (id | titre | gravité | statut | modules)\n" + bs) if bs else "",
         ("# Décisions en attente de l’utilisateur\n" + "\n".join("- %s (%s)" % (d.get("question") or (d["payload"].get("title") or d["payload"].get("name")), d["byName"]) for d in pend)) if pend else "",
-        ("# Spécifications actuelles\n" + p["spec"][:6000]) if p.get("spec") else "",
+        spec_prompt(p),
         "# Notes personnelles (ton fichier de contexte)\n" + (a.get("notes") or "(vides)"), actions_common(), focus_text(p, a),
-        "# Règles de l’équipe propres à ton mode de travail\n" + "\n".join(agent_rules_lines(p, a)), prules.subject_rules_text(p, a), actions_extra(p, a)]
+        "# Règles de l’équipe propres à ton mode de travail\n" + "\n".join(agent_rules_lines(p, a)), prules.subject_rules_text(p, a), actions_extra(p, a),
+        ("# Résumé automatique de tes échanges plus anciens (ils ne sont plus dans ta conversation)\n" + a["digest"]) if a.get("digest") else "", lock_state_text(p, a), spec_task_text(p, a)]
     # Blocs du plus stable au plus changeant (prompt caching Anthropic : les deux premiers sont mis en cache) :
     # 1) commun à tous les agents, 2) propre à l'agent mais rarement modifié, 3) change à presque chaque tour.
     shared = [parts[0], parts[18], parts[1], parts[11], parts[12], parts[16]]
     per_agent = [parts[20], parts[21], parts[22], parts[2], parts[3], parts[4], parts[6], parts[7], parts[8], parts[9]]
-    volatile = [parts[19], parts[5], parts[10], parts[13], parts[14], parts[15], parts[17]]
+    volatile = [parts[19], parts[5], parts[10], parts[13], parts[14], parts[15], parts[25], parts[24], parts[23], parts[17]]
     return System.of(["\n\n".join(x for x in grp if x) for grp in (shared, per_agent, volatile)])
 
 
@@ -628,7 +631,8 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
         mark_interrupted(u, pid, aid, frm)
     work(u, pid, aid, 1)
     try:
-        msg, final, ctx, overflow = "[%s] %s" % (frm, text), "", {"n": 0, "t0": time.time()}, 0
+        pre, inbox_ids = ("", []) if fresh else inbox_prefix(a)            # notifications reçues sans appel IA : en tête du premier message de l'échange
+        msg, final, ctx, overflow = pre + "[%s] %s" % (frm, text), "", {"n": 0, "t0": time.time()}, 0
         for _ in range(max_steps or MAX_STEPS):
             p = snap(u, pid)
             a = by_id(p["agents"], aid)
@@ -638,7 +642,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
             manual = a.get("mode") == "manual"
             if not s and not manual:
                 raise Err(400, "Service IA révoqué pour %s" % a["name"])
-            h = [] if fresh else list(a.get("history", []))[-30:]
+            h = [] if fresh else list(a.get("history", []))[-HIST_KEEP:]
             while h and h[0]["role"] != "user":
                 h.pop(0)
             h = shrink_history(h)
@@ -656,6 +660,7 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
 
                 def compact(pp):
                     ag = by_id(pp["agents"], aid)
+                    digest_push(ag, ag.get("history", [])[:-4])            # ce qui est écarté reste résumé (0 token d'IA)
                     h2 = [{"role": m["role"], "content": m["content"][:1500]} for m in ag.get("history", [])[-4:]]
                     while h2 and h2[0]["role"] != "user":
                         h2.pop(0)
@@ -673,8 +678,11 @@ def ask(u, pid, aid, text, frm, depth=0, stats=None, relog=True, max_steps=None,
             def add(pp):
                 ag = by_id(pp["agents"], aid)
                 if ag and not fresh:
-                    ag["history"] = (ag.get("history", []) + [{"role": "user", "content": keep}, {"role": "assistant", "content": keep_out}])[-30:]
+                    push_history(ag, [{"role": "user", "content": keep}, {"role": "assistant", "content": keep_out}])
             mp(u, pid, add)
+            if inbox_ids and not fresh:                        # remises à l'agent : elles sont maintenant dans son historique
+                inbox_delivered(u, pid, aid, inbox_ids)
+                inbox_ids = []
             if clean:
                 log(u, pid, a["name"], frm, clean)
                 final = clean
@@ -918,6 +926,10 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return work_context(u, pid, p, a, mn)
         if kind == "note":
             return note_act(u, pid, p, a, x, depth, ctx)
+        if kind == "notify":
+            return notify_act(u, pid, p, a, x, mn)
+        if kind == "read_spec":
+            return read_spec_act(p, x)
         if kind == "submit_task":
             return submit_task_act(u, pid, p, a, x, mn, depth, ctx)
         if kind == "spec_edit":
@@ -1774,6 +1786,181 @@ def repo_act(u, pid, p, a, x, kind, t0=0):
 
 # ---------------------------------------------------------------- Économie de tokens : relecture différentielle, plan et lecture ciblée, actions « tout-en-un »
 
+# ---------------------------------------------------------------- Dialogue sans appel IA, mémoire des échanges anciens, spécifications à la demande
+
+HIST_KEEP = 30          # messages gardés dans l'historique d'un agent (15 échanges)
+DIGEST_MAX, DIGEST_LINE = 1000, 150     # résumé automatique des échanges sortis de l'historique : taille totale et par ligne (caractères)
+INBOX_MAX, NOTIFY_MAX = 20, 1500        # notifications en attente par agent ; taille d'une notification
+NOTIFY_KINDS = ("info", "done")
+ACT_NAMES = re.compile(r'"do"\s*:\s*"(\w+)"')
+SPEC_INLINE = 2500      # spécifications plus courtes : dans le prompt en entier ; plus longues : sommaire + sections utiles (read_spec pour le reste)
+SPEC_TASK_MAX = 3000    # caractères maximum des sections de spécifications liées aux modules de la tâche en cours
+
+
+def _short(s, n):
+    s = " ".join(str(s or "").split())
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def digest_line(um, am):
+    """Une ligne (≤ DIGEST_LINE) résumant un échange sorti de l'historique : qui a écrit quoi, ce que l'agent a répondu, quelles actions il a lancées. Sans IA."""
+    c = (um or {}).get("content", "")
+    parts = []
+    if c and not c.startswith(OLD_RESULT):
+        m = re.match(r"\[([^\]]{1,40})\]\s*(.*)", c, re.S)
+        parts.append("%s : %s" % ((m.group(1), _short(m.group(2), 70)) if m else ("?", _short(c, 70))))
+    if am:
+        names = {}
+        for n in ACT_NAMES.findall(am.get("content", "")):
+            names[n] = names.get(n, 0) + 1
+        prose = _short(ACT_RE.sub("", am.get("content", "")), 50)
+        if prose:
+            parts.append("→ " + prose)
+        if names:
+            parts.append("[actions : " + ", ".join(k + (("×%d" % v) if v > 1 else "") for k, v in names.items()) + "]")
+    return ("- " + " ".join(parts))[:DIGEST_LINE] if parts else ""
+
+
+def digest_push(ag, dropped):
+    """Ajoute au résumé de l'agent (`ag["digest"]`) les messages qui sortent de son historique ; garde les lignes les plus récentes (DIGEST_MAX caractères)."""
+    lines, i = [], 0
+    while i < len(dropped):
+        m = dropped[i]
+        nxt = dropped[i + 1] if m["role"] == "user" and i + 1 < len(dropped) and dropped[i + 1]["role"] == "assistant" else None
+        lines.append(digest_line(m, nxt) if m["role"] == "user" else digest_line(None, m))
+        i += 2 if nxt else 1
+    cur = [l for l in (ag.get("digest") or "").split("\n") if l.strip()] + [l for l in lines if l]
+    while len("\n".join(cur)) > DIGEST_MAX and len(cur) > 1:
+        cur.pop(0)
+    ag["digest"] = "\n".join(cur)[-DIGEST_MAX:]
+
+
+def push_history(ag, msgs):
+    """Ajoute des messages à l'historique de l'agent ; ce qui dépasse HIST_KEEP n'est pas perdu : il est résumé dans `ag["digest"]` (déterministe, 0 token)."""
+    h = list(ag.get("history", [])) + list(msgs)
+    if len(h) > HIST_KEEP:
+        digest_push(ag, h[:-HIST_KEEP])
+    ag["history"] = h[-HIST_KEEP:]
+
+
+def inbox_prefix(a):
+    """Notifications reçues (sans réponse attendue) à placer en tête du prochain message de l'agent : (texte, ids). Elles entrent ainsi dans son historique."""
+    items = [i for i in (a.get("inbox") or []) if i.get("id")]
+    if not items:
+        return "", []
+    L = ["- %s%s (%s) : %s" % (i.get("from", "?"), (" · tâche " + i["task"]) if i.get("task") else "", {"done": "terminé", "info": "info"}.get(i.get("kind"), "info"), i.get("text", "")) for i in items]
+    return "[Application] Notifications reçues (sans réponse attendue) :\n" + "\n".join(L) + "\n\n", [i["id"] for i in items]
+
+
+def notify_act(u, pid, p, a, x, mn):
+    """`notify` : message ASYNCHRONE à un agent joignable, sans appel IA ni réponse attendue (info ou « terminé »). Le destinataire le lit en tête de son prochain échange.
+    Pour une question qui attend une réponse : `message`."""
+    refuse = lambda m: (m, m)
+    t = next((g for g in p["agents"] if g["name"].lower() == str(x.get("to") or "").strip().lower()), None)
+    text = str(x.get("text") or "").strip()
+    if not t or t["id"] == a["id"]:
+        return refuse("Notification refusée : agent « %s » inconnu." % x.get("to"))
+    if not can_talk(a, t, mn):
+        return refuse("Notification refusée : %s ne peut pas écrire à %s." % (a["name"], t["name"]))
+    if not text:
+        return refuse("Notification refusée : texte vide.")
+    kind = x.get("kind") if x.get("kind") in NOTIFY_KINDS else "info"
+    task = str(x.get("task") or "").strip()
+    item = {"id": uid(), "d": now(), "from": a["name"], "kind": kind, "text": text if len(text) <= NOTIFY_MAX else text[:NOTIFY_MAX] + " […tronqué]", "task": task if by_id(p.get("tasks", []), task) else ""}
+
+    def f(pp):
+        g = by_id(pp["agents"], t["id"])
+        if g is not None:
+            g["inbox"] = (g.get("inbox") or []) + [item]
+            g["inbox"] = g["inbox"][-INBOX_MAX:]
+    mp(u, pid, f)
+    log(u, pid, a["name"], t["name"], "(notification) " + item["text"])
+    return "", "Notification remise à %s (aucun appel IA, aucune réponse attendue) : il la lira au début de son prochain échange." % t["name"]
+
+
+def inbox_delivered(u, pid, aid, ids):
+    """Retire de la boîte de l'agent les notifications qui viennent d'entrer dans son historique."""
+    def f(pp):
+        g = by_id(pp["agents"], aid)
+        if g is not None and g.get("inbox"):
+            g["inbox"] = [i for i in g["inbox"] if i.get("id") not in ids]
+            if not g["inbox"]:
+                g.pop("inbox", None)
+    mp(u, pid, f)
+
+
+def lock_state_text(p, a):
+    """Fichiers verrouillés (répertoire local partagé) : change à chaque verrou, donc dans le bloc de prompt changeant (jamais dans un bloc mis en cache)."""
+    if local_agent(p, a) and not git_agent(p, a):
+        return "# Fichiers verrouillés actuellement\n" + locks.text(p, a["id"])
+    return ""
+
+
+def spec_prompt(p):
+    """Spécifications dans le bloc COMMUN du prompt (mis en cache, identique pour tous les agents) : en entier si elles sont courtes, sinon leur sommaire
+    (sections, lignes, taille) ; le détail s'obtient avec read_spec, et les sections liées aux modules de la tâche en cours arrivent dans le bloc changeant."""
+    s = p.get("spec") or ""
+    if not s.strip():
+        return ""
+    if len(s) <= SPEC_INLINE:
+        return "# Spécifications actuelles\n" + s
+    its = symbols.outline("SPEC.md", s) or []
+    toc = [i for i in its if i["depth"] <= 1]
+    if not toc:
+        return "# Spécifications actuelles (début ; %d caractères au total : read_spec from_line/to_line pour la suite)\n%s" % (len(s), s[:SPEC_INLINE])
+    L = s.splitlines()
+    approx = lambda n: max(250, int(round(n / 250.0)) * 250)               # tailles arrondies et pas de numéros de ligne : une petite retouche ne change pas le sommaire (donc pas le cache)
+    rows = ["%s- %s (~%d car.)" % ("  " * i["depth"], i["name"], approx(len("\n".join(L[i["start"] - 1:i["end"]])))) for i in toc[:40]]
+    return "# Spécifications — sommaire (~%d caractères : lis une section avec read_spec)\n%s" % (approx(len(s)), "\n".join(rows))
+
+
+def spec_task_text(p, a):
+    """Sections des spécifications dont le titre cite un module de la tâche EN COURS de l'agent (bloc changeant) ; vide si les spécifications sont courtes (déjà en entier)."""
+    s = p.get("spec") or ""
+    if len(s) <= SPEC_INLINE:
+        return ""
+    mods = {m.lower() for t in p.get("tasks", []) if t.get("who") == a["id"] and t["status"] == "en cours" for m in mod_names(p, t.get("modules"))}
+    if not mods:
+        return ""
+    L, out, used = s.splitlines(), [], 0
+    for i in symbols.outline("SPEC.md", s) or []:
+        if any(m in i["name"].lower() for m in mods):
+            body = "\n".join(L[i["start"] - 1:i["end"]])
+            if used + len(body) > SPEC_TASK_MAX:
+                body = body[:max(SPEC_TASK_MAX - used, 0)] + "\n[…section tronquée : read_spec]"
+            used += len(body)
+            out.append(body)
+            if used >= SPEC_TASK_MAX:
+                break
+    return ("# Spécifications — sections liées à ta tâche en cours\n" + "\n\n".join(out)) if out else ""
+
+
+def read_spec_act(p, x):
+    """`read_spec` : sommaire des spécifications (sans argument), une section par son titre (`section`), ou une zone par lignes (`from_line`/`to_line`)."""
+    refuse = lambda m: (m, m)
+    s = p.get("spec") or ""
+    if not s.strip():
+        return refuse("Il n’y a pas encore de spécifications.")
+    its = symbols.outline("SPEC.md", s) or []
+    sec = str(x.get("section") or "").strip()
+    if sec:
+        hit = symbols.find(its, sec) or [i for i in its if sec.lower() in i["name"].lower()]
+        if not hit:
+            near = symbols.close_names(its, sec)
+            return refuse("Section « %s » introuvable.%s Sans argument, read_spec donne le sommaire." % (sec, (" Titres proches : " + ", ".join(near) + ".") if near else ""))
+        if len(hit) > 1:
+            return "Plusieurs sections « %s »" % sec, "Plusieurs sections « %s » : %s. Précise le titre complet (Parent.Titre) ou lis par lignes." % (sec, " ; ".join("%s (L%d-%d)" % (i["qual"], i["start"], i["end"]) for i in hit[:8]))
+        sx = hit[0]
+        body, lab, nxt = read_view(s, {"from_line": sx["start"], "to_line": sx["end"]})
+        return "Lecture de la section « %s »" % sx["name"], "Spécifications — section « %s »%s :\n%s\n%s\n%s%s" % (sx["qual"], lab, F, body, F, ("\n" + nxt) if nxt else "")
+    if x.get("from_line") or x.get("to_line"):
+        body, lab, nxt = read_view(s, x)
+        return "Lecture des spécifications", "Spécifications%s :\n%s\n%s\n%s%s" % (lab, F, body, F, ("\n" + nxt) if nxt else "")
+    n = len(s.splitlines())
+    toc = symbols.format_outline(its, n, maxdepth=3) if its else "(pas de titres : utilise from_line/to_line)"
+    return "Sommaire des spécifications", "Spécifications (%d caractères, %d lignes) :\n%s\n[une section : read_spec section=\"<titre>\" ; une zone : from_line/to_line]" % (len(s), n, toc)
+
+
 BACK_MAX = 14000        # caractères maximum d'un retour d'action renvoyé à l'IA (une lecture fait au plus READ_MAX + en-tête : jamais touchée)
 LIST_MAX = 150          # entrées maximum d'un list_files (et LIST_MAX // 3 fichiers pour status)
 
@@ -1823,7 +2010,7 @@ def reread_filter(a, res):
     if cut < 0:
         return res
     body, tail = rest[:cut], rest[cut + 1 + len(F):]
-    h = list(a.get("history", []))[-30:]
+    h = list(a.get("history", []))[-HIST_KEEP:]
     while h and h[0]["role"] != "user":
         h.pop(0)
     h = shrink_history(h)                                   # exactement ce que l'IA recevra : un retour abrégé ne compte pas comme « encore visible »
@@ -2072,7 +2259,7 @@ def spec_edit_act(u, pid, p, a, x, mn, depth, ctx):
         old, new = str(e["old"]), str(e.get("new", ""))
         n = cur.count(old)
         if n == 0:
-            return refuse("Édition %d refusée : « old » est introuvable dans les spécifications (copie-le exactement). Aucune modification n’a été faite." % i)
+            return refuse("Édition %d refusée : « old » est introuvable dans les spécifications (copie-le exactement : lis d’abord la section avec read_spec). Aucune modification n’a été faite." % i)
         if n > 1 and not e.get("all"):
             return refuse("Édition %d refusée : « old » apparaît %d fois. Allonge-le pour qu’il soit unique, ou ajoute \"all\":true. Aucune modification n’a été faite." % (i, n))
         cur = cur.replace(old, new) if e.get("all") else cur.replace(old, new, 1)
@@ -3493,6 +3680,8 @@ def agent_reset(u, pid, aid, history=True, notes=False, branch=False, onboard_af
         ag.pop("session", None)
         if history:
             ag["history"] = []
+            ag.pop("digest", None)
+            ag.pop("inbox", None)
         if notes:
             ag["notes"] = ""
         for t in pp["tasks"]:

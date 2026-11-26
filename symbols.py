@@ -256,7 +256,8 @@ def find(items, query):
 
 def close_names(items, query, n=5):
     """Noms proches (faute de frappe) pour aider l'agent quand le symbole demandé n'existe pas."""
-    return difflib.get_close_matches(str(query or ""), sorted({i["qual"] for i in items}), n=n, cutoff=0.5)
+    names = sorted({i["qual"] for i in items} | {i["name"] for i in items})
+    return difflib.get_close_matches(str(query or ""), names, n=n, cutoff=0.5)
 
 
 def format_outline(items, total_lines, maxdepth=2, limit=220):
