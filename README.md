@@ -5,6 +5,10 @@ Les agents travaillent **côté serveur** : un travail lancé continue même si 
 - Les données sont persistées dans des fichiers JSON, dans le dossier `data/` (une base de données viendra plus tard).
 - Le backend appelle les API des services IA (Claude via l'API Anthropic ; ChatGPT, Mistral, DeepSeek, Gemini via le format compatible OpenAI).
 
+## Versions
+
+Le numéro de version (`MAJEUR.MINEUR.CORRECTIF`) est affiché dans le titre de l'application et dans le menu « À propos ». Historique : [CHANGELOG.md](CHANGELOG.md). Branche `main` = versions publiées (tags `vX.Y.Z`), branche `DEV` = corrections et évolutions en cours.
+
 ## Installation sur Windows 11
 
 1. **Installer Python 3.10 ou plus** (PowerShell) :

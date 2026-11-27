@@ -8,6 +8,7 @@ import engine
 import rights
 import skills
 import store
+import version
 from ai import call_ai
 from store import Err, LOCK, SESSIONS, USERS, rj, wj
 
@@ -28,7 +29,7 @@ def pw_ok(pw, stored):
 
 
 class H(BaseHTTPRequestHandler):
-    server_version = "MyTeam/1.0"
+    server_version = "MyTeam/" + version.VERSION
 
     def out(self, code, obj):
         b = json.dumps(obj, ensure_ascii=False).encode()
@@ -74,6 +75,8 @@ class H(BaseHTTPRequestHandler):
 
     def get(self):
         p = self.path.split("?")[0]
+        if p == "/api/version":                            # public : affiché aussi sur l'écran de connexion
+            return self.out(200, {"version": version.VERSION, "repo": version.REPO_URL})
         if p == "/api/state":
             u, _ = self.auth()
             ser = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("ser", [None])[0]
@@ -99,6 +102,8 @@ class H(BaseHTTPRequestHandler):
         if STATIC not in f.parents or not f.is_file():
             raise Err(404, "Introuvable")
         b = f.read_bytes()
+        if f.name == "index.html":                         # la version dans le titre de l'onglet, sans attendre le JS
+            b = b.replace(b"<title>myTeam</title>", ("<title>myTeam v%s</title>" % version.VERSION).encode(), 1)
         self.send_response(200)
         ct = mimetypes.guess_type(f.name)[0] or "text/plain"
         self.send_header("Content-Type", ct + ("; charset=utf-8" if ct.startswith("text/") or ct.endswith(("json", "javascript")) else ""))

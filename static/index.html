@@ -49,6 +49,8 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
 
+let VER="",REPO="";
+const verTag=()=>VER?` <small style="font-weight:400;color:var(--mu)">v${esc(VER)}</small>`:"";
 let D=null,U=null,TOK=null,view="dash",pid=null,tab="glob",q="",err="";
 try{TOK=localStorage.getItem("apm_tok");U=localStorage.getItem("apm_user")}catch(e){}
 async function api(m,u,b){const r=await fetch(u,{method:m,headers:Object.assign({"Content-Type":"application/json"},TOK?{Authorization:"Bearer "+TOK}:{}),body:b?JSON.stringify(b):undefined});const j=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(j.error||r.statusText);e.status=r.status;e.data=j;throw e}return j}
@@ -89,7 +91,7 @@ function modal(title,fields,cb,okLabel){
   $("#mo").onclick=()=>{const o={};document.querySelectorAll("#mb [data-k]").forEach(e=>o[e.dataset.k]=e.type=="checkbox"?e.checked:e.multiple?[...e.selectedOptions].map(x=>x.value):e.value);$("#mod").style.display="none";cb(o);save();render()};
 }
 function login(){
-  $("#root").innerHTML=`<div id="login"><div class="card"><img class="logo" src="/logo-myteam.png" alt="myTeam logo" style="align-self:center;width:150px"><h2 style="margin:0;text-align:center">myTeam</h2><span class="mu">Connectez-vous ou créez un compte (les données restent sur cet appareil).</span><input id="u" placeholder="Identifiant" autocomplete="username"><input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password"><div style="color:var(--er)">${esc(err)}</div><button class="b" id="in">Connexion</button><button class="g" id="cr">Créer le compte</button></div></div>`;
+  $("#root").innerHTML=`<div id="login"><div class="card"><img class="logo" src="/logo-myteam.png" alt="myTeam logo" style="align-self:center;width:150px"><h2 style="margin:0;text-align:center">myTeam${verTag()}</h2><span class="mu">Connectez-vous ou créez un compte (les données restent sur cet appareil).</span><input id="u" placeholder="Identifiant" autocomplete="username"><input id="p" type="password" placeholder="Mot de passe" autocomplete="current-password"><div style="color:var(--er)">${esc(err)}</div><button class="b" id="in">Connexion</button><button class="g" id="cr">Créer le compte</button></div></div>`;
   const go=async mk=>{const u=$("#u").value.trim(),p=$("#p").value;if(!u||!p){err="Identifiant et mot de passe requis.";return login()}
     try{const r=await api("POST",mk?"/api/register":"/api/login",{user:u,password:p});TOK=r.token;U=u;try{localStorage.setItem("apm_tok",TOK);localStorage.setItem("apm_user",U)}catch(e){}D=await loadState();if(mk)save();err="";render()}catch(e){err=e.message;login()}};
   $("#in").onclick=()=>go(false);$("#cr").onclick=()=>go(true);
@@ -98,8 +100,8 @@ function logout(){clearTimeout(st);api("POST","/api/logout").catch(()=>{});TOK=U
 function render(){
   if(!U)return login();
   const open=D.projects.filter(p=>p.open);
-  let nav=`<nav><h1><img class="logo" src="/logo-myteam.png" alt="myTeam logo"><span>myTeam</span></h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><button data-v="roles" class="${view=="roles"?"on":""}">Rôles</button><button data-v="skills" class="${view=="skills"?"on":""}">Skills${skPend()?` <span class="tag wa">${skPend()}</span>`:""}</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}${pendN(p)+(p.pending||[]).length?` <span class="tag wa">${pendN(p)+(p.pending||[]).length}</span>`:""}</button>`).join("")+`<div style="flex:1"></div><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
-  let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():view=="roles"?rolesView():view=="skills"?skillsView():projView();
+  let nav=`<nav><h1><img class="logo" src="/logo-myteam.png" alt="myTeam logo"><span>myTeam${verTag()}</span></h1><button data-v="dash" class="${view=="dash"?"on":""}">Tableau de bord</button><button data-v="proj" class="${view=="proj"?"on":""}">Projets</button><button data-v="serv" class="${view=="serv"?"on":""}">Services IA</button><button data-v="roles" class="${view=="roles"?"on":""}">Rôles</button><button data-v="skills" class="${view=="skills"?"on":""}">Skills${skPend()?` <span class="tag wa">${skPend()}</span>`:""}</button><div class="sec">Projets ouverts</div>`+open.map(p=>`<button data-p="${p.id}" class="${view=="p"&&pid==p.id?"on":""}">${esc(p.name)}${pendN(p)+(p.pending||[]).length?` <span class="tag wa">${pendN(p)+(p.pending||[]).length}</span>`:""}</button>`).join("")+`<div style="flex:1"></div><button data-v="about" class="${view=="about"?"on":""}">À propos</button><span class="mu" style="padding:0 8px">${esc(U)}</span><button id="lo">Déconnexion</button></nav>`;
+  let body=view=="dash"?dash():view=="proj"?projects():view=="serv"?services():view=="roles"?rolesView():view=="skills"?skillsView():view=="about"?aboutView():projView();
   const keep={},ae=document.activeElement,fid=ae&&ae.id,fs=ae&&ae.selectionStart;document.querySelectorAll("[data-keep]").forEach(e=>{keep[e.id]=e.value});const sc={};document.querySelectorAll("[data-scroll]").forEach(e=>{sc[e.id]={t:e.scrollTop,b:e.scrollHeight-e.scrollTop-e.clientHeight<40}});
   $("#root").innerHTML=`<div id="app">${nav}<main>${body}</main></div>`;
   Object.keys(keep).forEach(i=>{const e=document.getElementById(i);if(e)e.value=keep[i]});document.querySelectorAll("[data-scroll]").forEach(e=>{const o=sc[e.id];e.scrollTop=(!o||o.b)?e.scrollHeight:o.t});const fe=fid&&document.getElementById(fid);if(fe){fe.focus();try{if(fs!=null)fe.setSelectionRange(fs,fs)}catch(e){}}
@@ -119,6 +121,9 @@ function dash(){
 function projects(){
   const l=D.projects.filter(p=>p.name.toLowerCase().includes(q.toLowerCase()));
   return `<h2>Projets</h2><div class="row"><input id="sq" placeholder="Rechercher un projet…" value="${esc(q)}"><button class="b" data-a="newp">Nouveau projet</button></div><table><tr><th>Nom</th><th>État</th><th>Avancement</th><th></th></tr>`+l.map(p=>`<tr><td><b>${esc(p.name)}</b><div class="mu">${esc(p.desc)}</div></td><td><span class="tag ${p.open?"ok":""}">${p.open?"ouvert":"fermé"}</span></td><td>${prog(p)} %</td><td><button class="g" data-a="go" data-i="${p.id}">Ouvrir</button> <button class="g" data-a="tog" data-i="${p.id}">${p.open?"Fermer":"Rouvrir"}</button> <button class="g d" data-a="delp" data-i="${p.id}">Supprimer</button></td></tr>`).join("")+(l.length?"":`<tr><td colspan="4" class="mu">Aucun résultat.</td></tr>`)+`</table>`;
+}
+function aboutView(){
+  return `<h2>À propos</h2><div class="card" style="max-width:520px"><div class="big">myTeam</div><div>Version <b>${esc(VER||"inconnue")}</b></div><p class="mu">Gestion de projets de développement par une équipe d’agents IA.</p><p>Dépôt GitHub : <a href="${esc(REPO)}" target="_blank" rel="noopener noreferrer">${esc(REPO)}</a></p></div>`;
 }
 function rolesView(){
   return `<h2>Rôles</h2><div class="mu" style="margin-bottom:10px">Les rôles sont définis une seule fois, ici, et réutilisables dans tous les projets.</div><div class="row"><button class="b" data-a="newr">Nouveau rôle</button></div><table><tr><th>Rôle</th><th>Description</th><th>Droits des agents</th><th>Utilisé par</th><th></th></tr>`+D.roles.map(r=>`<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.desc)}</td><td class="mu">${CAPS.map(c=>c[2]+" "+({free:"✔",approve:"✋",no:"—"}[(r.caps||DEFBASE)[c[0]]||"no"])).join(" · ")}</td><td class="mu">${D.projects.reduce((c,q)=>c+q.agents.filter(x=>x.role==r.id).length,0)} agent(s)</td><td><button class="g" data-a="editr" data-i="${r.id}">Modifier</button> <button class="g d" data-a="delr" data-i="${r.id}">Supprimer</button></td></tr>`).join("")+`</table><div class="mu" style="margin-top:8px">✔ libre · ✋ soumis à votre validation · — interdit. Le niveau d’autonomie de chaque projet (Vue globale) peut durcir ou assouplir ces droits.</div>`;
@@ -477,5 +482,6 @@ function act(a,i,j){
   if(a=="newb")return modal("Déclarer un bug",[{k:"t",l:"Titre"},{k:"d",l:"Description",area:1},{k:"sev",l:"Gravité",opts:[["mineur","mineur"],["majeur","majeur"],["critique","critique"]]}].concat(mf()),o=>{if(o.t)p.bugs.push({id:uid(),t:o.t,d:o.d,sev:o.sev||"mineur",status:"ouvert",by:"Vous",modules:o.modules||[]})});
   if(a=="delb"){p.bugs=p.bugs.filter(b=>b.id!=i);save();render()}
 }
-(async()=>{if(TOK){try{D=await loadState()}catch(e){TOK=null;U=null;D=null}}else U=null;render()})();
+(async()=>{try{const v=await fetch("/api/version").then(r=>r.json());VER=v.version||"";REPO=v.repo||"";if(VER)document.title="myTeam v"+VER}catch(e){}
+  if(TOK){try{D=await loadState()}catch(e){TOK=null;U=null;D=null}}else U=null;render()})();
 </script></body></html>

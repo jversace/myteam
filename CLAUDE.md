@@ -28,6 +28,8 @@ Application de gestion de projets de développement par une **équipe d'agents I
 | `locks.py` | **répertoire local et verrous de fichiers** : accès borné au répertoire, verrous exclusifs avec attente, détection de verrou circulaire, expiration, arrêt/annulation d'un agent |
 | `github.py` | classe `Repo` : branches, fichiers, **fusions (`/merges`), comparaisons, détection et résolution de conflits (commit de fusion à 2 parents via l'API Git Data)**, PR, release |
 | `ai.py` | `call_ai(s, system, messages, max_tokens=8192)` : API Anthropic ou compatible OpenAI. `System` : prompt système en blocs (`.blocks`) ; côté Anthropic, tous les blocs sauf le dernier portent `cache_control` (**prompt caching**) |
+| `version.py` | **source unique du numéro de version** (`VERSION`) et de l'URL du dépôt (`REPO_URL`) ; voir « Versionnement » |
+| `CHANGELOG.md` | historique des versions ; l'entrée de tête doit toujours égaler `version.VERSION` |
 | `static/index.html` | toute l'IHM (aucune logique d'agent : elle envoie des travaux au serveur) |
 | `static/logo-myteam.png`, `static/favicon.png` | logo (barre de menu et écran de connexion, au-dessus du titre « myTeam ») et icône d'onglet ; servis par `server.py` avec leur type MIME (charset ajouté seulement aux types texte) |
 | `tests/test_checks.py` | analyse de vigilance et exécution encadrée des contrôles |
@@ -37,11 +39,12 @@ Application de gestion de projets de développement par une **équipe d'agents I
 | `tests/test_symbols.py` | symbols.py, plan/lecture ciblée, relecture différentielle, `note`, `spec_edit`, `get_work_context`, `submit_task` (répertoire local) ; les mêmes actions sont aussi testées en mode git (`EconomieTokens` dans `test_gitmode.py`) et GitHub (`EconomieLectureGithub` dans `test_engine.py`) |
 | `tests/test_prompt_dialogue.py` | notifications sans appel IA, résumé automatique de l'historique, spécifications à la demande, stabilité des blocs de prompt mis en cache |
 | `tests/test_skills.py` | skills : lecture de l'en-tête, classement, import (md, zip, règle Cursor), gestion, consultation ciblée, faux GitHub (liste, installation, mise à jour, topics, jeton), routes, actions des agents |
+| `tests/test_version.py` | format du numéro, concordance `version.py` / `CHANGELOG.md`, route `/api/version`, titre versionné, menu « À propos » |
 | `tests/test_locks.py` | tests des verrous et du répertoire local |
 | `tests/test_engine.py` | tests (faux GitHub local + IA scriptée) : `python -m unittest discover -s tests` |
 
 ## API (JSON, `Authorization: Bearer <token>`)
-- `POST /api/register|login` → `{token}` ; `POST /api/logout`
+- `GET /api/version` (**publique**, sans jeton) → `{version, repo}` ; `POST /api/register|login` → `{token}` ; `POST /api/logout`
 - `GET /api/state` → `{rev, ser, state}` ; `GET /api/state?ser=N` → `{same:true}` si rien n'a changé (sondage du front, toutes les 2 s)
 - `PUT /api/state` `{rev, state}` → `{rev, ser, state}` : le serveur **fusionne** l'état du navigateur avec l'état courant (voir ci-dessous) et renvoie le résultat.
 - `POST /api/service/test` `{serviceId}` : appel minimal au service IA (valide la clé). Les clés API se créent dans la console du fournisseur (aucun flux OAuth public ne permet de les générer : vérifié pour Anthropic et OpenAI) ; le front guide la saisie (`keyset`) et teste aussitôt.
@@ -228,10 +231,17 @@ Cause des « agents qui s'arrêtent » corrigée ici : avant, rien ne lançait l
 - **Statistiques d'usage** (`skills.record`, appelé par `read` quand `who=(pid, agent)` est fourni, donc jamais pour une lecture depuis l'IHM) : nombre de lectures, caractères fournis (≈ tokens / 4), dernière lecture, compte par `projet|agent` (50 entrées au plus) ; affichées sur chaque carte.
 - **Pas encore fait** (idées) : import depuis d'autres forges (GitLab…), mises à jour automatiques planifiées (avec re-validation), export, historique des versions, détail des statistiques par projet / agent dans l'IHM, lecture forcée des skills imposées.
 
+## Versionnement (`version.py` + `CHANGELOG.md`)
+- **Format `MAJEUR.MINEUR.CORRECTIF`**. Correction de **bug** : 3e chiffre (1.0.0 → 1.0.1, le 1er et le 2e chiffre restent inchangés). **Évolution** : 2e chiffre (1.0.1 → 1.1.0, le 3e repart à 0). Le **1er chiffre** n'est incrémenté que le jour d'une **refonte complète** du projet (décision de l'utilisateur, jamais de l'initiative d'un agent).
+- **Règle impérative : toute modification livrée met à jour le numéro de version** — `VERSION` dans `version.py` (source unique) **et** une nouvelle entrée en tête de `CHANGELOG.md` (`## [X.Y.Z] — date`, puces courtes). `tests/test_version.py` échoue si les deux ne concordent pas. Ne rien écrire d'autre part en dur : le serveur expose la version (`GET /api/version`, public) et remplace le titre de `index.html` ; le front l'affiche dans l'onglet du navigateur, la barre de menu (sous le logo), l'écran de connexion et le menu « À propos » (version + lien vers `REPO_URL`).
+- **Branches et tags** : `main` = versions publiées uniquement, chaque version publiée porte un tag annoté `vX.Y.Z` ; `DEV` = branche de travail des corrections et évolutions (une modification = un commit avec le numéro de version à jour). Publier : fusionner `DEV` dans `main`, poser le tag `vX.Y.Z` sur le commit de fusion, pousser `main` et les tags.
+- `v1.0.0` : version initiale figée (mise en place du versionnement incluse).
+
 ## Conventions de travail
 - **Champs de dialogue** (`chatInput`, ids `ci` onglet agent et `gi` vue globale) : `<textarea>` multiligne à hauteur auto (max 260 px, redimensionnable) ; Entrée envoie, Maj+Entrée insère un retour à la ligne (la saisie IME n'envoie pas). Le motif de refus d'une décision (`dn-`) est aussi un `<textarea>`.
 - **Pièces jointes** (champs `ci`/`gi`) : fichiers texte glissés, collés ou choisis via « 📎 Joindre » ; lus côté navigateur (`addFiles`, état `ATT`, hors `data-keep`) puis ajoutés au message par `withAtt` sous forme de blocs `[Fichier joint : nom]` entourés d'une clôture de backticks adaptée. Aucun changement serveur : le job `say` reçoit un simple texte (le journal affiche donc le contenu joint). Limites : 200 Ko par fichier, 500 Ko au total ; les fichiers binaires (images, PDF…) sont refusés avec une alerte.
 - Modifier `static/index.html` par remplacements ciblés ; vérifier la syntaxe JS (extraire le `<script>` et `node --check`).
+- **Mettre à jour la version** (`version.py` + `CHANGELOG.md`, voir « Versionnement ») dans chaque modification, et travailler sur la branche `DEV`.
 - Lancer `python -m unittest discover -s tests` avant tout commit. Les tests n'utilisent ni réseau ni clé (faux GitHub, IA scriptée).
 - Ne jamais committer `data/`, de token ni de clé API. Ne jamais tester sur le vrai dépôt sans supprimer ensuite les branches créées.
 - Token GitHub requis : *Contents* et *Pull requests* en lecture/écriture (sinon fusion en 403 avec message explicite).
