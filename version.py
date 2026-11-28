@@ -7,5 +7,5 @@ Format MAJEUR.MINEUR.CORRECTIF (voir « Versionnement » dans CLAUDE.md) :
 À chaque modification : mettre à jour VERSION ici et ajouter l'entrée correspondante en tête de CHANGELOG.md
 (un test vérifie que les deux concordent).
 """
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO_URL = "https://github.com/jversace/myteam"

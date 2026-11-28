@@ -73,11 +73,13 @@ def migrate_roles(st):
 
 
 def _attach(st):
-    """Donne à chaque projet (lecture seule, jamais écrit sur disque) une référence `_roles` vers les rôles globaux."""
+    """Donne à chaque projet (lecture seule, jamais écrit sur disque) des références `_roles` (rôles globaux) et `_tools` (registre d'outils) en lecture seule."""
     r = st.get("roles") if isinstance(st.get("roles"), list) else []
+    tl = st.get("tools") if isinstance(st.get("tools"), list) else []      # registre d'outils global (voir tools.py)
     for p in st.get("projects", []) or []:
         if isinstance(p, dict):
             p["_roles"] = r
+            p["_tools"] = tl
 
 
 def _strip(st):
@@ -85,6 +87,7 @@ def _strip(st):
         for p in st.get("projects", []) or []:
             if isinstance(p, dict):
                 p.pop("_roles", None)
+                p.pop("_tools", None)
 
 
 def wj(p, obj):  # écriture atomique : fichier temporaire puis remplacement

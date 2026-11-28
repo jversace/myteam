@@ -20,6 +20,7 @@ import locks
 import project_rules as prules
 import symbols
 import system_actions as sysact
+import tools
 import rights
 import rulebook
 import skills
@@ -70,6 +71,8 @@ ACTION_LINES = [
     '{"do":"force_unlock","path":"<fichier>","reason":"..."} : (agent principal) libérer de force le verrou d’un fichier (détenteur inactif ou plantage) ; si le détenteur travaille encore, utilise stop_agent',
     '{"do":"propose_check","name":"tests","command":"python -m unittest discover -s tests","when":"both","blocking":true,"explain":"<explication SIMPLE, sans jargon : ce que ça vérifie, ce que ça modifie, pourquoi>","reason":"<pourquoi maintenant>"} : proposer un contrôle automatique (tests, lint) exécuté par l’application à ta soumission (when : validation | integration | both) ; l’utilisateur l’approuve, rien ne s’exécute avant ; proposer le même name avec une autre commande = demander une modification',
     '{"do":"run_checks"} : (git local) lancer les contrôles automatiques approuvés (tests, lint, build) sur ton worktree : résumé compact ✔/✖ et fin de sortie des échecs seulement ; à faire avant submit_task',
+    '{"do":"tools_list"} : lister les outils tiers installés sur la machine que ton rôle peut utiliser (nom, description, paramètres, s’ils demandent l’accord de l’utilisateur), sans appel IA',
+    '{"do":"tool_run","tool":"<nom>","params":{"<paramètre>":"<valeur>"},"why":"<pourquoi>"} : lancer un outil tiers (exécuté par l’application, dans ton espace de travail, sans shell ; les paramètres sont contrôlés) ; l’utilisateur doit parfois l’approuver avant : tu reçois alors le résultat plus tard ; sinon la fin de la sortie nettoyée',
     '{"do":"status"} : (git local) fichiers modifiés non commités de ton worktree',
     '{"do":"commit","message":"<message clair>"} : (git local) enregistrer tout ton worktree dans un commit (local)',
     '{"do":"diff","path":"<fichier ou dossier, facultatif>","stat":false,"context":3} : (git local) tes changements COMMITÉS par rapport à la branche cible : synthèse par fichier (+/-) puis diff compact ; stat:true = synthèse seule ; path = un seul fichier avec tout le budget',
@@ -177,6 +180,8 @@ def action_applies(p, a, name):
         return mode == "git" and lv("check") != rights.NO
     if name == "run_checks":
         return mode == "git" and bool(checks_active(p, "validation"))
+    if name in ("tools_list", "tool_run"):
+        return mode in ("local", "git") and bool(tools_available(p, a))
     if name in ("pull", "merge_request"):
         return mode == "github"
     if name == "resolve_merge":
@@ -801,7 +806,7 @@ def check_budget(p):
 
 def _dec_key(d):
     """Clé « sujet » d'une décision : deux décisions en attente de même clé portent sur la même chose."""
-    for k in ("conflict", "mr_review", "wf_run", "review", "ruleconf"):
+    for k in ("conflict", "mr_review", "wf_run", "review", "ruleconf", "toolcall"):
         if d.get(k):
             return (k, d[k])
     if d.get("escalation") and d.get("task"):
@@ -946,6 +951,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return propose_check(u, pid, p, a, x, mn, ctx)
         if kind == "run_checks":
             return check_act(u, pid, p, a)
+        if kind in ("tools_list", "tool_run"):
+            return tool_act(u, pid, p, a, x, kind, ctx)
         if kind in GIT_KINDS:
             if not git_agent(p, a):
                 return refuse("L’action %s n’existe qu’en mode git local (répertoire local versionné, un worktree par agent)." % kind)
@@ -1355,6 +1362,8 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
         elif ag:
             ask(u, pid, ag["id"], "Réponse de l’utilisateur à ta question « %s » : %s" % (title, full), "Vous")
         return
+    if decision == "accept" and d["kind"] == "tool":       # l'approbation porte sur la commande EXACTE affichée : exécutée par l'application, jamais par l'agent
+        return tool_approved(u, pid, d)
     if decision == "accept" and d["kind"] == "check":      # l'approbation porte sur le texte EXACT de la commande : aucun champ modifiable
         pay = dict(d["payload"])
 
@@ -1997,6 +2006,150 @@ def check_act(u, pid, p, a):
     return "Contrôles : %d réussi(s), %d en échec" % (len(ck["results"]) - len(ck["failed"]), len(ck["failed"])), "\n".join(rows) + (("\n\n" + bad) if bad else "\nTout est vert : tu peux soumettre (submit_task).")
 
 
+# ---------------------------------------------------------------------------------------------------------------- outils tiers (tools.py)
+TOOL_RUNS_MAX = 100          # lancements gardés dans `p.tool_runs`
+TOOL_PER_EXCHANGE = 6        # lancements d'outils (ou demandes d'accord) par échange d'un agent
+
+
+def tools_available(p, a):
+    """[(outil, niveau)] : outils valides, activés, existants sur cette plateforme et autorisés au rôle de l'agent."""
+    out = []
+    for t in rights.tools_of(p):
+        lv = rights.tool_level(p, a, t)
+        if lv != rights.NO and tools.platform_ok(t) and not tools.validate_def(t)["errors"]:
+            out.append((t, lv))
+    return out
+
+
+def tool_cwd(u, pid, p, a):
+    """(espace de travail, dossiers des agents, erreur). Les outils s'exécutent dans l'espace de l'agent : son worktree (mode git) ou le répertoire local."""
+    ld = str(p.get("localdir") or "").strip()
+    if git_agent(p, a):
+        try:
+            _lg, wt = git_workspace(u, pid, p, a)
+        except Err as e:
+            return "", [], "Espace git indisponible : %s" % e.msg
+        return wt, [ld], ""
+    if local_agent(p, a):
+        if not ld or not os.path.isdir(ld):
+            return "", [], "Le répertoire local du projet n'existe pas sur la machine du serveur."
+        return ld, [ld], ""
+    return "", [], "Les outils s'exécutent dans le répertoire local du projet : ton mode de travail (GitHub) n'en a pas."
+
+
+def _tool_line(t, lv):
+    return "- %s : %s\n    Paramètres : %s\n    %s" % (t["name"], (t.get("desc") or "(sans description)").strip().replace("\n", " ")[:300], tools.usage(t),
+                                                       "Lancement libre." if lv == rights.FREE else "Chaque lancement demande l’accord de l’utilisateur (tu seras relancé avec le résultat).")
+
+
+def tool_act(u, pid, p, a, x, kind, ctx):
+    """`tools_list` / `tool_run` : l'agent demande, l'application vérifie (droits, paramètres, confinement) puis exécute — ou soumet à l'utilisateur."""
+    refuse = lambda m: (m, m)
+    avail = tools_available(p, a)
+    if not avail:
+        return refuse("Aucun outil n'est disponible pour ton rôle (l'utilisateur les déclare dans « Outils » et les attribue aux rôles).")
+    if kind == "tools_list":
+        return "", "Outils disponibles :\n" + "\n".join(_tool_line(t, lv) for t, lv in avail)
+    name = str(x.get("tool") or "").strip().lower()
+    hit = next(((t, lv) for t, lv in avail if t["name"].lower() == name), None)
+    if not hit:
+        return refuse("Outil « %s » inconnu ou non autorisé à ton rôle. Disponibles : %s." % (name[:40], ", ".join(t["name"] for t, _ in avail)))
+    tool, lv = hit
+    ctx["tools"] = ctx.get("tools", 0) + 1
+    if ctx["tools"] > TOOL_PER_EXCHANGE:
+        return refuse("Trop d'outils lancés dans un même échange (maximum %d) : poursuis plus tard." % TOOL_PER_EXCHANGE)
+    cwd, roots, err = tool_cwd(u, pid, p, a)
+    if err:
+        return refuse(err)
+    b = tools.build_argv(tool, x.get("params") or {}, cwd, roots)
+    if not b["ok"]:
+        return refuse("Appel de %s refusé : %s\nUsage : %s" % (tool["name"], b["error"], tools.usage(tool)))
+    why = str(x.get("why") or "").strip()[:300]
+    if lv == rights.FREE:
+        return tool_exec(u, pid, p, a, tool, b, why, "libre", ctx.get("t0", 0))
+    tid = next((t["id"] for t in p.get("tasks", []) if t.get("who") == a["id"] and t.get("status") == "en cours"), "")
+    key = hashlib.sha256(("%s|%s|%s" % (a["id"], tool["id"], b["display"])).encode("utf-8")).hexdigest()[:16]
+
+    def f(pp):
+        if any(d["kind"] == "tool" and d["status"] == "attente" and d.get("toolcall") == key for d in pp.get("decisions", [])):
+            return None
+        d = {"id": uid(), "n": rights.next_seq(pp), "kind": "tool", "by": a["id"], "byName": a["name"], "d": now(), "status": "attente", "toolcall": key, "task": tid,
+             "payload": {"name": "outil " + tool["name"], "tool_id": tool["id"], "tool_name": tool["name"], "params": {k: v for k, v in (x.get("params") or {}).items()},
+                         "command": b["display"], "explain": (tool.get("desc") or "").strip(), "why": why, "def_hash": tools.def_hash(tool), "task": tid}, "why": why}
+        add_decision(pp, d)
+        return d
+    d = mp(u, pid, f)
+    if not d:
+        return "Demande identique déjà en attente : %s" % tool["name"], "Cette demande attend déjà l’accord de l’utilisateur : ne la renvoie pas."
+    return "Demande d’outil enregistrée dans « Décisions » : %s" % tool["name"], \
+        "Demande enregistrée : l’utilisateur doit approuver cette commande exacte (%s) ; rien ne s’exécute avant. Le résultat te sera transmis ; poursuis une autre partie de ta tâche en attendant." % b["display"]
+
+
+def tool_exec(u, pid, p, a, tool, b, why, approved, t0=0, tid=""):
+    """Lance l'outil (aucun appel IA), journalise, et renvoie (note d'historique, retour pour l'agent)."""
+    if t0:
+        locks.check_stop(u, pid, a["id"], t0)
+    res = tools.run(b["argv"], b["cwd"], tools.timeout_of(tool), key=(u, pid, a["id"], uid()), lock_id=tool["id"])
+    rec = {"id": uid(), "d": now(), "tool": tool["id"], "name": tool["name"], "by": a["name"], "cmd": b["display"][:300], "why": why, "approved": approved, "ok": res["ok"],
+           "rc": res["rc"], "secs": res["secs"], "timed_out": res["timed_out"], "killed": res["killed"], "tail": res["tail"][-1500:]}
+
+    def f(pp):
+        pp.setdefault("tool_runs", []).append(rec)
+        del pp["tool_runs"][:-TOOL_RUNS_MAX]
+    mp(u, pid, f)
+    etat = "réussi" if res["ok"] else ("délai dépassé" if res["timed_out"] else ("interrompu" if res["killed"] else "échec"))
+    log(u, pid, "Système", a["name"], "Outil « %s » %s (code %s, %.1f s)%s." % (tool["name"], etat, res["rc"], res["secs"], " — accord de l’utilisateur" if approved == "Vous" else ""))
+    text = "Outil « %s » %s (code %s, %.1f s) :\n```\n%s\n```" % (tool["name"], etat, res["rc"], res["secs"], res["tail"] or "(aucune sortie)")
+    return "Outil %s : %s" % (tool["name"], etat), text
+
+
+def tool_approved(u, pid, d):
+    """Décision `accept` d'une demande d'outil : revérifie TOUT (outil, droits, commande identique à celle approuvée), exécute, puis transmet le résultat à l'agent."""
+    p = snap(u, pid)
+    y = d["payload"]
+    a = by_id(p["agents"], d["by"])
+    tool = by_id(rights.tools_of(p), y.get("tool_id"))
+
+    def fail(msg):
+        mp(u, pid, lambda pp: by_id(pp["decisions"], d["id"]).update(status="refusée", note=msg, done=now(), n_done=rights.next_seq(pp)))
+        log(u, pid, "Système", "Vous", "Outil non exécuté (%s) : %s" % (y.get("tool_name"), msg))
+        if a:
+            tool_deliver(u, pid, a, "[Application] La demande d’outil « %s » n’a pas été exécutée : %s" % (y.get("tool_name"), msg), "")
+    if not a or not tool:
+        return fail("l’agent ou l’outil n’existe plus")
+    if tools.def_hash(tool) != y.get("def_hash"):
+        return fail("la définition de l’outil a été modifiée depuis la demande : ce que vous avez approuvé n’existe plus")
+    if rights.tool_level(p, a, tool) == rights.NO or not tools.platform_ok(tool):
+        return fail("l’outil n’est plus autorisé à ce rôle (ou plus disponible)")
+    cwd, roots, err = tool_cwd(u, pid, p, a)
+    if err:
+        return fail(err)
+    b = tools.build_argv(tool, y.get("params") or {}, cwd, roots)
+    if not b["ok"]:
+        return fail(b["error"])
+    if b["display"] != y.get("command"):
+        return fail("la commande à exécuter n’est plus celle que vous avez approuvée")
+    mp(u, pid, lambda pp: by_id(pp["decisions"], d["id"]).update(status="acceptée", done=now(), n_done=rights.next_seq(pp)))
+    _note, text = tool_exec(u, pid, p, a, tool, b, y.get("why", ""), "Vous")
+    tool_deliver(u, pid, a, text, y.get("task") or "")
+
+
+def tool_deliver(u, pid, a, text, tid):
+    """Remet le résultat à l'agent sans l'interrompre : relance de sa tâche s'il est libre, sinon boîte de notifications (lue à son prochain échange)."""
+    p = snap(u, pid)
+    t = by_id(p.get("tasks", []), tid) if tid else None
+    ag = by_id(p["agents"], a["id"]) or a
+    if t and t.get("status") in ("en cours", "en attente") and not t.get("running") and not (ag.get("work") or 0):
+        return run_task(u, pid, tid, note="[Décision de l’utilisateur] " + text + "\nReprends la tâche en tenant compte de ce résultat.")
+    item = {"id": uid(), "d": now(), "from": "Application", "kind": "info", "text": text if len(text) <= NOTIFY_MAX else text[:NOTIFY_MAX] + " […tronqué]", "task": tid if t else ""}
+
+    def f(pp):
+        g = by_id(pp["agents"], a["id"])
+        if g is not None:
+            g["inbox"] = ((g.get("inbox") or []) + [item])[-INBOX_MAX:]
+    mp(u, pid, f)
+
+
 REREAD_WINDOW = 20      # un extrait n'est déclaré « inchangé » que si sa lecture précédente est dans les 20 derniers messages (l'historique envoyé en garde 30)
 SYM_FILES, SYM_READS, SYM_DIRS, SYM_CAP = 400, 150, 150, 3000
 SYM_CACHE, SYM_MAPS = {}, {}                         # analyse par fichier (empreinte du contenu) ; plan de dépôt GitHub (empreinte de la branche)
@@ -2445,6 +2598,9 @@ def stop_agent(u, pid, aid, cancel=False, by="Vous", reason=""):
             w["ev"].set()
     freed, restored, lost = locks.release_agent(u, pid, aid, restore=cancel)
     gnote = git_stop_note(u, pid, p, a, cancel) if git_agent(p, a) else ""
+    nk = tools.kill_agent(u, pid, aid)
+    if nk:
+        gnote += " %d outil(s) en cours interrompu(s)." % nk
 
     def f(pp):
         ag = by_id(pp["agents"], aid)

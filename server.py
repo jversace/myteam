@@ -8,6 +8,7 @@ import engine
 import rights
 import skills
 import store
+import tools
 import version
 from ai import call_ai
 from store import Err, LOCK, SESSIONS, USERS, rj, wj
@@ -170,6 +171,8 @@ class H(BaseHTTPRequestHandler):
             return self.out(200, {"items": engine.sync_all(u, pid)})
         if p == "/api/skills" or p.startswith("/api/skills/"):
             return self.out(200, skills.handle(u, "POST", p, {}, d))
+        if p == "/api/tools/check":                        # contrôle statique des outils du registre (sans exécution) : erreurs, avertissements, vigilance, aperçu
+            return self.out(200, {"results": {str(t.get("id")): tools.validate_def(t) for t in (d.get("tools") or [])[:100] if isinstance(t, dict)}})
         if p == "/api/job":
             engine.start(u, d)
             return self.out(200, {"ok": True})

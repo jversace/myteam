@@ -95,6 +95,22 @@ def level(p, a, cap, main=False):
     return c
 
 
+def tools_of(p):
+    """Registre d'outils global (`_tools`, rattaché au chargement) : jamais modifiable par un agent."""
+    return p.get("_tools") or []
+
+
+def tool_level(p, a, tool):
+    """Niveau d'usage d'un outil par un agent : `free`, `approve` (accord de l'utilisateur à chaque lancement) ou `no`.
+    Il faut À LA FOIS que le rôle de l'agent y ait droit (`role.tools[id]`) et que l'outil soit activé ; le niveau de l'outil (libre / avec accord /
+    interdit) s'applique ensuite : le plus strict l'emporte. Aucun outil par défaut, même pour l'agent principal."""
+    r = by_id(roles_of(p), a.get("role")) or {}
+    if not (tool or {}).get("id") or not (r.get("tools") or {}).get(tool["id"]) or tool.get("enabled") is False:
+        return NO
+    lv = tool.get("level")
+    return lv if lv in (FREE, APPROVE, NO) else APPROVE
+
+
 def rights_text(p, a, main=False):
     return "\n".join("- %s : %s" % (CAP_TXT[c], LV_TXT[level(p, a, c, main)]) for c in CAPS) \
         + "\n- Niveau d'autonomie du projet : " + AUTONOMY_TXT.get(p.get("autonomy") or "balanced", "équilibré")
