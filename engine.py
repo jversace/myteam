@@ -73,6 +73,7 @@ ACTION_LINES = [
     '{"do":"run_checks"} : (git local) lancer les contrôles automatiques approuvés (tests, lint, build) sur ton worktree : résumé compact ✔/✖ et fin de sortie des échecs seulement ; à faire avant submit_task',
     '{"do":"tools_list"} : lister les outils tiers installés sur la machine que ton rôle peut utiliser (nom, description, paramètres, s’ils demandent l’accord de l’utilisateur), sans appel IA',
     '{"do":"tool_run","tool":"<nom>","params":{"<paramètre>":"<valeur>"},"why":"<pourquoi>"} : lancer un outil tiers (exécuté par l’application, dans ton espace de travail, sans shell ; les paramètres sont contrôlés) ; l’utilisateur doit parfois l’approuver avant : tu reçois alors le résultat plus tard ; sinon la fin de la sortie nettoyée',
+    '{"do":"tool_propose","name":"<nom>","kind":"cli|api","desc":"<à quoi il sert>","command":"<programme seul>","args":["-q","{fichier}"],"params":["fichier ; chemin ; obligatoire ; fichier à tester ; existant"],"url":"<API : adresse locale>","method":"GET","body":{},"explain":"<explication SIMPLE, sans jargon>","reason":"<pourquoi>"} : proposer un outil tiers installé sur la machine (ligne de commande, ou API HTTP locale), ou modifier un outil de même nom ; l’utilisateur l’examine, l’approuve et décide qui peut s’en servir ; tu ne fixes ni en-têtes ni secrets',
     '{"do":"status"} : (git local) fichiers modifiés non commités de ton worktree',
     '{"do":"commit","message":"<message clair>"} : (git local) enregistrer tout ton worktree dans un commit (local)',
     '{"do":"diff","path":"<fichier ou dossier, facultatif>","stat":false,"context":3} : (git local) tes changements COMMITÉS par rapport à la branche cible : synthèse par fichier (+/-) puis diff compact ; stat:true = synthèse seule ; path = un seul fichier avec tout le budget',
@@ -181,7 +182,9 @@ def action_applies(p, a, name):
     if name == "run_checks":
         return mode == "git" and bool(checks_active(p, "validation"))
     if name in ("tools_list", "tool_run"):
-        return mode in ("local", "git") and bool(tools_available(p, a))
+        return bool(tools_available(p, a))                 # les outils en ligne de commande demandent un espace de travail (local ou git) ; les outils API non
+    if name == "tool_propose":
+        return lv("tool") != rights.NO
     if name in ("pull", "merge_request"):
         return mode == "github"
     if name == "resolve_merge":
@@ -953,6 +956,8 @@ def do_act(u, pid, aid, x, depth, ctx=None):
             return check_act(u, pid, p, a)
         if kind in ("tools_list", "tool_run"):
             return tool_act(u, pid, p, a, x, kind, ctx)
+        if kind == "tool_propose":
+            return tool_propose(u, pid, p, a, x, mn, ctx)
         if kind in GIT_KINDS:
             if not git_agent(p, a):
                 return refuse("L’action %s n’existe qu’en mode git local (répertoire local versionné, un worktree par agent)." % kind)
@@ -1362,6 +1367,8 @@ def decide(u, pid, did, decision, note="", fields=None, answer=""):
         elif ag:
             ask(u, pid, ag["id"], "Réponse de l’utilisateur à ta question « %s » : %s" % (title, full), "Vous")
         return
+    if decision == "accept" and d["kind"] == "toolnew":    # un NOUVEL outil (ou une modification) proposé par un agent : seul l'utilisateur l'ajoute au registre
+        return tool_new_apply(u, pid, d, fields or {})
     if decision == "accept" and d["kind"] == "tool":       # l'approbation porte sur la commande EXACTE affichée : exécutée par l'application, jamais par l'agent
         return tool_approved(u, pid, d)
     if decision == "accept" and d["kind"] == "check":      # l'approbation porte sur le texte EXACT de la commande : aucun champ modifiable
@@ -2013,10 +2020,10 @@ TOOL_PER_EXCHANGE = 6        # lancements d'outils (ou demandes d'accord) par é
 
 def tools_available(p, a):
     """[(outil, niveau)] : outils valides, activés, existants sur cette plateforme et autorisés au rôle de l'agent."""
-    out = []
+    out, mode = [], agent_mode(p, a)
     for t in rights.tools_of(p):
         lv = rights.tool_level(p, a, t)
-        if lv != rights.NO and tools.platform_ok(t) and not tools.validate_def(t)["errors"]:
+        if lv != rights.NO and tools.platform_ok(t) and (mode in ("local", "git") or not tools.needs_workspace(t)) and not tools.validate_def(t)["errors"]:
             out.append((t, lv))
     return out
 
@@ -2058,10 +2065,12 @@ def tool_act(u, pid, p, a, x, kind, ctx):
     ctx["tools"] = ctx.get("tools", 0) + 1
     if ctx["tools"] > TOOL_PER_EXCHANGE:
         return refuse("Trop d'outils lancés dans un même échange (maximum %d) : poursuis plus tard." % TOOL_PER_EXCHANGE)
-    cwd, roots, err = tool_cwd(u, pid, p, a)
-    if err:
-        return refuse(err)
-    b = tools.build_argv(tool, x.get("params") or {}, cwd, roots)
+    cwd, roots = "", []
+    if tools.needs_workspace(tool):
+        cwd, roots, err = tool_cwd(u, pid, p, a)
+        if err:
+            return refuse(err)
+    b = tools.prepare(tool, x.get("params") or {}, cwd, roots)
     if not b["ok"]:
         return refuse("Appel de %s refusé : %s\nUsage : %s" % (tool["name"], b["error"], tools.usage(tool)))
     why = str(x.get("why") or "").strip()[:300]
@@ -2085,11 +2094,11 @@ def tool_act(u, pid, p, a, x, kind, ctx):
         "Demande enregistrée : l’utilisateur doit approuver cette commande exacte (%s) ; rien ne s’exécute avant. Le résultat te sera transmis ; poursuis une autre partie de ta tâche en attendant." % b["display"]
 
 
-def tool_exec(u, pid, p, a, tool, b, why, approved, t0=0, tid=""):
+def tool_exec(u, pid, p, a, tool, b, why, approved, t0=0, want_res=False):
     """Lance l'outil (aucun appel IA), journalise, et renvoie (note d'historique, retour pour l'agent)."""
     if t0:
         locks.check_stop(u, pid, a["id"], t0)
-    res = tools.run(b["argv"], b["cwd"], tools.timeout_of(tool), key=(u, pid, a["id"], uid()), lock_id=tool["id"])
+    res = tools.execute(tool, b, key=(u, pid, a["id"], uid()))
     rec = {"id": uid(), "d": now(), "tool": tool["id"], "name": tool["name"], "by": a["name"], "cmd": b["display"][:300], "why": why, "approved": approved, "ok": res["ok"],
            "rc": res["rc"], "secs": res["secs"], "timed_out": res["timed_out"], "killed": res["killed"], "tail": res["tail"][-1500:]}
 
@@ -2100,7 +2109,7 @@ def tool_exec(u, pid, p, a, tool, b, why, approved, t0=0, tid=""):
     etat = "réussi" if res["ok"] else ("délai dépassé" if res["timed_out"] else ("interrompu" if res["killed"] else "échec"))
     log(u, pid, "Système", a["name"], "Outil « %s » %s (code %s, %.1f s)%s." % (tool["name"], etat, res["rc"], res["secs"], " — accord de l’utilisateur" if approved == "Vous" else ""))
     text = "Outil « %s » %s (code %s, %.1f s) :\n```\n%s\n```" % (tool["name"], etat, res["rc"], res["secs"], res["tail"] or "(aucune sortie)")
-    return "Outil %s : %s" % (tool["name"], etat), text
+    return ("Outil %s : %s" % (tool["name"], etat), text) + ((res,) if want_res else ())
 
 
 def tool_approved(u, pid, d):
@@ -2121,10 +2130,12 @@ def tool_approved(u, pid, d):
         return fail("la définition de l’outil a été modifiée depuis la demande : ce que vous avez approuvé n’existe plus")
     if rights.tool_level(p, a, tool) == rights.NO or not tools.platform_ok(tool):
         return fail("l’outil n’est plus autorisé à ce rôle (ou plus disponible)")
-    cwd, roots, err = tool_cwd(u, pid, p, a)
-    if err:
-        return fail(err)
-    b = tools.build_argv(tool, y.get("params") or {}, cwd, roots)
+    cwd, roots = "", []
+    if tools.needs_workspace(tool):
+        cwd, roots, err = tool_cwd(u, pid, p, a)
+        if err:
+            return fail(err)
+    b = tools.prepare(tool, y.get("params") or {}, cwd, roots)
     if not b["ok"]:
         return fail(b["error"])
     if b["display"] != y.get("command"):
@@ -2148,6 +2159,91 @@ def tool_deliver(u, pid, a, text, tid):
         if g is not None:
             g["inbox"] = ((g.get("inbox") or []) + [item])[-INBOX_MAX:]
     mp(u, pid, f)
+
+
+TOOL_FIELDS = ("name", "desc", "kind", "command", "args_text", "params_text", "workdir", "timeout", "platform", "method", "url", "body_text")
+TOOL_PENDING_MAX = 3         # propositions d'outils en attente par agent
+
+
+def _lines(v):
+    return "\n".join(str(i) for i in v) if isinstance(v, (list, tuple)) else str(v or "")
+
+
+def tool_propose(u, pid, p, a, x, mn, ctx):
+    """Un agent PROPOSE un outil tiers (ou la modification d'un outil de même nom) : jamais ajouté au registre sans l'approbation de l'utilisateur, qui décide
+    aussi quels rôles peuvent s'en servir. L'agent ne fixe NI en-têtes NI adresse non locale (les secrets restent côté utilisateur)."""
+    refuse = lambda m: (m, m)
+    ctx["n"] += 1
+    if ctx["n"] > MAX_CREATE:
+        return refuse("Trop de créations dans un même échange (maximum %d) : poursuis plus tard." % MAX_CREATE)
+    if rights.level(p, a, "tool", mn) == rights.NO:
+        return refuse("Ton rôle ne t’autorise pas à proposer des outils tiers.")
+    explain = str(x.get("explain") or "").strip()
+    body = x.get("body")
+    t = {"name": str(x.get("name") or "").strip().lower()[:40], "desc": str(x.get("desc") or "").strip()[:300], "kind": "api" if x.get("kind") == "api" else "cli",
+         "command": str(x.get("command") or "").strip(), "args_text": _lines(x.get("args")), "params_text": _lines(x.get("params")), "workdir": str(x.get("workdir") or "").strip(),
+         "timeout": x.get("timeout") if str(x.get("timeout") or "").isdigit() else tools.DEFAULT_TIMEOUT, "platform": x.get("platform") if x.get("platform") in tools.PLATFORMS else "any",
+         "method": str(x.get("method") or "GET").upper(), "url": str(x.get("url") or "").strip(),
+         "body_text": body if isinstance(body, str) else (json.dumps(body, ensure_ascii=False) if body else "")}
+    if not t["name"] or not t["desc"] or len(explain) < 20:
+        return refuse("Proposition incomplète : name, desc et explain sont obligatoires. explain = une explication SIMPLE, sans jargon : ce que fait l’outil, ce qu’il peut modifier, pourquoi tu le proposes.")
+    v = tools.validate_def(dict(t, id="new", level="approve", enabled=True))
+    if v["errors"]:
+        return refuse("Proposition refusée (outil invalide) : " + " ; ".join(v["errors"][:4]))
+    cur = next((c for c in rights.tools_of(p) if c.get("name", "").lower() == t["name"]), None)
+    if cur and tools.def_hash(cur) == tools.def_hash(dict(cur, **{k: t[k] for k in TOOL_FIELDS})):
+        return refuse("Cet outil existe déjà avec cette définition : rien à proposer.")
+    if sum(1 for d in p.get("decisions", []) if d["kind"] == "toolnew" and d["status"] == "attente" and d["by"] == a["id"]) >= TOOL_PENDING_MAX:
+        return refuse("Tu as déjà %d propositions d’outils en attente de l’utilisateur : attends sa réponse." % TOOL_PENDING_MAX)
+    tid = next((k["id"] for k in p.get("tasks", []) if k.get("who") == a["id"] and k.get("status") == "en cours"), "")
+    pay = {"name": "outil " + t["name"], "tool": t, "id": cur["id"] if cur else "", "prev": tools.validate_def(cur)["preview"] if cur else "", "explain": explain, "reason": str(x.get("reason") or "").strip()[:300],
+           "why": str(x.get("reason") or "").strip()[:300], "preview": v["preview"], "risk": v["risk"], "grant_role": a.get("role") or "", "grant_role_name": role(p, a)["name"], "task": tid}
+
+    def f(pp):
+        d = {"id": uid(), "n": rights.next_seq(pp), "kind": "toolnew", "by": a["id"], "byName": a["name"], "d": now(), "status": "attente", "payload": pay, "why": pay["why"], "task": tid}
+        add_decision(pp, d)                                   # une version révisée du même outil remplace la proposition en attente
+        return d
+    d = mp(u, pid, f)
+    return "Proposition d’outil enregistrée dans « Décisions » : %s (vigilance %s)" % (t["name"], v["risk"]["level"]), \
+        "Proposition enregistrée : l’utilisateur lira ton explication, la commande ou la requête exacte et le niveau de vigilance, puis l’approuvera ou non et choisira qui peut s’en servir. Tu seras prévenu de sa réponse."
+
+
+def tool_new_apply(u, pid, d, fields):
+    """Décision `accept` d'un outil proposé : ajoute (ou met à jour) l'outil dans le registre global, niveau « avec accord », et attribue le rôle de l'agent si l'utilisateur l'a coché."""
+    p = snap(u, pid)
+    y = d["payload"]
+    t = {k: y["tool"].get(k) for k in TOOL_FIELDS}
+    a = by_id(p["agents"], d["by"])
+    grant = str(fields.get("grant") or "").lower() not in ("", "0", "false", "non")
+
+    def g(st):
+        tl = st.setdefault("tools", [])
+        cur = by_id(tl, y.get("id")) if y.get("id") else None
+        if y.get("id") and not cur:
+            return None, "l’outil à modifier n’existe plus"
+        v = tools.validate_def(dict(cur or {}, **t, id="x", level="approve"))
+        if v["errors"]:
+            return None, "l’outil proposé est invalide : " + " ; ".join(v["errors"][:3])
+        if cur:
+            cur.update(t)
+        else:
+            cur = {"id": uid(), **t, "level": "approve", "enabled": True}
+            tl.append(cur)
+        r = by_id(st.get("roles", []), y.get("grant_role")) if grant else None
+        if r is not None:
+            r.setdefault("tools", {})[cur["id"]] = True
+        return cur, ("modifié" if y.get("id") else "ajouté") + (" et autorisé au rôle « %s »" % r["name"] if r is not None else "")
+    cur, msg = mutate(u, g)
+    if cur is None:
+        mp(u, pid, lambda pp: by_id(pp["decisions"], d["id"]).update(status="refusée", note=msg, done=now(), n_done=rights.next_seq(pp)))
+        log(u, pid, "Système", "Vous", "Outil « %s » non ajouté : %s" % (t["name"], msg))
+        if a:
+            tool_deliver(u, pid, a, "[Application] Ta proposition d’outil « %s » n’a pas pu être appliquée : %s" % (t["name"], msg), "")
+        return
+    mp(u, pid, lambda pp: by_id(pp["decisions"], d["id"]).update(status="acceptée", done=now(), n_done=rights.next_seq(pp)))
+    log(u, pid, "Système", d["byName"], "Proposition acceptée — outil « %s » %s (lancement : avec accord de l’utilisateur)." % (t["name"], msg))
+    if a:
+        tool_deliver(u, pid, a, "[Application] Ta proposition d’outil « %s » a été acceptée (%s). %s" % (t["name"], msg, "Utilise tools_list pour le voir." if grant else "Ton rôle n’y a pas encore droit : l’utilisateur peut le lui attribuer."), y.get("task") or "")
 
 
 REREAD_WINDOW = 20      # un extrait n'est déclaré « inchangé » que si sa lecture précédente est dans les 20 derniers messages (l'historique envoyé en garde 30)

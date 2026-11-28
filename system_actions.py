@@ -14,6 +14,7 @@ import time
 import github
 import project_rules as prules
 import rights
+import tools
 from rights import by_id, now, uid
 from store import Err
 
@@ -61,10 +62,12 @@ ACTIONS = {
     "refresh_agent_context": ("Réécrire le fichier de contexte d’un agent (git local)", None, None, True, False, "acteur = nom ou rôle"),
     "log_history": ("Écrire dans l’historique des discussions", None, None, False, True, "texte"),
     "for_each_subtask": ("Lancer un workflow sur chaque sous-tâche directe non terminée d’une tâche", "task", "workflow", False, False, "cible = tâche parente ; valeur = nom du workflow"),
+    # lot outils tiers
+    "run_tool": ("Lancer un outil tiers du registre (sans IA)", None, "tool", True, True, "valeur = nom de l’outil ; acteur = agent dont l’espace de travail sert (outils en ligne de commande) ; texte = paramètres, une ligne nom=valeur"),
 }
 
 # Actions qui détruisent, publient ou contournent un contrôle : confirmation de l'utilisateur par défaut
-SENSITIVE_ACTIONS = ("release_publish", "push_release", "cleanup_merged_branches", "force_unlock", "reset_usage")
+SENSITIVE_ACTIONS = ("release_publish", "push_release", "cleanup_merged_branches", "force_unlock", "reset_usage", "run_tool")
 EVENTS = ("mr_opened", "bug_declared", "release_started")      # + "task_status:<statut>"
 
 
@@ -214,7 +217,9 @@ def lint_step(p, st, timer, wf=None):
         out.append(("erreur", "Chemin de fichier vide."))
     if vk == "push_scope" and (st.get("value") or "") not in ("", "all"):
         out.append(("erreur", "Valeur attendue : vide (agent désigné) ou all."))
-    if xk and act not in ("launch_task", "end_workflow", "release_publish") and not prules.norm(st.get("text")):
+    if vk == "tool":
+        out += _lint_tool(p, st)
+    if xk and act not in ("launch_task", "end_workflow", "release_publish", "run_tool") and not prules.norm(st.get("text")):
         out.append(("erreur", "Texte vide."))
     if wk:
         who = st.get("who") or "principal"
@@ -228,6 +233,43 @@ def lint_step(p, st, timer, wf=None):
         out.append(("avertissement", "Action sensible exécutée sans confirmation : elle contourne la vérification."))
     if sensitive(st) and needs_confirm(st) and timer:
         out.append(("info", "La confirmation de l’utilisateur sera demandée à chaque déclenchement par minuterie."))
+    return out
+
+
+def _tool(p, name):
+    n = prules.norm(name)
+    return next((t for t in rights.tools_of(p) if prules.norm(t.get("name")) == n), None)
+
+
+def _tool_params(text):
+    """{nom: valeur} : une ligne `nom=valeur` par paramètre."""
+    out = {}
+    for line in str(text or "").replace("\r", "").split("\n"):
+        if line.strip() and "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def _lint_tool(p, st):
+    t = _tool(p, st.get("value"))
+    if not t:
+        return [("erreur", "Outil introuvable dans le registre : %s." % (st.get("value") or "—"))]
+    out = [("erreur", "L’outil « %s » : %s" % (t["name"], e)) for e in tools.validate_def(t)["errors"]]
+    if t.get("enabled") is False or tools.level_of(t) == "no":
+        out.append(("erreur", "L’outil « %s » est désactivé ou interdit." % t["name"]))
+    if tools.level_of(t) == "approve" and not needs_confirm(st):
+        out.append(("erreur", "L’outil « %s » exige votre accord à chaque lancement : la confirmation de l’étape ne peut pas être désactivée." % t["name"]))
+    if not tools.platform_ok(t):
+        out.append(("erreur", "L’outil « %s » n’existe pas sur la plateforme du serveur." % t["name"]))
+    params, _ = tools.parse_params(t.get("params_text"))
+    given = _tool_params(st.get("text"))
+    for k in given:
+        if k not in {x["name"] for x in params}:
+            out.append(("erreur", "Paramètre inconnu pour « %s » : %s." % (t["name"], k)))
+    for x in params:
+        if x["required"] and x["name"] not in given:
+            out.append(("erreur", "Paramètre obligatoire manquant pour « %s » : %s (ligne « %s=valeur »)." % (t["name"], x["name"], x["name"])))
     return out
 
 
@@ -708,7 +750,30 @@ def _for_each_subtask(E, u, pid, p, wf, run, st):
     return "ok", "« %s » lancé sur %d sous-tâche(s)" % (w2["name"], len(kids))
 
 
-HANDLERS = {"merge_mr": _merge_mr, "run_checks": _run_checks, "push_branch": _push_branch, "create_task_branch": _create_task_branch,
+def _run_tool(E, u, pid, p, wf, run, st):
+    t = _tool(p, st.get("value"))
+    if not t:
+        raise Err(404, "outil « %s » introuvable dans le registre" % (st.get("value") or ""))
+    if t.get("enabled") is False or tools.level_of(t) == "no" or not tools.platform_ok(t):
+        raise Err(409, "l’outil « %s » est désactivé, interdit ou indisponible ici" % t["name"])
+    if tools.level_of(t) == "approve" and not needs_confirm(st):
+        raise Err(409, "l’outil « %s » exige l’accord de l’utilisateur à chaque lancement : activez la confirmation de l’étape" % t["name"])
+    a = _actor(p, run, st)
+    cwd, roots = "", []
+    if tools.needs_workspace(t):
+        cwd, roots, err = E.tool_cwd(u, pid, p, a)
+        if err:
+            raise Err(409, err)
+    b = tools.prepare(t, _tool_params(render(st.get("text"), p, run)), cwd, roots)
+    if not b["ok"]:
+        raise Err(400, b["error"])
+    _note, _text, res = E.tool_exec(u, pid, p, a, t, b, "workflow « %s »" % wf.get("name", ""), "Workflow", want_res=True)
+    first = next((l for l in res["tail"].splitlines() if l.strip()), "")[:200]
+    return ("ok" if res["ok"] else "ko"), "outil « %s » %s (code %s, %.1f s)%s" % (t["name"], "réussi" if res["ok"] else "en échec", res["rc"], res["secs"], (" : " + first) if first else "")
+
+
+
+HANDLERS = {"run_tool": _run_tool, "merge_mr": _merge_mr, "run_checks": _run_checks, "push_branch": _push_branch, "create_task_branch": _create_task_branch,
             "cleanup_merged_branches": _cleanup_merged_branches, "release_start": _release_start, "release_publish": _release_publish,
             "push_release": _push_release, "force_unlock": _force_unlock, "reset_usage": _reset_usage, "refresh_agent_context": _refresh_agent_context,
             "log_history": _log_history, "for_each_subtask": _for_each_subtask, "if": _if, "create_subtask": _create_subtask, "create_bug_fix_subtask": _create_bug_fix_subtask, "link_modules": _link_modules,

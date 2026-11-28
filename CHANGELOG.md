@@ -4,6 +4,13 @@ Numérotation `MAJEUR.MINEUR.CORRECTIF` : **correctif** (3e chiffre) = bug ; **m
 **majeur** (1er chiffre) = refonte complète du projet uniquement.
 Le numéro courant est défini dans `version.py` ; l'entrée la plus récente ci-dessous doit toujours lui correspondre.
 
+## [1.2.0] — 2026-11-28
+Outils tiers, Lot 2. Évolution : voir « Outils tiers » dans `CLAUDE.md`.
+- **Type API** : un outil peut appeler une API HTTP installée sur la machine (méthode, adresse à `{paramètres}` encodés, corps JSON, en-têtes fixes saisis par l'utilisateur et invisibles des agents). Adresse locale par défaut, sans proxy ni redirection, réponse limitée ; utilisable aussi par les agents en mode GitHub (pas d'espace de travail requis).
+- **Propositions d'outils par les agents** : nouvelle action `tool_propose` et nouveau droit de rôle « Proposer des outils tiers » (toujours soumis à approbation). Carte « 🧰 Outil proposé » dans les Décisions : l'utilisateur approuve (outil ajouté ou modifié, niveau « avec accord ») et choisit s'il autorise le rôle de l'agent. Un agent ne fixe ni en-têtes ni adresse non locale.
+- **Workflows** : nouvelle étape système `run_tool` (sans IA) ; confirmation par défaut, obligatoire si l'outil demande l'accord de l'utilisateur ; ok/ko selon le code de sortie (ou HTTP 2xx).
+- Menu Outils : sélecteur de type (ligne de commande / API) et champs API ; journal : colonne « Accord » (libre / vous / workflow) ; 67 tests dans `tests/test_tools.py`.
+
 ## [1.1.0] — 2026-11-28
 Outils tiers pilotés par les agents (Lot 1 : type CLI). Évolution : voir « Outils tiers » dans `CLAUDE.md`.
 - Nouveau menu **Outils** (niveau application) : registre d'outils (nom, description, programme, arguments avec `{paramètres}` typés, plateforme, délai, niveau libre / avec accord / interdit, activation) avec contrôle statique affiché (erreurs, avertissements, vigilance, aperçu de la commande).

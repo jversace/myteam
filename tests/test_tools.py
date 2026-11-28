@@ -5,6 +5,7 @@ import sys
 import tempfile
 import json
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import time
 import unittest
 import urllib.error
@@ -17,6 +18,7 @@ os.environ.setdefault("APM_DATA", tempfile.mkdtemp())
 import engine  # noqa: E402
 import locks  # noqa: E402
 import rights  # noqa: E402
+import system_actions as sysact  # noqa: E402
 import store  # noqa: E402
 import tools  # noqa: E402
 from test_locks import make_state, proj  # noqa: E402
@@ -433,6 +435,341 @@ class Front(unittest.TestCase):
         html = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text(encoding="utf-8")
         for k in ('data-v="tools"', "function toolsView()", "function toolCard(", "function toolRunsCard(", 'a=="newtl"', "/api/tools/check", "tools:[]"):
             self.assertIn(k, html, k)
+
+
+# ====================================================================================================== Lot 2 : outils API, propositions, workflows
+class Echo(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _go(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n).decode("utf-8") if n else ""
+        if self.path.startswith("/redir"):
+            self.send_response(302)
+            self.send_header("Location", "/ailleurs")
+            self.end_headers()
+            return
+        if self.path.startswith("/lent"):
+            time.sleep(3)
+        code = 404 if self.path.startswith("/absent") else 200
+        out = json.dumps({"method": self.command, "path": self.path, "body": body, "auth": self.headers.get("Authorization", ""), "ctype": self.headers.get("Content-Type", "")}).encode()
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    do_GET = do_POST = do_PUT = do_DELETE = _go
+
+
+API = {"id": "ta", "name": "api-items", "desc": "Crée un élément", "kind": "api", "method": "POST", "url": "http://127.0.0.1:{port}/items/{id}?q={q}", "level": "free", "enabled": True,
+       "headers_text": "Authorization: Bearer SECRET", "body_text": "{\"nom\": \"{nom}\", \"n\": \"{n}\", \"opt\": \"{opt}\"}",
+       "params_text": "id ; entier ; o ; id\nq ; texte ; o ; q\nnom ; texte ; o ; nom\nn ; entier ; o ; n\nopt ; texte ; facultatif ; o", "timeout": 10}
+
+
+class ServeurEcho(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.sv = ThreadingHTTPServer(("127.0.0.1", 0), Echo)
+        cls.port = cls.sv.server_address[1]
+        threading.Thread(target=cls.sv.serve_forever, daemon=True).start()
+        cls.api = dict(API, url=API["url"].replace("{port}", str(cls.port)))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.sv.shutdown()
+        cls.sv.server_close()
+
+
+class OutilApi(ServeurEcho):
+    def test_definition(self):
+        self.assertEqual(tools.validate_def(self.api)["errors"], [])
+        self.assertIn("POST http://127.0.0.1", tools.validate_def(self.api)["preview"])
+        bad = lambda **k: tools.validate_def(dict(self.api, **k))["errors"]
+        self.assertTrue(bad(url="http://exemple.org/x/{id}?q={q}"))                        # adresse non locale sans autorisation
+        self.assertEqual(tools.validate_def(dict(self.api, url="http://exemple.org/{id}?q={q}", remote=True))["risk"]["level"], "élevée")
+        self.assertTrue(bad(url="ftp://127.0.0.1/x"))
+        self.assertTrue(bad(url="http://{id}.local/x?q={q}"))                              # hôte à paramètre
+        self.assertTrue(bad(url="http://user:pass@127.0.0.1/{id}?q={q}"))                  # identifiants dans l'adresse
+        self.assertTrue(bad(headers_text="X-Cle: {nom}"))                                  # un en-tête ne reçoit jamais de paramètre
+        self.assertTrue(bad(headers_text="Host: autre"))
+        self.assertTrue(bad(body_text="{pas du json"))
+        self.assertTrue(bad(method="GET"))                                                 # GET sans corps
+        self.assertTrue(bad(method="TRACE"))
+        self.assertTrue(bad(params_text=API["params_text"] + "\nf ; chemin ; facultatif ; f"))    # pas de chemin pour une API
+        self.assertTrue(bad(body_text='{"x": "{inconnu}"}'))
+
+    def test_construction_echappee(self):
+        b = tools.prepare(self.api, {"id": 7, "q": "a b&c=d/e", "nom": 'x"y\\z', "n": "4"})
+        self.assertTrue(b["ok"], b)
+        self.assertIn("/items/7?q=a%20b%26c%3Dd%2Fe", b["url"])
+        self.assertEqual(json.loads(b["body"]), {"nom": 'x"y\\z', "n": 4})                  # entier typé ; clé facultative absente supprimée
+        self.assertNotIn("SECRET", b["display"])                                           # les en-têtes ne sont jamais affichés
+        self.assertTrue(tools.prepare(self.api, {"id": 1, "q": "-x", "nom": "a", "n": 1})["ok"])      # « - » n'est une option que pour un programme
+        self.assertFalse(tools.prepare(self.api, {"id": "x", "q": "a", "nom": "a", "n": 1})["ok"])
+        self.assertFalse(tools.prepare(self.api, {"id": 1, "q": "a", "nom": "a", "n": 1, "z": 1})["ok"])
+
+    def test_structure_du_corps_non_injectable(self):
+        b = tools.prepare(self.api, {"id": 1, "q": "a", "nom": '", "admin": true, "x": "', "n": 1})
+        self.assertEqual(sorted(json.loads(b["body"])), ["n", "nom"])
+
+    def test_appel_reel(self):
+        b = tools.prepare(self.api, {"id": 7, "q": "z", "nom": "Bob", "n": 2})
+        r = tools.execute(self.api, b)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["rc"], 200)
+        got = json.loads(r["tail"])
+        self.assertEqual((got["method"], got["path"], got["auth"], got["ctype"]), ("POST", "/items/7?q=z", "Bearer SECRET", "application/json"))
+        self.assertEqual(json.loads(got["body"]), {"nom": "Bob", "n": 2})
+
+    def test_erreur_http_redirection_delai_injoignable(self):
+        g = dict(self.api, method="GET", body_text="", url="http://127.0.0.1:%d/{id}?q={q}" % self.port, params_text="id ; texte ; o ; id\nq ; texte ; o ; q")
+        r = tools.execute(g, tools.prepare(g, {"id": "absent", "q": "1"}))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["rc"], 404)
+        r = tools.execute(g, tools.prepare(g, {"id": "redir", "q": "1"}))
+        self.assertEqual(r["rc"], 302)                                                     # redirection NON suivie
+        r = tools.execute(dict(g, timeout=1), tools.prepare(g, {"id": "lent", "q": "1"}))
+        self.assertTrue(r["timed_out"])
+        morte = dict(g, url="http://127.0.0.1:1/{id}?q={q}")
+        r = tools.execute(morte, tools.prepare(morte, {"id": "a", "q": "1"}))
+        self.assertFalse(r["ok"])
+        self.assertIn("impossible", r["tail"])
+
+    def test_pas_d_espace_de_travail(self):
+        self.assertFalse(tools.needs_workspace(self.api))
+        self.assertTrue(tools.needs_workspace(LIRE))
+        self.assertNotEqual(tools.def_hash(self.api), tools.def_hash(dict(self.api, headers_text="Authorization: autre")))
+
+
+class MoteurLot2(ServeurEcho):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "a.txt").write_text("bonjour", encoding="utf-8")
+        locks.STOP.clear()
+        self.state(tools_list=[dict(LIRE), dict(self.api)])
+
+    def state(self, tools_list, roles_tools=None, caps=None, source=None):
+        st = make_state(self.tmp)
+        p = st["projects"][0]
+        st["roles"] = [{"id": "r1", "name": "Chef de projet", "desc": ""},
+                       {"id": "r2", "name": "Développeur back-end", "desc": "", "tools": roles_tools if roles_tools is not None else {t["id"]: True for t in tools_list}, **({"caps": caps} if caps else {})}]
+        p.pop("roles")
+        if source:
+            for a in p["agents"]:
+                a["source"] = source
+        st["tools"] = tools_list
+        store.wj(store.state_path("u"), st)
+
+    def act(self, who, do_, **x):
+        return engine.do_act("u", "p1", who, {"do": do_, **x}, 0, {"n": 0, "t0": time.time()})
+
+    def agent(self, aid="a2"):
+        p = store.load("u")["projects"][0]
+        return p, next(a for a in p["agents"] if a["id"] == aid)
+
+    # --- outils API
+    def test_outil_api_utilisable_sans_espace_de_travail(self):
+        self.state([dict(self.api)], source="github")                                      # agent GitHub : pas de répertoire local
+        p, bob = self.agent()
+        self.assertTrue(engine.action_applies(p, bob, "tool_run"))
+        n, back = self.act("a2", "tool_run", tool="api-items", params={"id": 3, "q": "x", "nom": "Bob", "n": 1})
+        self.assertIn("réussi", back)
+        self.assertIn("/items/3?q=x", back)
+        self.assertNotIn("SECRET", store.load("u")["projects"][0]["tool_runs"][0]["cmd"])
+
+    def test_outil_cli_toujours_indisponible_en_mode_github(self):
+        self.state([dict(LIRE)], source="github")
+        p, bob = self.agent()
+        self.assertFalse(engine.action_applies(p, bob, "tool_run"))
+
+    # --- propositions d'outils
+    PROP = dict(name="compte-lignes", kind="cli", desc="Compte les lignes d'un fichier", command=PY,
+                args=["-c", "import sys; print(len(open(sys.argv[1]).read().splitlines()))", "{fichier}"], params=["fichier ; chemin ; obligatoire ; fichier ; existant"],
+                explain="Cet outil lit un fichier et affiche son nombre de lignes. Il ne modifie rien.", reason="Pour mesurer la taille des fichiers")
+
+    def propose(self, **k):
+        return self.act("a2", "tool_propose", **{**self.PROP, **k})
+
+    def decisions(self, kind="toolnew"):
+        return [d for d in store.load("u")["projects"][0].get("decisions", []) if d["kind"] == kind]
+
+    def test_proposition_enregistree_sans_rien_ajouter(self):
+        avant = store.load("u")["tools"]
+        n, back = self.propose()
+        d = self.decisions()
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0]["status"], "attente")
+        self.assertEqual(store.load("u")["tools"], avant)
+        self.assertIn("Proposition enregistrée", back)
+        self.assertIn("fichier", d[0]["payload"]["preview"] + d[0]["payload"]["tool"]["params_text"])
+
+    def test_proposition_invalide_ou_incomplete_refusee_sans_carte(self):
+        self.assertIn("invalide", self.propose(command="bash", args=["-c", "ls"], params=[])[1])
+        self.assertIn("incomplète", self.propose(explain="court")[1])
+        self.assertIn("incomplète", self.propose(name="")[1])
+        self.assertIn("invalide", self.propose(args=["{inconnu}"])[1])
+        self.assertEqual(self.decisions(), [])
+
+    def test_droit_de_proposer(self):
+        self.state([dict(LIRE)], caps={"tool": "no"})
+        p, bob = self.agent()
+        self.assertFalse(engine.action_applies(p, bob, "tool_propose"))
+        n, back = self.propose()
+        self.assertIn("t’autorise pas", back)
+        self.assertEqual(self.decisions(), [])
+
+    def test_agent_ne_fixe_ni_en_tetes_ni_adresse_distante(self):
+        n, back = self.act("a2", "tool_propose", name="api-neuve", kind="api", desc="API locale", url="http://exemple.org/x", method="GET", headers_text="Authorization: pirate",
+                           explain="Appelle une API sur Internet pour récupérer des données.", reason="r")
+        self.assertIn("non locale", back)
+        self.assertEqual(self.decisions(), [])
+        n, back = self.act("a2", "tool_propose", name="api-neuve", kind="api", desc="API locale", url="http://127.0.0.1:%d/x" % self.port, method="GET", headers_text="Authorization: pirate",
+                           remote=True, explain="Appelle une API locale pour récupérer des données.", reason="r")
+        self.assertIn("enregistrée", back)
+        self.assertNotIn("headers_text", self.decisions()[0]["payload"]["tool"])
+        self.assertNotIn("remote", self.decisions()[0]["payload"]["tool"])
+        with mock.patch.object(engine, "run_task"):
+            engine.decide("u", "p1", self.decisions()[0]["id"], "accept")
+        t = next(t for t in store.load("u")["tools"] if t["name"] == "api-neuve")
+        self.assertFalse(t.get("headers_text"))
+        self.assertFalse(t.get("remote"))
+
+    def test_approbation_ajoute_l_outil_avec_accord_et_autorise_le_role(self):
+        self.propose()
+        with mock.patch.object(engine, "run_task"):
+            engine.decide("u", "p1", self.decisions()[0]["id"], "accept", fields={"grant": "1"})
+        st = store.load("u")
+        t = next(t for t in st["tools"] if t["name"] == "compte-lignes")
+        self.assertEqual((t["level"], t["enabled"], t["kind"]), ("approve", True, "cli"))              # jamais « libre » d'office
+        self.assertTrue(next(r for r in st["roles"] if r["id"] == "r2")["tools"][t["id"]])
+        self.assertEqual(self.decisions()[0]["status"], "acceptée")
+        p, bob = self.agent()
+        self.assertEqual(rights.tool_level(p, bob, p["_tools"][-1]), rights.APPROVE)
+        self.assertIn("acceptée", bob["inbox"][-1]["text"])
+
+    def test_approbation_sans_attribution_du_role(self):
+        self.propose()
+        with mock.patch.object(engine, "run_task"):
+            engine.decide("u", "p1", self.decisions()[0]["id"], "accept", fields={"grant": ""})
+        st = store.load("u")
+        t = next(t for t in st["tools"] if t["name"] == "compte-lignes")
+        self.assertNotIn(t["id"], next(r for r in st["roles"] if r["id"] == "r2")["tools"])
+        p, bob = self.agent()
+        self.assertEqual(rights.tool_level(p, bob, t), rights.NO)
+
+    def test_modification_d_un_outil_existant(self):
+        self.state([dict(LIRE, headers_text="X-A: 1", level="free")])
+        n, back = self.act("a2", "tool_propose", name="lire", kind="cli", desc="Affiche un fichier", command=PY, args=["-c", "print('v2')", "{fichier}"],
+                           params=["fichier ; chemin ; obligatoire ; f ; existant"], explain="Même outil, affichage simplifié du fichier demandé.", reason="r")
+        d = self.decisions()[0]
+        self.assertEqual(d["payload"]["id"], "t1")
+        self.assertTrue(d["payload"]["prev"])
+        with mock.patch.object(engine, "run_task"):
+            engine.decide("u", "p1", d["id"], "accept")
+        t = store.load("u")["tools"][0]
+        self.assertIn("v2", t["args_text"])
+        self.assertEqual((t["level"], t.get("headers_text")), ("free", "X-A: 1"))                  # niveau et en-têtes de l'utilisateur conservés
+        self.assertEqual(len(store.load("u")["tools"]), 1)
+        n, back = self.act("a2", "tool_propose", name="lire", kind="cli", desc="Affiche un fichier", command=PY, args=["-c", "print('v2')", "{fichier}"],
+                           params=["fichier ; chemin ; obligatoire ; f ; existant"], explain="Même outil, affichage simplifié du fichier demandé.", reason="r")
+        self.assertIn("existe déjà", back)
+
+    def test_version_revisee_remplace_la_proposition_en_attente_et_plafond(self):
+        self.propose()
+        self.propose(desc="Compte les lignes (version 2)")
+        d = self.decisions()
+        self.assertEqual([x["status"] for x in d], ["remplacée", "attente"])
+        for i in range(3):
+            self.propose(name="outil-%d" % i)
+        n, back = self.propose(name="outil-9")
+        self.assertIn("en attente", back)
+
+    def test_refus_previent_l_agent(self):
+        self.propose()
+        with mock.patch.object(engine, "ask") as ask:
+            engine.decide("u", "p1", self.decisions()[0]["id"], "refuse", note="inutile")
+        self.assertEqual(len(store.load("u")["tools"]), 2)
+        self.assertIn("inutile", ask.call_args.args[3])
+
+
+class ActionWorkflow(ServeurEcho):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "a.txt").write_text("bonjour", encoding="utf-8")
+        st = make_state(self.tmp)
+        p = st["projects"][0]
+        st["roles"] = [{"id": "r1", "name": "Chef de projet", "desc": ""}, {"id": "r2", "name": "Développeur back-end", "desc": ""}]
+        p.pop("roles")
+        st["tools"] = [dict(LIRE, level="free"), dict(self.api), dict(LIRE, id="t3", name="avec-accord", level="approve"),
+                       dict(LIRE, id="t4", name="echec", level="free", args_text="-c\nimport sys; sys.exit(3)\n{fichier}")]
+        p["workflows"] = [{"id": "w1", "name": "WF", "enabled": True, "steps": []}]
+        p["wf_runs"] = [{"id": "run1", "wf": "w1", "task": "", "requester": "", "results": []}]
+        store.wj(store.state_path("u"), st)
+
+    def ctx(self):
+        p = store.load("u")["projects"][0]
+        return p, p["workflows"][0], p["wf_runs"][0]
+
+    def step(self, **k):
+        return {"kind": "system", "action": "run_tool", "value": "lire", "who": "agent:a2", "text": "fichier=a.txt", "confirm": "0", **k}
+
+    def lint(self, st):
+        p, wf, run = self.ctx()
+        return [m for lvl, m in sysact.lint_step(p, st, False, wf) if lvl == "erreur"]
+
+    def test_controle_statique_de_l_etape(self):
+        self.assertEqual(self.lint(self.step()), [])
+        self.assertTrue(self.lint(self.step(value="inconnu")))
+        self.assertTrue(any("accord" in m for m in self.lint(self.step(value="avec-accord", confirm="0"))))     # l'accord de l'utilisateur ne se contourne pas
+        self.assertEqual(self.lint(self.step(value="avec-accord", confirm="1")), [])
+        self.assertTrue(any("obligatoire" in m for m in self.lint(self.step(text=""))))
+        self.assertTrue(any("inconnu" in m for m in self.lint(self.step(text="fichier=a.txt\nzzz=1"))))
+
+    def test_confirmation_par_defaut(self):
+        self.assertTrue(sysact.needs_confirm({"action": "run_tool"}))
+        self.assertIn("Lancer un outil", sysact.describe(store.load("u")["projects"][0], self.step()))
+
+    def run_step(self, st):
+        p, wf, run = self.ctx()
+        return sysact.run_step(engine, "u", "p1", p, wf, run, 0, st)
+
+    def test_execution_ok_et_journal(self):
+        issue, comment, wait = self.run_step(self.step())
+        self.assertEqual(issue, "ok", comment)
+        self.assertFalse(wait)
+        self.assertIn("réussi", comment)
+        r = store.load("u")["projects"][0]["tool_runs"][0]
+        self.assertEqual((r["approved"], r["ok"]), ("Workflow", True))
+
+    def test_echec_de_l_outil_est_un_ko(self):
+        issue, comment, wait = self.run_step(self.step(value="echec"))
+        self.assertEqual(issue, "ko")
+        self.assertIn("code 3", comment)
+
+    def test_variables_et_outil_api_sans_acteur_local(self):
+        st = self.step(value="api-items", text="id=3\nq={task.id}x\nnom=Alice\nn=2", who="principal")
+        issue, comment, wait = self.run_step(st)
+        self.assertEqual(issue, "ok", comment)
+
+    def test_outil_avec_accord_sans_confirmation_est_refuse_a_l_execution(self):
+        issue, comment, wait = self.run_step(self.step(value="avec-accord", confirm="0"))
+        self.assertEqual(issue, "ko")
+        self.assertIn("accord", comment)
+        self.assertEqual(store.load("u")["projects"][0].get("tool_runs", []), [])
+
+    def test_confirmation_demandee_avant_l_execution(self):
+        issue, comment, wait = self.run_step(self.step(confirm=""))
+        self.assertTrue(wait)
+        self.assertEqual(store.load("u")["projects"][0].get("tool_runs", []), [])
+        d = [x for x in store.load("u")["projects"][0]["decisions"] if x.get("wf_run") == "run1"]
+        self.assertEqual(len(d), 1)
+
+    def test_outil_desactive_ou_inconnu(self):
+        st = store.load("u")
+        st["tools"][0]["enabled"] = False
+        store.wj(store.state_path("u"), st)
+        self.assertEqual(self.run_step(self.step())[0], "ko")
+        self.assertEqual(self.run_step(self.step(value="nexistepas"))[0], "ko")
 
 
 if __name__ == "__main__":

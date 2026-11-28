@@ -19,6 +19,9 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import checks
 
@@ -27,6 +30,11 @@ PARAM_RE = re.compile(r"^[a-z][a-z0-9_]{0,29}$")
 PLACE_RE = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 TYPES = {"texte": "text", "text": "text", "entier": "int", "int": "int", "chemin": "path", "path": "path", "choix": "choice", "choice": "choice"}
 TYPE_FR = {"text": "texte", "int": "entier", "path": "chemin", "choice": "choix"}
+KINDS = ("cli", "api")
+METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "[::1]")
+HEADER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,39}$")
+FORBIDDEN_HEADERS = ("host", "content-length", "transfer-encoding", "connection", "cookie")
 PLATFORMS = ("any", "windows", "linux", "macos")
 LEVELS = ("free", "approve", "no")                          # libre / avec accord de l'utilisateur / interdit
 DEFAULT_TIMEOUT, MAX_TIMEOUT = 120, 3600
@@ -119,7 +127,7 @@ def timeout_of(tool):
 
 def def_hash(tool):
     """Empreinte de ce qui détermine la commande exécutée : une demande approuvée n'est exécutée que si elle est inchangée."""
-    keys = ("command", "args_text", "params_text", "workdir", "timeout")
+    keys = ("kind", "command", "args_text", "params_text", "workdir", "timeout", "method", "url", "headers_text", "body_text", "remote")
     return hashlib.sha256(json.dumps([str((tool or {}).get(k) or "") for k in keys], ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
 
 
@@ -147,6 +155,51 @@ def _command_errors(cmd):
     return errs
 
 
+def kind_of(tool):
+    return (tool or {}).get("kind") or "cli"
+
+
+def parse_headers(text):
+    """Une ligne = `Nom: valeur` (valeurs FIXES, jamais fournies par un agent). Retourne (dict, erreurs)."""
+    out, errs = {}, []
+    for raw in [l for l in str(text or "").replace("\r", "").split("\n") if l.strip()]:
+        n, _, v = raw.partition(":")
+        n, v = n.strip(), v.strip()
+        if not HEADER_RE.match(n) or n.lower() in FORBIDDEN_HEADERS:
+            errs.append("en-tête refusé ou invalide : « %s »" % n[:40])
+        elif PLACE_RE.search(v):
+            errs.append("l'en-tête « %s » ne peut pas contenir de paramètre (ses valeurs sont fixes : jetons et clés restent hors de portée des agents)" % n)
+        else:
+            out[n] = v
+    return out, errs
+
+
+def _api_url(tool):
+    """(modèle d'URL, erreurs) : http(s), hôte LITTÉRAL, local sauf autorisation explicite, sans identifiants."""
+    url = str(tool.get("url") or "").strip()
+    errs = []
+    pu = urllib.parse.urlsplit(PLACE_RE.sub("x", url))
+    if pu.scheme not in ("http", "https") or not pu.hostname:
+        return url, ["l'adresse (URL) doit commencer par http:// ou https:// et contenir un hôte"]
+    if PLACE_RE.search(urllib.parse.urlsplit(url).netloc):
+        errs.append("l'hôte de l'adresse ne peut pas contenir de paramètre")
+    if "@" in pu.netloc:
+        errs.append("l'adresse ne doit pas contenir d'identifiants (utilisez un en-tête)")
+    if not tool.get("remote") and pu.hostname.lower() not in LOCAL_HOSTS and not pu.hostname.startswith("127."):
+        errs.append("adresse non locale (%s) : cochez « autoriser une adresse non locale » si c'est voulu (les données du projet pourraient alors quitter la machine)" % pu.hostname[:60])
+    return url, errs
+
+
+def _body_tokens(node):
+    if isinstance(node, str):
+        return PLACE_RE.findall(node)
+    if isinstance(node, list):
+        return [x for e in node for x in _body_tokens(e)]
+    if isinstance(node, dict):
+        return [x for k, v in node.items() for x in PLACE_RE.findall(str(k)) + _body_tokens(v)]
+    return []
+
+
 def validate_def(tool):
     """{errors, warnings, risk, preview}. Contrôle statique d'un outil du registre, sans l'exécuter."""
     t = tool or {}
@@ -154,43 +207,77 @@ def validate_def(tool):
     name = str(t.get("name") or "")
     if not NAME_RE.match(name):
         errs.append("nom invalide « %s » (2 à 40 caractères : minuscules, chiffres, - _ . ; c'est ce que les agents écrivent)" % name[:40])
-    errs += _command_errors(t.get("command"))
-    args = parse_args(t.get("args_text"))
+    kind = kind_of(t)
     params, perrs = parse_params(t.get("params_text"))
     errs += perrs
     names = {p["name"] for p in params}
-    if len(args) > MAX_ARGS:
-        errs.append("trop d'arguments (maximum %d)" % MAX_ARGS)
-    used = set()
-    for tok in args:
-        for m in PLACE_RE.findall(tok):
-            used.add(m)
-            if m not in names:
-                errs.append("l'argument « %s » utilise {%s}, qui n'est pas un paramètre déclaré" % (tok[:60], m))
+    used, flags = set(), []
+    level_risk = "faible"
+    if kind not in KINDS:
+        errs.append("type d'outil inconnu : %s" % kind)
+        preview = ""
+    elif kind == "api":
+        meth = str(t.get("method") or "GET").upper()
+        if meth not in METHODS:
+            errs.append("méthode HTTP invalide : %s" % meth)
+        _, uerrs = _api_url(t)
+        errs += uerrs
+        _, herrs = parse_headers(t.get("headers_text"))
+        errs += herrs
+        used |= set(PLACE_RE.findall(str(t.get("url") or "")))
+        body = str(t.get("body_text") or "").strip()
+        if body:
+            if meth == "GET":
+                errs.append("une requête GET n'a pas de corps")
+            try:
+                used |= set(_body_tokens(json.loads(body)))
+            except ValueError:
+                errs.append("le corps doit être du JSON valide (les {paramètres} se placent dans des textes : \"{nom}\")")
+        for p in params:
+            if p["type"] == "path":
+                errs.append("le paramètre « %s » : le type chemin n'existe pas pour un outil API" % p["name"])
+        if not errs:
+            if t.get("remote"):
+                level_risk, flags = "élevée", ["adresse non locale : des données peuvent quitter la machine"]
+            elif meth != "GET":
+                level_risk, flags = "moyenne", ["requête %s : peut modifier des données de l'outil" % meth]
+        preview = ("%s %s" % (meth, PLACE_RE.sub(lambda m: "<%s>" % m.group(1), str(t.get("url") or "")))) + ((" corps " + re.sub(r"\s+", " ", body)[:120]) if body else "")
+    else:
+        errs += _command_errors(t.get("command"))
+        args = parse_args(t.get("args_text"))
+        if len(args) > MAX_ARGS:
+            errs.append("trop d'arguments (maximum %d)" % MAX_ARGS)
+        for tok in args:
+            used |= set(PLACE_RE.findall(tok))
+        wd = str(t.get("workdir") or "").strip()
+        if wd and (os.path.isabs(wd) or ".." in re.split(r"[\\/]", wd)):
+            errs.append("le dossier de travail doit être un sous-dossier RELATIF de l'espace de travail de l'agent")
+        argv = [str(t.get("command") or "").strip()] + [PLACE_RE.sub(lambda m: "<%s>" % m.group(1), a) for a in args]
+        preview = _display(argv)
+        plain = _display([str(t.get("command") or "").strip()] + [PLACE_RE.sub("x", a) for a in args])   # sans « < > » : l'analyse y verrait des redirections
+        if not errs:
+            r = checks.analyze(plain)
+            if r["refused"]:
+                errs.append("commande refusée d'office : " + " ; ".join(r["flags"]))
+            else:
+                level_risk, flags = r["level"], r["flags"]
+    for u_ in sorted(used - names):
+        errs.append("{%s} est utilisé mais n'est pas un paramètre déclaré" % u_)
     for p in params:
         if p["name"] not in used:
-            (errs if p["required"] else warns).append("le paramètre « %s » n'est utilisé dans aucun argument" % p["name"])
+            (errs if p["required"] else warns).append("le paramètre « %s » n'est utilisé nulle part" % p["name"])
     if t.get("level") not in LEVELS:
         warns.append("niveau non défini : « avec accord de l'utilisateur » sera appliqué")
     if t.get("platform") not in PLATFORMS:
         warns.append("plateforme non définie : « toutes » sera appliqué")
     elif not platform_ok(t):
         warns.append("cet outil est déclaré pour une autre plateforme que celle du serveur : il ne sera pas proposé aux agents ici")
-    wd = str(t.get("workdir") or "").strip()
-    if wd and (os.path.isabs(wd) or ".." in re.split(r"[\\/]", wd)):
-        errs.append("le dossier de travail doit être un sous-dossier RELATIF de l'espace de travail de l'agent")
     try:
         if t.get("timeout") not in (None, "") and not (1 <= int(t.get("timeout")) <= MAX_TIMEOUT):
             errs.append("délai invalide (1 à %d secondes)" % MAX_TIMEOUT)
     except (TypeError, ValueError):
         errs.append("délai invalide (nombre de secondes)")
-    argv = [str(t.get("command") or "").strip()] + [PLACE_RE.sub(lambda m: "<%s>" % m.group(1), a) for a in args]
-    preview = _display(argv)
-    plain = _display([str(t.get("command") or "").strip()] + [PLACE_RE.sub("x", a) for a in args])   # sans « < > » : l'analyse y verrait des redirections
-    risk = checks.analyze(plain) if not errs else {"level": "refusée", "flags": [], "refused": False}
-    if not errs and risk["refused"]:
-        errs.append("commande refusée d'office : " + " ; ".join(risk["flags"]))
-    return {"errors": errs, "warnings": warns, "risk": {"level": risk["level"], "flags": risk["flags"]}, "preview": preview}
+    return {"errors": errs, "warnings": warns, "risk": {"level": "refusée" if errs else level_risk, "flags": [] if errs else flags}, "preview": preview}
 
 
 def usage(tool):
@@ -224,7 +311,7 @@ def _inside(path, root):
         return False
 
 
-def _value(p, raw, cwd):
+def _value(p, raw, cwd, dash=True):
     """(texte validé, erreur) pour un paramètre."""
     if isinstance(raw, bool) or isinstance(raw, (list, dict)) or raw is None:
         return None, "valeur de « %s » invalide (texte ou nombre attendu)" % p["name"]
@@ -254,7 +341,7 @@ def _value(p, raw, cwd):
         if p.get("exists") and not os.path.exists(real):
             return None, "« %s » : « %s » n'existe pas" % (p["name"], v[:80])
         return rel.replace("\\", "/"), None
-    if v.lstrip().startswith("-"):
+    if dash and v.lstrip().startswith("-"):
         return None, "« %s » ne peut pas commencer par « - » (ce serait une option déguisée)" % p["name"]
     if p.get("pattern") and not re.fullmatch(p["pattern"], v):
         return None, "« %s » ne respecte pas le format attendu (%s)" % (p["name"], p["pattern"])
@@ -373,3 +460,119 @@ def kill_agent(u, pid, aid):
                 checks._kill(proc)
                 n += 1
     return n
+
+
+# ---------------------------------------------------------------------------------------------------------------- type API (HTTP)
+
+
+def _subst_body(node, vals, types):
+    """Substitue les paramètres DANS les textes du JSON (jamais dans sa structure) : un texte exactement égal à « {nom} » prend la valeur typée,
+    une valeur facultative absente supprime la clé ; ailleurs le texte est remplacé tel quel (aucune injection de structure possible)."""
+    if isinstance(node, str):
+        m = PLACE_RE.fullmatch(node)
+        if m:
+            return (int(vals[m.group(1)]) if types.get(m.group(1)) == "int" else vals[m.group(1)]) if m.group(1) in vals else _MISSING
+        return PLACE_RE.sub(lambda m: vals.get(m.group(1), ""), node)
+    if isinstance(node, list):
+        return [x for x in (_subst_body(e, vals, types) for e in node) if x is not _MISSING]
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            r = _subst_body(v, vals, types)
+            if r is not _MISSING:
+                out[PLACE_RE.sub(lambda m: vals.get(m.group(1), ""), k)] = r
+        return out
+    return node
+
+
+_MISSING = object()
+
+
+def build_call(tool, values):
+    """Requête HTTP EXACTE d'un appel d'outil API : {ok, error, method, url, headers, body, display}. Les valeurs sont validées puis échappées
+    (URL : encodage pourcent ; corps : JSON) ; les en-têtes sont ceux de l'outil, jamais ceux d'un agent."""
+    bad = lambda m: {"ok": False, "error": m}
+    v = validate_def(tool)
+    if v["errors"]:
+        return bad("outil mal configuré (%s) : signale-le à l'utilisateur" % "; ".join(v["errors"][:2]))
+    if not isinstance(values, dict):
+        return bad("« params » doit être un objet {\"nom\": \"valeur\"}")
+    params, _ = parse_params(tool.get("params_text"))
+    pm = {p["name"]: p for p in params}
+    extra = [k for k in values if k not in pm]
+    if extra:
+        return bad("paramètre(s) inconnu(s) : %s" % ", ".join(str(k)[:30] for k in extra))
+    vals = {}
+    for p in params:
+        if p["name"] not in values or values[p["name"]] in (None, ""):
+            if p["required"]:
+                return bad("paramètre obligatoire manquant : %s" % p["name"])
+            continue
+        s, e = _value(p, values[p["name"]], "", dash=False)
+        if e:
+            return bad(e)
+        vals[p["name"]] = s
+    url = PLACE_RE.sub(lambda m: urllib.parse.quote(vals.get(m.group(1), ""), safe=""), str(tool["url"]).strip())
+    body = None
+    if str(tool.get("body_text") or "").strip():
+        body = json.dumps(_subst_body(json.loads(tool["body_text"]), vals, {p["name"]: p["type"] for p in params}), ensure_ascii=False)
+    meth = str(tool.get("method") or "GET").upper()
+    headers = parse_headers(tool.get("headers_text"))[0]
+    return {"ok": True, "method": meth, "url": url, "headers": headers, "body": body, "display": "%s %s%s" % (meth, url, (" corps " + body[:300]) if body else "")}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None                                         # une redirection pourrait mener hors de l'adresse déclarée : le code 3xx est rendu tel quel
+
+
+def run_api(call, timeout=DEFAULT_TIMEOUT, lock_id="api"):
+    """Exécute la requête : {ok (2xx), rc (code HTTP), secs, timed_out, killed, tail}. Sans proxy, sans redirection, réponse limitée."""
+    timeout = max(1, min(int(timeout or DEFAULT_TIMEOUT), MAX_TIMEOUT))
+    lk = _lock_for(lock_id)
+    if not lk.acquire(timeout=LOCK_WAIT):
+        return {"ok": False, "rc": -1, "secs": 0.0, "timed_out": False, "killed": False, "tail": "Outil occupé : un autre appel du même outil dure depuis plus de %d s." % LOCK_WAIT}
+    try:
+        t0 = time.time()
+        hd = {"User-Agent": "myTeam-tools", **call["headers"]}
+        data = call["body"].encode("utf-8") if call.get("body") is not None else None
+        if data is not None and not any(k.lower() == "content-type" for k in hd):
+            hd["Content-Type"] = "application/json"
+        rq = urllib.request.Request(call["url"], data=data, method=call["method"], headers=hd)
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        timed_out, code, text = False, -1, ""
+        try:
+            with op.open(rq, timeout=timeout) as r:
+                code, text = r.status, r.read(MAX_OUT_BYTES).decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            code = e.code
+            try:
+                text = e.read(MAX_OUT_BYTES).decode("utf-8", errors="replace")
+            except Exception:
+                text = ""
+        except (TimeoutError, OSError) as e:
+            timed_out = "timed out" in str(e).lower() or isinstance(e, TimeoutError)
+            reason = getattr(e, "reason", e)
+            text = ("[délai de %d s dépassé]" % timeout) if timed_out else "Appel impossible : %s" % reason
+        return {"ok": 200 <= code < 300, "rc": code, "secs": round(time.time() - t0, 1), "timed_out": timed_out, "killed": False, "tail": checks.compact(text, 2500)}
+    finally:
+        lk.release()
+
+
+# ---------------------------------------------------------------------------------------------------------------- point d'entrée commun
+
+
+def needs_workspace(tool):
+    return kind_of(tool) == "cli"
+
+
+def prepare(tool, values, cwd="", roots=()):
+    """Appel validé d'un outil (CLI ou API) : {ok, error, display, …}."""
+    return build_call(tool, values) if kind_of(tool) == "api" else build_argv(tool, values, cwd, roots)
+
+
+def execute(tool, b, key=None):
+    """Exécute un appel préparé par `prepare`."""
+    if kind_of(tool) == "api":
+        return run_api(b, timeout_of(tool), lock_id=tool["id"])
+    return run(b["argv"], b["cwd"], timeout_of(tool), key=key, lock_id=tool["id"])
